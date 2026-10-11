@@ -51,7 +51,7 @@ to a standalone writer, `--last`, or a fresh thread.
 ## Add an existing shared task to AM
 
 In Settings → Codex multi-device preview, check the server and use **Add to AM**
-on an idle task. This adds a session-list entry without starting another agent,
+on a loaded root task, including one currently working. This adds a session-list entry without starting another agent,
 copying its history or sending a prompt. Open the entry to join the same
 conversation that is available from a phone or another terminal.
 
@@ -63,7 +63,7 @@ curl --fail-with-body http://127.0.0.1:7861/api/codex/import \
   -H 'Content-Type: application/json' --data '{"threadId":"EXACT_CODEX_UUID"}'
 ```
 
-It requires the same pilot flag, an idle loaded root thread accepting direct
+It requires the same pilot flag, a loaded root thread accepting direct
 input, and a resolved cwd within AM's configured workspace root. A legacy AM
 pin refuses import and must follow the existing handoff path. Repeated imports
 return the same AM view. Archived views are not reactivated automatically.
@@ -147,6 +147,59 @@ checks. Attribution is not authentication. The helper does not send any AM
 mutation by itself. Configuration accepts loopback HTTP only; redirects are
 refused. `--config FILE` selects another explicit configuration.
 
+### Explicit association from an unmapped native conversation
+
+When the operator requests AM association, run this **from that conversation**:
+
+```sh
+node /path/to/agent-manager/scripts/am-codex-context.mjs import
+node /path/to/agent-manager/scripts/am-codex-context.mjs resolve --id-only
+```
+
+`import` reads only `CODEX_THREAD_ID` and posts to `/api/codex/import` with
+`X-AM-Origin: codex-thread:<exact UUID>`. This narrow bootstrap origin is valid
+only for importing that same UUID; it cannot create agents, send messages, or
+claim the operator identity. The API verifies the configured server, native
+root identity, workspace and direct-input eligibility. Child/forked, unloaded,
+outside-workspace or existing legacy AM conversations are refused. An active
+root task is safe to associate because this operation only creates AM metadata
+and a binding: no native resume, prompt, interruption, or settings change.
+`resolve` remains read-only and never imports automatically. These labels
+provide attribution within the existing private deployment boundary, not a
+new authentication mechanism.
+
+### Messages from an associated agent to a shared Codex task
+
+Use the existing `/api/agents/:id/prompt` endpoint with the resolved AM sender
+and a stable UUID in JSON `requestId` (or `X-AM-Message-Id` for text bodies):
+
+```sh
+curl --fail-with-body 'http://127.0.0.1:7861/api/agents/DESTINATION_ID/prompt?from=SOURCE_AM_ID' \
+  -H 'X-AM-Request: 1' -H 'Content-Type: application/json' \
+  --data '{"text":"Please review the proposed change.","requestId":"11111111-1111-4111-8111-111111111111"}'
+```
+
+Generate a new UUID for each new message; keep it unchanged for retries. AM
+records the sender's exact incarnation/binding, prefixes the native message
+with its source name and identifiers, and revalidates both ends before sending.
+The operation log retains source and destination attribution. A known busy,
+archived or unloaded target is refused; no terminal is started or typed into.
+
+Delivery uses native `thread/queue/add` (verified with Codex 0.162.1), rather
+than `turn/start`, which can steer a turn that starts concurrently. If the
+target becomes busy between verification and delivery, its server queues the
+message for a separate later turn, preserving the work already in progress.
+The response reports `queued: true` and `queuedSubmissionId`; this acknowledges
+acceptance, not completion. A durable receipt prevents resubmitting an accepted
+or ambiguously acknowledged message after retries or AM restarts. Conflicting
+reuse of an ID is refused. No automatic retry, policy override or interrupt is
+performed. The native queue, not AM, owns accepted messages thereafter.
+
+An imported source can also use `/api/agents?cli=claude&from=SOURCE_AM_ID` to
+create a reviewer through the existing spawn path. Its workspace/group defaults
+and audit attribution are preserved. New shared Codex agent/cron creation and
+scheduled delivery remain separate, unsupported paths.
+
 From a regular tmux/mosh shell:
 
 ```sh
@@ -178,8 +231,8 @@ removal is implemented.
 For bound sessions, standalone launch fallbacks and rollout-based repinning
 are bypassed. AM boot does not revive their terminal clients. Closing a browser
 view only detaches that view. Stopping AM closes its clients; the Codex server
-is an independent process. Generic process stop/delete and managed agent/cron
-prompt delivery refuse bound tasks. The existing operator input route selects
+is an independent process. Generic process stop/delete and scheduled prompt delivery refuse bound tasks.
+Explicit agent-to-agent delivery uses the native queue as described below. The existing operator input route selects
 the shared adapter.
 
 `POST /api/sessions/:id/interrupt` is operator-only and requires `{turnId}`.
@@ -207,6 +260,8 @@ Run from `server/`:
 
 ```sh
 node ../scripts/run-suites.mjs codex-reader codex-import codex-bindings codex-context codex-shared.test api-http api-boundary request-admission codex-repin revive
+node test/codex-coordination-http.test.mjs
+node test/codex-coordination-live.test.mjs
 node test/codex-shared-regressions.test.mjs
 node test/codex-shared-pilot.test.mjs
 node test/codex-reader-input-live.test.mjs
@@ -432,3 +487,15 @@ Codex daemon and any independent pilot outside it. A migration controller
 running inside the old AM must finish its turn before an independent, audited
 worker closes it. A partial failure keeps exact native IDs and launch guards;
 never roll back to an old backend that ignores those guards.
+
+
+Coordination validation uses an isolated HTTP fixture with a fake Claude
+executable to verify active self-import, reviewer creation in the source
+workspace, source/destination audit attribution, queue delivery, deduplication
+and busy-target refusal. The manual native fixture uses a real disposable
+Codex daemon and deterministic local provider to verify active import,
+unchanged settings, receipts across AM restart and a queued message becoming a
+separate turn after concurrent work. No production tasks or external inference
+are used. Protocol reference: [official app-server documentation](https://learn.chatgpt.com/docs/app-server);
+the experimental queue shape and scheduling behavior are also checked against
+the installed 0.162.1 schema and the native fixture.

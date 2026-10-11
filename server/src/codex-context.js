@@ -34,6 +34,7 @@ export function contextForThread(threadId, { sessions, bindings = codexBindings,
 export async function bindExistingThread({ sessionId, threadId, expectedRevision }, {
   getSession, sessions, isRunning, bindings = codexBindings,
   config = observationConfig(), connect = ObservationClient.connect, signal, beforeCommit = () => {},
+  activeSharedReference = false,
 }) {
   if (!validThreadId(threadId) || !Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
     throw new ApiError(400, 'invalid-input', 'Pass threadId and an integer expectedRevision (0 for a first binding).');
@@ -41,10 +42,10 @@ export async function bindExistingThread({ sessionId, threadId, expectedRevision
   const endpoint = configuredEndpoint(config);
   const initial = getSession(sessionId);
   if (!initial) throw new ApiError(404, 'not-found', 'AM session not found.');
-  const stamp = JSON.stringify([initial.sessionUuid, initial.cli, initial.path, initial.codexSessionId]);
+  const stamp = JSON.stringify([initial.sessionUuid, initial.cli, initial.path, initial.codexSessionId, initial.codexSharedOnly]);
   const validateSession = () => {
     const s = getSession(sessionId);
-    if (!s || JSON.stringify([s.sessionUuid, s.cli, s.path, s.codexSessionId]) !== stamp) {
+    if (!s || JSON.stringify([s.sessionUuid, s.cli, s.path, s.codexSessionId, s.codexSharedOnly]) !== stamp) {
       throw new ApiError(409, 'codex-session-changed', 'The AM session changed during verification.');
     }
     if (s.cli !== 'codex' || s.codexSessionId !== threadId) throw new ApiError(409, 'codex-pin-mismatch', 'The exact existing Codex pin must match.');
@@ -63,7 +64,13 @@ export async function bindExistingThread({ sessionId, threadId, expectedRevision
     const result = await client.call('thread/read', { threadId, includeTurns: false });
     const thread = result?.thread;
     if (thread?.id !== threadId) throw new ApiError(409, 'codex-thread-mismatch', 'The server returned a different thread.');
-    if (thread.status?.type !== 'idle') throw new ApiError(409, 'codex-handoff-required', 'The thread must already be loaded and idle on this server. No session was released.');
+    // Import only associates an already server-owned root task. Unlike a
+    // legacy handoff, this metadata-only path can run inside an active turn.
+    const activeImport = activeSharedReference && initial.codexSharedOnly === true;
+    if (activeImport && (thread.canAcceptDirectInput !== true || thread.parentThreadId || thread.forkedFromId)) {
+      throw new ApiError(409, 'codex-handoff-required', 'Choose a directly addressable root task on this server.');
+    }
+    if (!(activeImport ? ['idle', 'active'].includes(thread.status?.type) : thread.status?.type === 'idle')) throw new ApiError(409, 'codex-handoff-required', 'The thread must already be loaded and idle on this server. No session was released.');
     const s = validateSession();
     const root = fs.realpathSync(WORKSPACES_DIR);
     const cwd = fs.realpathSync(path.join(WORKSPACES_DIR, s.path ?? s.id));
@@ -98,8 +105,8 @@ export async function importSharedThread({ threadId }, {
     client = await connect(config, { signal });
     if (client.endpoint.socket !== endpoint.socket || client.endpoint.home !== endpoint.home) throw new ApiError(409, 'codex-endpoint-changed', 'The configured endpoint changed.');
     const { thread } = await client.call('thread/read', { threadId, includeTurns: false });
-    if (thread?.id !== threadId || thread.status?.type !== 'idle' || thread.canAcceptDirectInput !== true || thread.parentThreadId) {
-      throw new ApiError(409, 'codex-handoff-required', 'Choose an idle root task already loaded on this shared server.');
+    if (thread?.id !== threadId || !['idle', 'active'].includes(thread.status?.type) || thread.canAcceptDirectInput !== true || thread.parentThreadId || thread.forkedFromId) {
+      throw new ApiError(409, 'codex-handoff-required', 'Choose a loaded, directly addressable root task on this shared server.');
     }
     const root = fs.realpathSync(WORKSPACES_DIR);
     const cwd = typeof thread.cwd === 'string' ? fs.realpathSync(thread.cwd) : '';
@@ -125,8 +132,15 @@ export async function importSharedThread({ threadId }, {
     // Reuse the full binding checks, including the stopped AM view, exact pin,
     // workspace, pending inputs and a second live read after persistence.
     const binding = await bindExistingThread({ sessionId: session.id, threadId, expectedRevision: 0 }, {
-      getSession: store.get, sessions: store.list, isRunning, bindings, config, connect, signal, beforeCommit,
+      getSession: store.get, sessions: store.list, isRunning, bindings, config, connect, signal, beforeCommit, activeSharedReference: true,
     });
     return { session, binding, context: contextForThread(threadId, { sessions: store.list(), bindings, endpoint }) };
   } finally { client?.close(); }
+}
+
+export function importOperationOrigin(raw, req) {
+  if (req.method !== 'POST' || req.path.toLowerCase().replace(/\/+$/, '') !== '/api/codex/import') return null;
+  const threadId = raw?.startsWith('codex-thread:') ? raw.slice('codex-thread:'.length) : null;
+  if (!validThreadId(threadId) || req.body?.threadId !== threadId) return null;
+  return {id:raw, type:'codex-thread', threadId, name:`Codex thread ${threadId}`};
 }

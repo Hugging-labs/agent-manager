@@ -69,12 +69,12 @@ try {
     return route.fulfill({ json: { session: { id: 'am-ready', name: 'Existing conversation' } } });
   });
   await page.getByRole('button', { name: 'Check server' }).click();
-  await page.getByRole('button', { name: 'Add to AM' }).waitFor();
+  await page.getByRole('button', { name: 'Add to AM' }).first().waitFor();
   assert.equal(imports, 0, 'inspection never imports automatically');
-  assert.equal(await page.getByRole('button', { name: 'Add to AM' }).count(), 1, 'no import for busy task');
-  await page.getByRole('button', { name: 'Add to AM' }).click();
+  assert.equal(await page.getByRole('button', { name: 'Add to AM' }).count(), 2, 'active imports associate metadata without changing work');
+  await page.getByRole('button', { name: 'Add to AM' }).first().click();
   await page.getByText('Task changed; refresh and retry.').waitFor();
-  await page.getByRole('button', { name: 'Add to AM' }).click();
+  await page.getByRole('button', { name: 'Add to AM' }).first().click();
   await page.getByText('Added Existing conversation.', { exact: false }).waitFor();
   await page.getByText('AM: Existing conversation').waitFor();
   assert.equal(imports, 2);

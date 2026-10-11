@@ -73,7 +73,7 @@ export default function CodexSharedSessions() {
               <strong>{task.name || task.amSessions[0]?.name || 'Untitled task'}</strong>
               {' — '}{labels[task.status]}
               {task.amSessions.length > 0 && <div className="s-help">AM: {task.amSessions.map((s) => s.name).join(', ')}</div>}
-              {snapshot.importEnabled && task.status === 'idle' && <button className="btn-ghost"
+              {snapshot.importEnabled && ['idle', 'working', 'needs-input'].includes(task.status) && <button className="btn-ghost"
                 disabled={!!importing || busy} onClick={() => void add(task.id)}>
                 {importing === task.id ? 'Adding…' : 'Add to AM'}
               </button>}

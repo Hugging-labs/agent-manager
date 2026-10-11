@@ -21,7 +21,7 @@ function fixture() {
  const turn = {id:'active-turn',status:'inProgress'};
  const calls=[], replies=[]; let locked=false, lost=false, connects=0;
  const client={endpoint,closed:false,requests:new Map(),items:new Map(),requestView(){return [...this.requests.values()];},
-  async call(method,params){calls.push({method,params});if(method==='thread/turns/list')return {data:[turn]};if(method==='turn/interrupt')return {};if(method==='turn/start'){if(lost)throw Error('timeout');return {turn:{id:'turn-fixture'}};}return {thread};},
+  async call(method,params){calls.push({method,params});if(method==='thread/turns/list')return {data:[turn]};if(method==='turn/interrupt')return {};if(['turn/start','thread/queue/add'].includes(method)){if(lost)throw Error('timeout');return method==='thread/queue/add'?{queuedSubmission:{id:'queued-fixture',clientUserMessageId:params.clientUserMessageId}}:{turn:{id:'turn-fixture'}};}return {thread};},
   close(){this.closed=true;},async answer(key,response){replies.push({key,response});this.requests.delete(key);}};
  const deps={getSession:()=>session,listSessions:()=>[session],bindings,endpoint:()=>endpoint,connect:async()=>{connects++;return client;},observe:async()=>client,
   receipts:path.join(root,`receipts-${n}`),enabled:()=>true,assertWritable:()=>{if(locked)throw Error('locked');}};
@@ -148,4 +148,41 @@ test('closed clients release capacity while live subscriptions and pending reque
  for(const entry of hub.clients.values())entry.client.close();
  await hub.attach('after-restart');assert.equal(hub.clients.size,1);
  assert.equal(hub.clients.has('after-restart'),true);
+});
+
+
+function withSender(f) {
+ const source={id:'sender',name:'Reviewer',cli:'claude',sessionUuid:randomUUID()};
+ f.hub.getSession=id=>id==='sender'?source:id==='am'?f.session:null;
+ f.hub.listSessions=()=>[f.session,source];return source;
+}
+test('agent delivery uses the native queue with durable source-scoped receipts and no terminal/steering',async()=>{
+ const f=fixture(),source=withSender(f),input={text:'Please review',requestId:randomUUID()};
+ const first=await f.hub.sendFromAgent('am',input,'sender');
+ assert.deepEqual(first,{ok:true,queued:true,queuedSubmissionId:'queued-fixture'});
+ assert.equal((await f.hub.sendFromAgent('am',input,'sender')).repeated,true);
+ const restarted=new CodexInput({...f.deps,getSession:f.hub.getSession,listSessions:f.hub.listSessions});
+ assert.equal((await restarted.sendFromAgent('am',input,'sender')).repeated,true);
+ const sent=f.calls.filter(c=>c.method==='thread/queue/add');assert.equal(sent.length,1);
+ assert.ok(!f.calls.some(c=>['turn/start','turn/steer','turn/interrupt'].includes(c.method)));
+ assert.match(sent[0].params.input[0].text,/\[message from Reviewer:\]/);
+ assert.match(sent[0].params.input[0].text,/"amSessionId":"sender"/);
+ assert.equal(f.hub.readReceipt(input.requestId).source.sessionUuid,source.sessionUuid);
+ await assert.rejects(f.hub.sendFromAgent('am',{...input,text:'different'},'sender'),{code:'codex-request-conflict'});
+ await assert.rejects(f.hub.send('am',{text:sent[0].params.input[0].text,requestId:input.requestId}),{code:'codex-request-conflict'});
+});
+test('agent delivery rejects known active targets, stale senders, cancellation and uncertain retries',async()=>{
+ for(const mode of ['active','archived','changed','cancelled']){
+  const f=fixture(),source=withSender(f);const call=f.client.call.bind(f.client);
+  if(mode==='active')f.thread.status={type:'active',activeFlags:[]};
+  if(mode==='archived')source.archivedAt='now';
+  if(mode==='changed')f.client.call=async(...args)=>{const result=await call(...args);source.sessionUuid=randomUUID();return result;};
+  await assert.rejects(f.hub.sendFromAgent('am',{text:'hello',requestId:randomUUID()},'sender',{signal:mode==='cancelled'?AbortSignal.abort():undefined}));
+  assert.equal(f.calls.filter(c=>c.method==='thread/queue/add').length,0);
+ }
+ const f=fixture();withSender(f);f.lose();const input={text:'once',requestId:randomUUID()};
+ await assert.rejects(f.hub.sendFromAgent('am',input,'sender'),{code:'codex-send-uncertain'});
+ await assert.rejects(f.hub.sendFromAgent('am',input,'sender'),{code:'codex-send-uncertain'});
+ assert.equal(f.calls.filter(c=>c.method==='thread/queue/add').length,1);
+ await assert.rejects(f.hub.sendFromAgent('am',{text:'self',requestId:randomUUID()},'am'),{code:'codex-self-message'});
 });

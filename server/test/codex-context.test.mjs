@@ -8,7 +8,7 @@ import { CodexBindings } from '../src/codex-bindings.js';
 import { run, tuiSpec } from '../../scripts/am-codex-context.mjs';
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'am-context-'));
 process.env.DATA_DIR = root;
-const { bindExistingThread, configuredEndpoint, contextForThread, codexBindings } = await import('../src/codex-context.js');
+const { bindExistingThread, configuredEndpoint, contextForThread, codexBindings, importOperationOrigin } = await import('../src/codex-context.js');
 const { commandFor } = await import('../src/runner.js');
 const threadId = '11111111-1111-4111-8111-111111111111';
 const sessionUuid = '22222222-2222-4222-8222-222222222222';
@@ -108,4 +108,22 @@ test('TUI uses exact remote resume and clears inherited AM attribution without a
     launched = args; const child = new EventEmitter(); setImmediate(() => child.emit('exit', 0)); return child;
   } });
   assert.equal(code, 0); assert.equal(launched[0], 'codex'); assert.deepEqual(launched[1], spec.args);
+});
+
+
+test('self-import has explicit native attribution and never borrows AM_ID or operator',async()=>{
+ const requests=[];
+ const fetchImpl=async(url,options)=>{requests.push({url,options});return Response.json({context:{amSessionId:'imported',threadId}});};
+ const output=[];
+ await run(['--base-url','http://127.0.0.1:1234','import','--id-only'],{env:{CODEX_THREAD_ID:threadId,AM_ID:'neighbor'},fetchImpl,print:v=>output.push(v)});
+ assert.deepEqual(output,['imported']);assert.equal(requests.length,1);
+ assert.equal(requests[0].options.method,'POST');assert.equal(requests[0].options.headers['x-am-origin'],`codex-thread:${threadId}`);
+ assert.deepEqual(JSON.parse(requests[0].options.body),{threadId});
+ assert.equal(requests[0].url,'http://127.0.0.1:1234/api/codex/import');
+ await assert.rejects(run(['--base-url','http://127.0.0.1:1234','import'],{env:{AM_ID:'neighbor'},fetchImpl}),/CODEX_THREAD_ID/);
+ assert.equal(requests.length,1);
+ const req={method:'POST',path:'/api/codex/import',body:{threadId}};
+ assert.equal(importOperationOrigin(`codex-thread:${threadId}`,req).type,'codex-thread');
+ for(const bad of [{...req,method:'GET'},{...req,path:'/api/agents'},{...req,body:{threadId:sessionUuid}}])assert.equal(importOperationOrigin(`codex-thread:${threadId}`,bad),null);
+ assert.equal(importOperationOrigin('operator',req),null);
 });

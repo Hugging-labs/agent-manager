@@ -172,28 +172,59 @@ export class CodexInput {
       fd = fs.openSync(this.receipts, 'r'); fs.fsyncSync(fd);
     } finally { if (fd !== undefined) fs.closeSync(fd); if (!first) { try { fs.unlinkSync(file); } catch {} } }
   }
-  async send(id, { text, requestId, attachments = [] }, { signal } = {}) {
+  agentSource(id) {
+    const session = this.getSession(id);
+    if (!session || session.archivedAt) throw fail('codex-sender-stale', 'The sending session is missing or archived.');
+    const shared = session.cli === 'codex' && (session.codexSharedOnly || this.bindings.forSession(id));
+    const context = shared ? this.context(id) : null;
+    return {id, sessionUuid:session.sessionUuid, name:session.name, cli:session.cli,
+      threadId:context?.threadId || null, binding:context?.stamp || null};
+  }
+  async sendFromAgent(id, {text, requestId}, sourceId, {signal, cancelled = () => {}} = {}) {
+    if (id === sourceId) throw fail('codex-self-message', 'An agent cannot message itself.');
+    if (typeof text !== 'string' || !text.trim()) throw new ApiError(400, 'invalid-input', 'Message text is required.');
+    const source = this.agentSource(sourceId), stamp = JSON.stringify(source);
+    const verifySource = () => {
+      cancelled();
+      if (JSON.stringify(this.agentSource(sourceId)) !== stamp) throw fail('codex-sender-stale', 'The sender changed before delivery.');
+    };
+    const name = String(source.name || source.id).replace(/[\x00-\x1f\x7f\[\]]/g, ' ');
+    const attribution = JSON.stringify({amSessionId:source.id, threadId:source.threadId});
+    return this.send(id, {text:`[message from ${name}:] [AM source ${attribution}]\n${text}`, requestId},
+      {signal, source, verifySource});
+  }
+  async send(id, { text, requestId, attachments = [] }, { signal, source = null, verifySource = () => {} } = {}) {
     if (!uuid(requestId) || typeof text !== 'string' || (!text.trim() && !attachments.length) || text.length > 50000) throw new ApiError(400, 'invalid-input', 'A message and unique requestId are required.');
     if (this.busy.has(id)) throw fail('codex-send-busy', 'A message is already being submitted. Your draft is safe.');
     this.busy.add(id);
     try {
+      verifySource();
       const context = this.context(id), hash = digest(attachments.length ? JSON.stringify([text,attachments.map(a=>[a.id,a.path,a.kind])]) : text), existing = this.readReceipt(requestId);
       if (existing) {
-        if (existing.session !== id || existing.stamp !== context.stamp || existing.hash !== hash) throw fail('codex-request-conflict', 'This message ID was used for different content.');
-        if (existing.status === 'accepted') return { ok: true, turnId: existing.turnId, repeated: true };
+        if (existing.session !== id || existing.stamp !== context.stamp || existing.hash !== hash || JSON.stringify(existing.source || null) !== JSON.stringify(source)) throw fail('codex-request-conflict', 'This message ID was used for different content.');
+        if (existing.status === 'accepted') return {ok:true, ...(existing.queuedSubmissionId ? {queued:true, queuedSubmissionId:existing.queuedSubmissionId} : {turnId:existing.turnId}), repeated:true};
         throw uncertain(); // persisted before sending; never replay after an ambiguous failure
       }
       const { client } = await this.attach(id);
       const thread = await this.metadata(client, context);
       if (thread.status?.type !== 'idle' || client.requests?.size) throw fail('codex-task-busy', 'Codex is working or waiting for an answer. Wait for it to finish; your draft is safe.');
-      this.check(id, context); this.assertWritable();
+      this.check(id, context); verifySource(); this.assertWritable();
       if (signal?.aborted) throw fail('codex-send-cancelled', 'The message was not submitted.');
-      const receipt = { session: id, stamp: context.stamp, hash, status: 'sending', at: new Date().toISOString() };
+      const receipt = { session: id, stamp: context.stamp, hash, ...(source ? {source} : {}), status: 'sending', at: new Date().toISOString() };
       this.saveReceipt(requestId, receipt, true);
       // From this point, disconnects/timeout/restarts must never cause a retry.
       try {
-        const result = await client.call('turn/start', { threadId: context.threadId,
+        // Native queue/add starts an idle task, but cannot steer an active
+        // turn if another device wins the race after our idle check. In that
+        // case Codex schedules this message as a separate later turn.
+        const result = await client.call(source ? 'thread/queue/add' : 'turn/start', { threadId: context.threadId,
           input: [...(text ? [{ type: 'text', text, text_elements: [] }] : []), ...attachments.filter(a=>a.kind==='image').map(a=>({type:'localImage',path:a.path}))], clientUserMessageId: requestId });
+        if (source) {
+          const queuedSubmissionId = result?.queuedSubmission?.id;
+          if (typeof queuedSubmissionId !== 'string' || !queuedSubmissionId || result.queuedSubmission.clientUserMessageId !== requestId) throw uncertain();
+          this.saveReceipt(requestId, {...receipt, status:'accepted', queuedSubmissionId});
+          return {ok:true, queued:true, queuedSubmissionId};
+        }
         if (!result?.turn?.id) throw uncertain();
         this.saveReceipt(requestId, { ...receipt, status: 'accepted', turnId: result.turn.id });
         return { ok: true, turnId: result.turn.id };

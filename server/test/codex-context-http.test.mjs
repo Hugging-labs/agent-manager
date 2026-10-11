@@ -86,7 +86,7 @@ try {
   assert.equal((await call('/api/codex/import', { threadId })).body.code, 'codex-existing-session');
   assert.equal((await call('/api/codex/import', { threadId: 'bad' })).status, 400);
   const importedThread = '33333333-3333-4333-8333-333333333333';
-  status = 'active'; assert.equal((await call('/api/codex/import', { threadId: importedThread })).status, 409); status = 'idle';
+  status = 'active'; assert.equal((await call('/api/codex/import', { threadId: importedThread })).status, 200); status = 'idle';
   const imported = await call('/api/codex/import', { threadId: importedThread });
   assert.equal(imported.status, 200, JSON.stringify(imported));
   assert.equal(imported.body.session.codexSharedOnly, true);

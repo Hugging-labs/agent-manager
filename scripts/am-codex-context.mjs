@@ -36,18 +36,23 @@ export async function run(args, { env = process.env, fetchImpl = fetch, print = 
   if (args[0] === '--base-url') { baseOverride = localOrigin(args[1]); args = args.slice(2); }
   else if (args[0] === '--config') { configFile = args[1]; args = args.slice(2); }
   const [command = 'resolve', ...rest] = args;
-  if (!['resolve', 'tui'].includes(command) || (command === 'resolve' && rest.some((x) => x !== '--id-only'))
-      || (command === 'tui' && rest.length !== 1)) throw new Error('Usage: am-codex-context.mjs [--config FILE] resolve [--id-only] | tui AM_NAME_OR_ID');
-  if (command === 'resolve' && !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(env.CODEX_THREAD_ID || '')) {
+  if (!['resolve', 'import', 'tui'].includes(command) || (['resolve', 'import'].includes(command) && rest.some((x) => x !== '--id-only'))
+      || (command === 'tui' && rest.length !== 1)) throw new Error('Usage: am-codex-context.mjs [--config FILE] resolve [--id-only] | import [--id-only] | tui AM_NAME_OR_ID');
+  if (command !== 'tui' && !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(env.CODEX_THREAD_ID || '')) {
     throw new Error('CODEX_THREAD_ID is required; AM_ID is not a fallback.');
   }
   const base = baseOverride || readConfig(configFile);
-  const query = command === 'resolve' ? `/api/codex/context?threadId=${encodeURIComponent(env.CODEX_THREAD_ID)}`
+  const query = command === 'import' ? '/api/codex/import' : command === 'resolve' ? `/api/codex/context?threadId=${encodeURIComponent(env.CODEX_THREAD_ID)}`
     : `/api/codex/client-target?session=${encodeURIComponent(rest[0])}`;
-  const response = await fetchImpl(base + query, { headers: { 'x-am-request': '1' }, redirect: 'error', signal: AbortSignal.timeout(10000) });
+  const response = await fetchImpl(base + query, {
+    ...(command === 'import' ? {method:'POST', body:JSON.stringify({threadId:env.CODEX_THREAD_ID})} : {}),
+    headers: {'x-am-request':'1', ...(command === 'import' ? {'content-type':'application/json', 'x-am-origin':`codex-thread:${env.CODEX_THREAD_ID}`} : {})},
+    redirect:'error', signal:AbortSignal.timeout(10000),
+  });
   if (!response.ok) throw new Error(`AM context lookup refused (HTTP ${response.status}).`);
-  const data = await response.json();
-  if (command === 'resolve') {
+  const result = await response.json();
+  const data = command === 'import' ? result.context : result;
+  if (command !== 'tui') {
     if (data?.threadId !== env.CODEX_THREAD_ID || !/^[a-zA-Z0-9_-]{1,128}$/.test(data.amSessionId || '')) throw new Error('Invalid AM context response.');
     print(rest.includes('--id-only') ? data.amSessionId : JSON.stringify(data, null, 2));
     return 0;

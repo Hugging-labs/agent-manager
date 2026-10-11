@@ -19,6 +19,7 @@ export class CodexInteractiveClient extends ObservationClient {
     return (method === 'thread/resume' && this.recoveryParams && isDeepStrictEqual(params, this.recoveryParams)) || super.allows(method, params)
       || (method === 'thread/resume' && params?.threadId === this.threadId && params.excludeTurns === true && Object.keys(params).length === 2)
       || (method === 'turn/interrupt' && params?.threadId === this.threadId && typeof params.turnId === 'string' && !!params.turnId && Object.keys(params).length === 2)
+      || (method === 'thread/queue/add' && params?.threadId === this.threadId && typeof params.clientUserMessageId === 'string' && Array.isArray(params.input) && Object.keys(params).length === 3)
       || (method === 'turn/start' && params?.threadId === this.threadId && Object.keys(params).every(k => ['threadId', 'input', 'clientUserMessageId'].includes(k)));
   }
   hydrate() {

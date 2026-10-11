@@ -35,8 +35,8 @@ test('imports the exact existing thread with a durable protective marker, and re
   store.init(); assert.equal(store.get(first.session.id).codexSharedOnly, true);
   assert.ok(f.calls.every((m) => m === 'thread/read'));
 });
-test('refuses active/unloaded/child/noninteractive/wrong-id/outside-root tasks before creating a session', async () => {
-  for (const patch of [{ status: { type: 'active' } }, { status: { type: 'notLoaded' } },
+test('refuses unloaded/child/fork/noninteractive/wrong-id/outside-root tasks before creating a session', async () => {
+  for (const patch of [{ status: { type: 'notLoaded' } }, { forkedFromId: threadId },
     { parentThreadId: threadId }, { canAcceptDirectInput: false }, { canAcceptDirectInput: undefined }, { id: 'other' }, { cwd: root }]) {
     const f = fixture(); Object.assign(f.facts.thread, patch);
     await assert.rejects(f.run()); assert.equal(store.list().length, 0); assert.equal(f.bindings.read().length, 0);
@@ -75,4 +75,22 @@ test('privacy/cancellation and failure to persist prevent binding', async () => 
   await assert.rejects(g.run(), /Connection lost/); assert.equal(store.list().length, 0);
   const h = fixture(); h.deps.store = { ...store, createCodexReference() { throw new Error('disk full'); } };
   await assert.rejects(h.run(), /disk full/); assert.equal(h.bindings.read().length, 0);
+});
+
+
+test('explicit import can associate an active root without input, resume or changing its native state',async()=>{
+ const f=fixture();f.facts.thread.status={type:'active',activeFlags:[]};
+ const first=await f.run();const second=await f.run();
+ assert.equal(first.session.id,second.session.id);assert.equal(store.list().length,1);
+ assert.equal(f.facts.thread.status.type,'active');assert.ok(f.calls.every(m=>m==='thread/read'));
+ store.init();assert.equal((await f.run()).binding.threadId,threadId);
+});
+
+test('active import revalidates root eligibility after persisting its pending reference',async()=>{
+ const f=fixture();let reads=0;const connect=f.deps.connect;
+ f.deps.connect=async()=>{const c=await connect();const read=c.call;c.call=async(...args)=>{
+  if(++reads===2)f.facts.thread.forkedFromId=threadId;return read(...args);
+ };return c;};
+ await assert.rejects(f.run());assert.equal(f.bindings.read().length,0);
+ assert.equal(store.list()[0].codexSharedOnly,true);
 });
