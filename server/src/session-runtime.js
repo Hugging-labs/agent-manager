@@ -12,6 +12,13 @@ export class SessionRuntime {
       .finally(()=>this.checks.delete(session.id));
     this.checks.set(session.id,pending);return pending;
   }
+  // Coordination must await a fresh native observation. An absent TUI or an
+  // unavailable daemon is not evidence that a shared task has finished.
+  async coordinationState(session) {
+    if (!this.shared(session)) return null;
+    const current = await this.refresh(session);
+    return ({working:'working', idle:'waiting', 'needs-input':'waiting', unloaded:'stopped'})[current?.status] || 'unknown';
+  }
   presentation(session) {
     if(!this.shared(session))return null;
     const current=this.states.get(session.id);
@@ -31,6 +38,9 @@ export class SessionRuntime {
     let client,problem=null;
     try {({client}=await this.codex.attach(session.id));}
     catch(e){problem=e.message;}
+    // Display catch-up is optional and uses its own bounded transport. Sending
+    // input and receiving approvals never depend on downloading old tool output.
+    if (client?.hydrate) await client.hydrate();
     const state=await this.refresh(session);
     const requests=client?requestView(client):[];
     if(client)for(const t of page.turns||[]) {

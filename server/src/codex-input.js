@@ -98,7 +98,7 @@ export class CodexInput {
       catch {throw new ApiError(503,'codex-recovery-uncertain','Reconnection could not be confirmed. Refresh before trying again; no message was sent.');}
       finally {client.recoveryParams=null;}
       verifyRecovered(resumed,plan.settings,context.threadId);
-      await client.hydrate();this.check(id,context);
+      this.check(id,context);
       this.clients.get(id)?.client.close();this.clients.set(id,{client,stamp:context.stamp});client=null;
       return {ok:true,reconnected:true,threadId:context.threadId};
     } finally {client?.close();this.busy.delete(id);this.reconnecting.delete(id);}
@@ -135,6 +135,11 @@ export class CodexInput {
     if (client) return { client, context };
     // No implicit task loading or daemon boot. Attach is a subscription to a
     // verified existing task, with zero settings overrides.
+    // Closed transports do not own a subscription or usable interactive
+    // requests. Prune every dead entry, not just the task being reopened.
+    for (const [key, entry] of this.clients) {
+      if (entry.client.closed) this.clients.delete(key);
+    }
     if (this.clients.size >= 50) throw fail('codex-client-limit', 'Too many connected Reader sessions.');
     client = await this.connect(context.endpoint);
     try {
@@ -144,7 +149,6 @@ export class CodexInput {
       this.check(id, context); this.assertWritable();
       const resumed = await client.call('thread/resume', { threadId: context.threadId, excludeTurns: true });
       if (resumed?.thread?.id !== context.threadId) throw fail('codex-thread-mismatch', 'The server returned a different conversation.');
-      if(client.hydrate)await client.hydrate();
       this.check(id, context);
       this.clients.set(id, { client, stamp: context.stamp });
       return { client, context };

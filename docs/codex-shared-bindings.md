@@ -98,6 +98,21 @@ anything or stop the task. These controls use the existing private deployment,
 operator-intent, privacy-lock and exact-binding checks; they are not a new
 public authentication boundary.
 
+Reader display catch-up is separate from subscription, input and reconnection.
+It checks the latest turn summary first and never fetches completed turns in
+full. An active-turn snapshot uses a separate read-only connection with the
+same 2 MiB transport limit. If that snapshot cannot be loaded, the Reader keeps
+its paginated transcript instead of replacing it with partial live content;
+the interactive connection and pending approvals remain available. Closed
+transports are pruned before enforcing the 50-client subscription limit; live
+subscriptions and their pending requests are retained.
+
+`GET /api/agents/:id/wait` and `/tail` await fresh shared-server state, regardless
+of whether an AM terminal is open. Unavailable or unrecognized native state is
+reported as `unknown` and never satisfies a wait. Shared tasks honor the settle
+interval even when unloaded, because another device can reload them. Legacy
+sessions retain their process-based behavior.
+
 For an isolated host pilot, `AM_WORKSPACES_DIR` may select an existing absolute
 project root without moving files or sharing production AM data. This is an
 administrator setting, not an API input. All resolved workspace checks still
@@ -192,6 +207,7 @@ Run from `server/`:
 
 ```sh
 node ../scripts/run-suites.mjs codex-reader codex-import codex-bindings codex-context codex-shared.test api-http api-boundary request-admission codex-repin revive
+node test/codex-shared-regressions.test.mjs
 node test/codex-shared-pilot.test.mjs
 node test/codex-reader-input-live.test.mjs
 ```

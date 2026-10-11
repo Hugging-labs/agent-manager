@@ -1016,13 +1016,16 @@ api.get('/api/agents/:id', async (req, res) => {
 
 // A peer's screen (plus scrollback) — watch progress without spending a turn on
 // either side. This is the cheap way to answer "how far has it got?".
-api.get('/api/agents/:id/tail', (req, res) => {
+api.get('/api/agents/:id/tail', async (req, res) => {
   const s = store.get(req.params.id);
   if (!s) return res.status(404).json({ error: 'not found' });
   const lines = clamp(parseInt(req.query.lines || '80', 10), 1, 2000, 80);
   const text = capturePane(s.id, lines);
-  if (text === null) return res.json({ id: s.id, state: 'stopped', text: '', note: 'not running' });
-  res.json({ id: s.id, state: deriveState(s, agentInfo().get(s.id)), text });
+  const sharedState = await sessionRuntime.coordinationState(s);
+  if (isLocked()) return res.status(403).json(lockError());
+  const state = sharedState ?? deriveState(s, agentInfo().get(s.id));
+  if (text === null) return res.json({ id: s.id, state, text: '', note: sharedState === null ? 'not running' : 'no local terminal; task state observed on shared server' });
+  res.json({ id: s.id, state, text });
 });
 
 // The sub-agents this session spawned, and one sub-agent's own transcript.
@@ -1078,13 +1081,17 @@ api.get('/api/agents/:id/wait', async (req, res) => {
     if (isLocked()) return res.status(403).json(lockError());
     const cur = store.get(s0.id);
     if (!cur) return res.json({ id: s0.id, state: 'gone', matched: false });
-    const state = deriveState(cur, agentInfo().get(cur.id));
+    const sharedState = await sessionRuntime.coordinationState(cur);
+    if (!open) return;
+    if (isLocked()) return res.status(403).json(lockError());
+    if (!store.get(s0.id)) return res.json({ id: s0.id, state: 'gone', matched: false });
+    const state = sharedState ?? deriveState(cur, agentInfo().get(cur.id));
     const waited = Math.round((Date.now() - startedAt) / 1000);
-    if (want.has(state)) {
+    if (state !== 'unknown' && want.has(state)) {
       if (!matchedAt) matchedAt = Date.now();
-      // 'stopped' can't flap (a dead session doesn't revive itself), so don't
-      // make the caller sit through the settle window for it.
-      if (state === 'stopped' || Date.now() - matchedAt >= settle) {
+      // Only a stopped legacy process can bypass settling. Shared tasks can
+      // be loaded by another device even when no local terminal exists.
+      if ((sharedState === null && state === 'stopped') || Date.now() - matchedAt >= settle) {
         return res.json({ id: cur.id, state, matched: true, waited });
       }
     } else {

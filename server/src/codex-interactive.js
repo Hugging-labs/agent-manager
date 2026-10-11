@@ -3,17 +3,52 @@ import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { ObservationClient } from './codex-shared.js';
 
+// A large display snapshot may exceed the transport bound. Keep it isolated
+// from the subscribed connection that owns pending approvals and input.
+class TurnSnapshotClient extends ObservationClient {
+  allows(method, params) {
+    return super.allows(method, params) || (method === 'thread/turns/list'
+      && params?.threadId === this.threadId && params.limit === 1
+      && params.itemsView === 'full' && params.sortDirection === 'desc'
+      && Object.keys(params).length === 4);
+  }
+}
+
 export class CodexInteractiveClient extends ObservationClient {
   allows(method, params) {
     return (method === 'thread/resume' && this.recoveryParams && isDeepStrictEqual(params, this.recoveryParams)) || super.allows(method, params)
       || (method === 'thread/resume' && params?.threadId === this.threadId && params.excludeTurns === true && Object.keys(params).length === 2)
       || (method === 'turn/interrupt' && params?.threadId === this.threadId && typeof params.turnId === 'string' && !!params.turnId && Object.keys(params).length === 2)
-      || (method === 'turn/start' && params?.threadId === this.threadId && Object.keys(params).every(k => ['threadId', 'input', 'clientUserMessageId'].includes(k)))
-      || (method === 'thread/turns/list' && params?.threadId === this.threadId && params.limit === 1 && params.itemsView === 'full');
+      || (method === 'turn/start' && params?.threadId === this.threadId && Object.keys(params).every(k => ['threadId', 'input', 'clientUserMessageId'].includes(k)));
   }
-  async hydrate() {
+  hydrate() {
+    // One catch-up per subscription, shared by concurrent Reader requests.
+    this.hydration ??= this.hydrateSnapshot();
+    return this.hydration;
+  }
+  async readSnapshot() {
+    const snapshot = await TurnSnapshotClient.connect(this.endpoint);
+    try {
+      snapshot.threadId = this.threadId;
+      return await snapshot.call('thread/turns/list', {threadId:this.threadId, limit:1, itemsView:'full', sortDirection:'desc'});
+    } finally { snapshot.close(); }
+  }
+  async hydrateSnapshot() {
     const version=this.eventVersion||0;
-    const page=await this.call('thread/turns/list',{threadId:this.threadId,limit:1,itemsView:'full',sortDirection:'desc'});
+    let activeId, page;
+    try {
+      const summary = await this.call('thread/turns/list', {threadId:this.threadId, limit:1, itemsView:'summary', sortDirection:'desc'});
+      const latest = summary.data?.[0];
+      if (latest?.status !== 'inProgress') return;
+      activeId = latest.id;
+      page = await this.readSnapshot();
+    } catch {
+      // Keep the main subscription and its requests. Incomplete live snapshots
+      // must not replace the complete, paginated transcript already in Reader.
+      if (!this.closed && (activeId || this.turnId)) this.turn(activeId || this.turnId).incomplete = true;
+      return;
+    }
+    if (this.closed) return;
     // A snapshot may race events. Seed only missing items, never overwrite a delta.
     for(const t of (page.data||[]).filter(t=>t.status==='inProgress')) {
       if((this.eventVersion||0)!==version && this.turnId && this.turnId!==t.id)continue;

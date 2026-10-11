@@ -121,3 +121,31 @@ test('recovery refuses stale identity, archived tasks, locks, cancellation and c
  await assert.rejects(f.hub.reconnect('am',{recoveryKey:'a'.repeat(64)},{signal:AbortSignal.abort()}),{code:'codex-recovery-cancelled'});
  assert.equal(f.calls.some(c=>c.method==='thread/resume'),false);
 });
+
+
+test('input and subscription do not wait for display hydration',async()=>{
+ const f=fixture();let hydrated=false;
+ f.client.hydrate=async()=>{hydrated=true;throw Error('large display snapshot');};
+ await f.hub.send('am',{text:'still sendable',requestId:randomUUID()});
+ assert.equal(hydrated,false);assert.equal(f.client.closed,false);
+ assert.equal(f.calls.filter(c=>c.method==='turn/start').length,1);
+});
+
+test('closed clients release capacity while live subscriptions and pending requests are preserved',async()=>{
+ const hub=new CodexInput({enabled:()=>true});
+ hub.context=id=>({stamp:id,threadId:id,endpoint});
+ hub.metadata=async()=>({status:{type:'idle'},canAcceptDirectInput:true});hub.check=()=>{};
+ hub.connect=async()=>({closed:false,requests:new Map(),call:async(_m,p)=>({thread:{id:p.threadId}}),close(){this.closed=true;}});
+ for(let i=0;i<50;i++)await hub.attach('task'+i);
+ await assert.rejects(hub.attach('extra'),{code:'codex-client-limit'});
+ const retained=hub.clients.get('task0').client;
+ retained.requests.set('approval',{key:'approval'});
+ for(const [id,entry] of hub.clients)if(id!=='task0')entry.client.close();
+ await hub.attach('new');assert.equal(hub.clients.size,2);
+ assert.equal(hub.clients.get('task0').client,retained);
+ assert.equal(retained.requests.size,1);assert.equal(retained.closed,false);
+ // A global transport disconnect must also allow a completely new task.
+ for(const entry of hub.clients.values())entry.client.close();
+ await hub.attach('after-restart');assert.equal(hub.clients.size,1);
+ assert.equal(hub.clients.has('after-restart'),true);
+});

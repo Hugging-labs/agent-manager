@@ -5,7 +5,7 @@ import {CodexInteractiveClient} from '../src/codex-interactive.js';
 import {liveView,requestView} from '../src/codex-view.js';
 import {SessionRuntime} from '../src/session-runtime.js';
 import {readTraceByPath} from '../src/traces.js';
-function client(){const c=Object.create(CodexInteractiveClient.prototype);c.threadId='thread';return c;}
+function client(){const c=Object.create(CodexInteractiveClient.prototype);c.threadId='thread';c.call=async()=>({data:[]});return c;}
 function emit(c,method,params){c.receiveServerMessage({method,params:{threadId:'thread',turnId:'turn',...params}});}
 test('streamed reasoning, tool output and message use existing AM blocks, isolate threads',()=>{
  const c=client();emit(c,'turn/started',{turn:{id:'turn'}});
@@ -42,7 +42,7 @@ test('adapter translates server state, settles live records and never selects by
 });
 
 test('status notifications during hydration do not discard the current turn',async()=>{
- const c=client();c.call=async()=>{
+ const c=client();c.call=async()=>({data:[{id:'current',status:'inProgress'}]});c.readSnapshot=async()=>{
   emit(c,'thread/status/changed',{turnId:undefined,status:{type:'active',activeFlags:[]}});
   return {data:[{id:'current',status:'inProgress',items:[{id:'prompt',type:'userMessage',content:[{type:'text',text:'Terminal prompt'}]}]}]};
  };
@@ -50,7 +50,7 @@ test('status notifications during hydration do not discard the current turn',asy
 });
 
 test('hydration orders prompt before deltas arriving during the snapshot',async()=>{
- const c=client();c.call=async()=>{
+ const c=client();c.call=async()=>({data:[{id:'current',status:'inProgress'}]});c.readSnapshot=async()=>{
   emit(c,'item/agentMessage/delta',{turnId:'current',itemId:'answer',delta:'newer streamed text'});
   return {data:[{id:'current',status:'inProgress',items:[
    {id:'prompt',type:'userMessage',content:[{type:'text',text:'Phone prompt'}]},
@@ -72,4 +72,38 @@ test('a fresh reader tail retires older completed live turns outside its page',a
  const runtime=new SessionRuntime({bindings:{forSession:()=>({})},codex:{attach:async()=>({client:c}),status:async()=>({status:'idle'})}});
  const page=await runtime.trace({id:'s',cli:'codex'},{turns:[{nativeTurnId:'new',event:{type:'task-complete'}}],window:{atEnd:true,atStart:false}});
  assert.equal(page.live.turns.length,0);
+});
+
+
+test('idle hydration skips full history and active hydration failure preserves requests and saved transcript',async()=>{
+ const idle=client();let reads=0;
+ idle.call=async()=>({data:[{id:'old',status:'completed'}]});
+ idle.readSnapshot=async()=>{reads++;throw Error('oversized');};
+ await idle.hydrate();assert.equal(reads,0);
+ const active=client();active.call=async()=>({data:[{id:'turn',status:'inProgress'}]});
+ active.readSnapshot=async()=>{reads++;throw Error('oversized');};
+ emit(active,'item/agentMessage/delta',{itemId:'partial',delta:'partial'});
+ active.receiveServerMessage({id:42,method:'item/commandExecution/requestApproval',params:{threadId:'thread',turnId:'turn'}});
+ await Promise.all([active.hydrate(),active.hydrate()]);
+ assert.equal(reads,1);assert.equal(active.requests.size,1);
+ assert.deepEqual(liveView(active),{replaceTurnIds:[],turns:[]});
+ emit(active,'item/started',{turnId:'next',item:{id:'answer',type:'agentMessage',text:'next turn'}});
+ assert.deepEqual(liveView(active).replaceTurnIds,['next']);
+});
+
+test('coordination awaits native state, never uses cached idle or a missing terminal as completion',async()=>{
+ let status='working',resolve,fail=false;
+ const runtime=new SessionRuntime({bindings:{forSession:()=>({})},codex:{status:async()=>{
+  if(fail)throw Error('disconnected');
+  await new Promise(r=>{resolve=r;});return {status};
+ }}});
+ const s={id:'shared',cli:'codex'};
+ runtime.states.set(s.id,{status:'idle',at:Date.now()});
+ for(const [native,state] of [['working','working'],['idle','waiting'],['needs-input','waiting'],['unloaded','stopped'],['error','unknown']]){
+  status=native;let settled=false;
+  const check=runtime.coordinationState(s).then(v=>{settled=true;return v;});
+  await Promise.resolve();assert.equal(settled,false);resolve();assert.equal(await check,state);
+ }
+ fail=true;assert.equal(await runtime.coordinationState(s),'unknown');
+ assert.equal(await runtime.coordinationState({id:'shell',cli:'shell'}),null);
 });
