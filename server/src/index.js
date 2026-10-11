@@ -1,3 +1,5 @@
+import { sharedCodexRollout } from './codex-reader.js';
+import { conversationActivity, agentListOptions, filterAgentRows } from './agent-list.js';
 import {CodexMigration} from './codex-migrate.js';
 import {CodexCreation, sharedCreationEnabled} from './codex-create.js';
 import { SessionRuntime } from './session-runtime.js';
@@ -968,31 +970,49 @@ function agentRow(s, act, d, selfId, mates) {
     lastAnswer: d ? d.lastAssistantText || null : null,
     recentFiles: d ? d.sinceFiles : [],
     createdAt: s.createdAt,
+    archivedAt: s.archivedAt || null,
+    ...conversationActivity(d),
   };
 }
 
+// A shared binding is authoritative even when the imported AM row has no
+// codexRollout. Never borrow a neighboring file or stale legacy digest on failure.
+async function agentEvidence(session, bulk) {
+  if (sessionRuntime.shared(session)) {
+    try {
+      const file = await sharedCodexRollout(session);
+      const digest = await digestFor({...session,codexRollout:file});
+      return {digest,trace:{format:'jsonl',path:file},error:digest ? null : 'activity-unavailable'};
+    } catch { return {digest:null,trace:null,error:'codex-reader-unavailable'}; }
+  }
+  const digest = await digestFor(session) || (bulk ?? await traceDigests({fresh:true})).get(session.id) || null;
+  return {digest,trace:await traceLocation(session),error:null};
+}
+
 api.get('/api/agents', async (req, res) => {
-  // `?group=` narrows the roster to one sidebar group, by name, ignoring case.
-  const group = req.query.group === undefined ? null : String(req.query.group).trim();
-  if (group !== null && (!group || group.length > 120)) return res.status(400).json({ error: 'group filter is invalid' });
+  const options = agentListOptions(req.query, {cliExists:cliById});
   const info = agentInfo();
-  const digests = await traceDigests();
+  const digests = await traceDigests({fresh:true});
   const selfId = String(req.query.from || req.query.self || '').trim() || null;
   const mates = folderMates();
   const agents = [];
-  for (const s of store.list()) {
-    // The bulk trace build is stale-while-revalidate — fine for the Overview
-    // polling at 1Hz, wrong here: an agent reads the roster ONCE and would see
-    // nulls for a peer that just answered. Fall back to the targeted parse
-    // (cheap, and shares the per-file cache) for anything the bulk pass hasn't
-    // caught up on yet.
-    const d = digests.get(s.id) || (promptable(s) ? await digestFor(s) : null);
-    const row = agentRow(s, info.get(s.id), d, selfId, mates);
-    row.trace = await traceLocation(s);
-    agents.push(row);
+  const sessions = store.list();
+  // Bound observation fan-out; one unavailable daemon must not serialize every timeout.
+  for (let offset = 0; offset < sessions.length; offset += 4) {
+    const batch = await Promise.all(sessions.slice(offset,offset+4).map(async s => {
+    const evidence = await agentEvidence(s, digests);
+    const state = await sessionRuntime.coordinationState(s);
+    const row = agentRow(s, info.get(s.id), evidence.digest, selfId, mates);
+    if (state !== null) row.state = state;
+    row.trace = evidence.trace;
+    row.activityError = evidence.error;
+    return row;
+    }));
+    agents.push(...batch);
   }
   res.json({
-    agents: filterAgentsByGroup(agents, group),
+    agents: filterAgentRows(agents, options),
+    activityErrors: agents.filter(row=>row.activityError).map(row=>({id:row.id,code:row.activityError})),
     // Which CLIs a spawn can ask for. `ready` = a credential was found.
     // Remote agents are absent from the spawn list on purpose: creating one
     // produces a pane waiting for a human to paste its prompt onto another
@@ -1007,15 +1027,13 @@ api.get('/api/agents/:id', async (req, res) => {
   const s = store.get(req.params.id);
   if (!s) return res.status(404).json({ error: 'not found' });
   const selfId = String(req.query.from || req.query.self || '').trim() || null;
-  // digestFor() parses just this session's own files; the bulk map covers the
-  // db-backed CLIs it can't target.
-  const { _ts, ...d } = (await digestFor(s)) || (await traceDigests()).get(s.id) || {};
-  const digest = Object.keys(d).length ? d : null;
-  const row = agentRow(s, agentInfo().get(s.id), digest, selfId, folderMates());
-  row.trace = await traceLocation(s);
-  // The full digest adds the markdown-preserving prompt/answer, tool counts,
-  // and the intermediate turns of the current request.
-  row.digest = digest;
+  const evidence = await agentEvidence(s);
+  const state = await sessionRuntime.coordinationState(s);
+  const row = agentRow(s, agentInfo().get(s.id), evidence.digest, selfId, folderMates());
+  if (state !== null) row.state = state;
+  row.trace = evidence.trace;
+  row.activityError = evidence.error;
+  row.digest = evidence.digest;
   res.json(row);
 });
 
@@ -1993,9 +2011,28 @@ curl -s -H 'X-AM-Request: 1' "http://localhost:\${AM_PORT:-${PORT}}/api/agents?f
 Each entry carries \`id\`, \`name\`, \`cli\`, \`state\`, \`workdir\`, \`sharesFolderWith\`,
 a one-line \`lastPrompt\`/\`lastAnswer\`, \`recentFiles\`, and \`trace\` — the path to
 its raw conversation log, which you can read directly with \`jq\` when you need
-the full history rather than a summary. \`?group=<name>\` keeps only one sidebar
-group (name matched ignoring case). \`GET /api/agents/$ID\` adds the full
-digest for one agent. Read \`state\` before you do anything:
+the full history rather than a summary. Entries also expose \`lastPromptAt\`,
+\`lastAnswerAt\`, \`lastActivityAt\` (ISO UTC, or null when unknown), and
+\`activityKind\` (prompt, answer, or null). These dates describe conversation
+exchanges, including assistant progress text, not screen updates, imports,
+creation, tools or task-completion markers. A previous answer's date survives
+a new prompt even though its summary clears. Transcript parsing is cached.
+
+List filters: \`group\` (case-insensitive name), comma-separated \`state\` and
+\`cli\`, \`active_within_minutes\` (integer 0–52560000), \`include_archived=true|false\`
+(default false, excludes explicitly archived AM entries), and \`limit\` (1–1000).
+\`sort\` accepts \`recent_conversation\`, \`recent_answer\`, \`recent_prompt\`,
+\`created\` (newest first), or \`name\` (ascending). Without sort, stored order
+is preserved; limit is applied after filtering and sorting. Unknown activity
+does not match a time window. Invalid/unsupported options return HTTP 400.
+
+Shared/imported Codex entries resolve only their verified bound transcript.
+An unavailable source yields null dates plus \`activityError\`; the list's
+\`activityErrors\` reports those omissions even when a time filter hides the
+row. Do not interpret an incomplete inventory as absence of recent work.
+Shell/passive entries without conversations have null exchange dates.
+\`GET /api/agents/$ID\` exposes the same dates and the full digest.
+Read \`state\` before you do anything:
 
 - \`working\` — thinking or running a tool right now. **Leave it alone.**
 - \`waiting\` — done, and nobody has replied to it. Safe to talk to.
