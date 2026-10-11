@@ -26,6 +26,8 @@ for(const [thread,time]of [[tid,now-60000],[oldTid,now-10*864e5],[archTid,now-12
  fs.writeFileSync(file,[{type:'session_meta',timestamp:new Date(now).toISOString(),payload:{id:thread,cwd:work}},message('user','question',time-10000),message('assistant','answer',time),{type:'event_msg',timestamp:new Date(now).toISOString(),payload:{type:'token_count'}}].map(JSON.stringify).join('\n')+'\n');
 }
 const rollout=files.get(tid),sourceThread=tid;
+// A recent exchange outside the display tail must remain visible in filters.
+fs.appendFileSync(rollout,JSON.stringify({type:'response_item',payload:{type:'function_call_output',output:'x'.repeat(13*1024*1024)}})+'\n');
 const server=http.createServer(),wss=new WebSocketServer({server});
 let unavailable=false;const calls=[];
 wss.on('connection',ws=>ws.on('message',raw=>{
@@ -80,8 +82,14 @@ try {
  const one=(await request('/api/agents/imported')).body;assert.equal(one.lastActivityAt,row.lastActivityAt);
  // A new prompt must retain the date of the previous answer while summary clears it.
  const next=now+1000;fs.appendFileSync(rollout,JSON.stringify(message('user','new prompt',next))+'\n');
- const changed=(await request('/api/agents/imported')).body;
+ let changed;
+ for(let i=0;i<50;i++){changed=(await request('/api/agents/imported')).body;if(changed.lastPromptAt===new Date(next).toISOString())break;await new Promise(r=>setTimeout(r,250));}
  assert.equal(changed.lastPromptAt,new Date(next).toISOString());assert.equal(changed.lastAnswerAt,row.lastAnswerAt);assert.equal(changed.lastAnswer,null);
+ // Oversized records surface uncertainty even when a time filter hides rows.
+ fs.appendFileSync(rollout,JSON.stringify({type:'response_item',payload:{type:'function_call_output',output:'x'.repeat(17*1024*1024)}})+'\n');
+ let incomplete;
+ for(let i=0;i<50;i++){incomplete=(await request('/api/agents?active_within_minutes=0')).body;if(incomplete.activityErrors.some(e=>e.id==='imported'))break;await new Promise(r=>setTimeout(r,250));}
+ assert.ok(incomplete.activityErrors.some(e=>e.id==='imported'&&e.code==='activity-incomplete'));
  unavailable=true;
  const failed=(await request('/api/agents?active_within_minutes=5760&include_archived=true')).body;
  assert.equal(failed.agents.length,0);assert.equal(failed.activityErrors.length,3);

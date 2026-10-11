@@ -982,11 +982,11 @@ async function agentEvidence(session, bulk) {
     try {
       const file = await sharedCodexRollout(session);
       const digest = await digestFor({...session,codexRollout:file});
-      return {digest,trace:{format:'jsonl',path:file},error:digest ? null : 'activity-unavailable'};
+      return {digest,trace:{format:'jsonl',path:file},error:digest ? digest.activityError || null : 'activity-unavailable'};
     } catch { return {digest:null,trace:null,error:'codex-reader-unavailable'}; }
   }
   const digest = await digestFor(session) || (bulk ?? await traceDigests({fresh:true})).get(session.id) || null;
-  return {digest,trace:await traceLocation(session),error:null};
+  return {digest,trace:await traceLocation(session),error:digest?.activityError || null};
 }
 
 api.get('/api/agents', async (req, res) => {

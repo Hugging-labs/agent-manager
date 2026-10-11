@@ -1,3 +1,4 @@
+import { traceActivity } from './trace-activity.js';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
@@ -159,9 +160,8 @@ function digestTool(d, name, file) {
 // Multi-block assistant messages repeat the same message.id AND usage across
 // several lines — dedupe both turns/usage (by message id) and tool_use blocks
 // (by block id) or everything double-counts.
-function parseClaude(txt) {
+function parseClaude(txt, dg = emptyDigest()) {
   const st = emptyStats();
-  const dg = emptyDigest();
   st.files = 1;
   const seenMsg = new Set();
   const seenTool = new Set();
@@ -221,9 +221,8 @@ function parseClaude(txt) {
 // ---------- Codex rollouts (CODEX_HOME/sessions/**/rollout-*-<uuid>.jsonl) ----------
 const codexText = (p) => (Array.isArray(p.content) ? p.content.map((c) => (c && c.text) || '').join(' ') : '');
 
-function parseCodex(txt) {
+function parseCodex(txt, dg = emptyDigest()) {
   const st = emptyStats();
-  const dg = emptyDigest();
   st.files = 1;
   let tok = null; // token_count events are cumulative per run — keep the last
   let tokAtPrompt = 0; // cumulative total when you last prompted (for sinceTokens)
@@ -814,6 +813,12 @@ async function statsFor(p, parser, quietMs = 0) {
   let parsed;
   const t0 = Date.now();
   try { parsed = parser(await readTraceFile(p, m.size)); } catch { return null; }
+  if (m.size > MAX_TRACE_BYTES) {
+    if (parser === parseCodex || parser === parseClaude) {
+      try { Object.assign(parsed.digest, await traceActivity(p, parser, emptyDigest)); }
+      catch { parsed.digest.activityError = 'activity-unavailable'; }
+    } else parsed.digest.activityError = 'activity-incomplete';
+  }
   fileCache.set(p, { key, parsed, cost: Date.now() - t0, at: t0, statAt: now, mtimeMs: m.mtimeMs });
   return parsed;
 }

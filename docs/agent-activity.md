@@ -15,12 +15,19 @@ is set. The list's `activityErrors` preserves those warnings even if the row
 is excluded by the activity filter. An empty filtered result with errors is
 not evidence that no work happened.
 
-Other harnesses use their conversation digests. Missing evidence, including
-shell/passive entries, stays null. Existing parsing caches and bounded tail
-reads apply: very long transcripts may not retain an older exchange outside
-the parsed window. These fields are timestamps of observed exchanges, not a
-claim of a complete historical audit or instantaneous delivery. Unknown dates
-never become the time a file was modified, imported or read.
+Codex and Claude exchange dates are scanned independently of the 12 MiB display
+digest. The bounded-memory JSONL scan retains an append cursor, so long tool
+output cannot hide earlier exchanges. Individual records above 16 MiB, malformed
+records and incomplete final records produce `activity-incomplete`; unreadable
+activity evidence produces `activity-unavailable`. Known dates can still be
+returned alongside that warning. The scanner detects file replacement,
+truncation and same-size rewrites; normal transcript growth is append-only.
+
+Other harnesses use their conversation digests; a truncated digest explicitly
+reports `activity-incomplete`. Missing evidence, including shell/passive entries,
+stays null. Existing parsing caches apply: these are observed exchange times,
+not a claim of instantaneous delivery. Unknown dates never become the time a
+file was modified, imported or read.
 
 List options:
 

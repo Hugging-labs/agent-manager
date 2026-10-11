@@ -1,3 +1,4 @@
+import { withDurableIntent } from './lib/durableIntent';
 import {withCreationIntent} from './lib/creationIntent';
 import type { Cli, Group, MoveTarget, RemoteInfo, RemoteMessage, Session, Tree } from './types';
 import { ApiError, connectionError, decodeJsonText, decodeResponse } from './apiResponse';
@@ -476,14 +477,19 @@ export const insertAttachments = (
   }).then(jsonOrError);
 
 export const sendInput = async (id: string, text: string, attachmentIds: string[] = []): Promise<{ ok: boolean; started?: boolean }> => {
-  const key='am-pending-input:'+id, content=JSON.stringify([text,attachmentIds]);
-  let pending: {content: string; requestId: string} | null=null;
-  try {pending=JSON.parse(localStorage.getItem(key)||'null');} catch { /* invalid saved draft */ }
-  if(!pending||pending.content!==content)pending={content,requestId:typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : '10000000-1000-4000-8000-100000000000'.replace(/[018]/g, c => (Number(c) ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> Number(c) / 4).toString(16))};
-  localStorage.setItem(key,JSON.stringify(pending));
-  const result=await fetch(`/api/sessions/${id}/input`, {method:'POST',headers:HEADERS,body:JSON.stringify({text,attachmentIds,requestId:pending.requestId})}).then(jsonOrError);
-  try {localStorage.removeItem(key);} catch { /* accepted receipt still prevents replay */ }
-  return result;
+  const legacyKey = 'am-pending-input:' + id;
+  const payload = [text, attachmentIds];
+  const legacyId = () => {
+    try {
+      const old = JSON.parse(localStorage.getItem(legacyKey) || 'null');
+      return old?.content === JSON.stringify(payload) ? old.requestId : null;
+    } catch { return null; }
+  };
+  return withDurableIntent('am-pending-input:' + id, payload, async requestId => {
+    const result = await fetch(`/api/sessions/${id}/input`, {method:'POST',headers:HEADERS,body:JSON.stringify({text,attachmentIds,requestId})}).then(jsonOrError);
+    try { if (legacyId() === requestId) localStorage.removeItem(legacyKey); } catch { /* Keep uncertain legacy receipts. */ }
+    return result;
+  }, legacyId);
 };
 
 // ---- push notifications ----
