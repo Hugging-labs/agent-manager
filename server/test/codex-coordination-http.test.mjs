@@ -94,6 +94,15 @@ try {
  assert.equal((await request(route,{...message,text:'changed'},source.id)).body.code,'codex-request-conflict');
  status='active';assert.equal((await request(route,{text:'must not interrupt',requestId:randomUUID()},source.id)).body.code,'codex-task-busy');
  assert.equal(queue.length,1);
+ // Background connectors send text/plain with a durable UUID header, not JSON.
+ status='idle';
+ const plainId=randomUUID(),plainText='OPAQUE_JOB_WAKEUP';
+ const sendPlain=()=>fetch(base+route,{method:'POST',headers:{'content-type':'text/plain','x-am-message-id':plainId},body:plainText,signal:AbortSignal.timeout(10000)});
+ const plain=await sendPlain();assert.equal(plain.status,200);
+ const receipt=await plain.json();assert.equal(receipt.queued,true);assert.equal(receipt.queuedSubmissionId,'queued-2');
+ const replay=await sendPlain();assert.equal(replay.status,200);assert.equal((await replay.json()).repeated,true);
+ assert.equal(queue.length,2);assert.equal(queue[1].clientUserMessageId,plainId);
+ assert.ok(queue[1].input[0].text.includes(source.id)&&queue[1].input[0].text.includes(plainText));
  const operations=(await request('/api/operations?limit=100')).body.operations;
  assert.ok(operations.some(o=>o.path==='/api/codex/import'&&o.origin?.id===nativeOrigin&&o.status===200));
  assert.ok(operations.some(o=>o.path==='/api/agents'&&o.origin?.id===source.id&&o.status===201));
