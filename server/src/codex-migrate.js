@@ -1,10 +1,9 @@
+import {writerOwner} from './codex-owner.js';
+export {writerOwner} from './codex-owner.js';
 // Explicit migration of an already stopped AM TUI. Never release a process,
 // rewrite a native file, infer a neighbouring task, or send model input.
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import {fileURLToPath} from 'node:url';
-import {execFile} from 'node:child_process';
-import {promisify} from 'node:util';
 import {createHash} from 'node:crypto';
 import {isDeepStrictEqual} from 'node:util';
 import {ApiError} from './api-errors.js';
@@ -17,10 +16,6 @@ const fail=(code,message)=>new ApiError(409,code,message);
 const canonical=value=>Array.isArray(value)?value.map(canonical):value&&typeof value==='object'?Object.fromEntries(Object.keys(value).sort().map(k=>[k,canonical(value[k])])):value;
 const hash=value=>createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
 const enabled=()=>process.env.AM_CODEX_BINDINGS_PILOT==='1'&&process.env.AM_CODEX_MIGRATION==='1';
-export async function writerOwner(home,threadId) {
-  const {stdout}=await promisify(execFile)('python3',[fileURLToPath(new URL('../../scripts/codex-writer.py',import.meta.url)),home,threadId],{timeout:5000,maxBuffer:8192});
-  return JSON.parse(stdout);
-}
 export class MigrationClient extends ObservationClient {
   // Full historical tool results can exceed the Reader's summary-page limit.
   // Keep a finite limit on the trusted local endpoint, only for this verifier.

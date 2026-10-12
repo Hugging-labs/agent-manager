@@ -330,10 +330,13 @@ See [conversation adapter and parity checks](conversation-adapter.md) for the
 current UI-preserving integration and remaining on-device verification.
 
 
-### Explicit recovery
+### Reader recovery after restart
 
 `POST /api/sessions/:id/reconnect` requires operator origin and `{recoveryKey}`
-from that session's presentation. It only reopens the already-bound saved task;
+from that session's presentation. Opening the active, visible Reader calls this
+endpoint automatically once per disconnected state; hidden/archived views stay
+passive and failures retain the explicit retry button. Plain API reads remain
+read-only. It only reopens the already-bound saved task;
 there is no daemon startup, new thread, input replay, or process signal. The
 key covers binding identity and last persisted native settings. Archived,
 changed, already-loaded, unsupported or ambiguous tasks are refused.
@@ -342,7 +345,8 @@ The installed 0.162.1 daemon does **not** reliably preserve a loaded thread's
 sandbox through a bare cold resume: the disposable test changes read-only to
 the workspace default. Recovery therefore restores the verified last-turn
 settings explicitly and checks the result. A complete allowlist compares the
-resolved restricted permission profile against the supported standard presets;
+resolved permission profile against the supported standard presets (read-only,
+workspace-write and an explicitly saved full-access/disabled profile);
 it does not reduce arbitrary permission profiles to a sandbox label. Loaded
 resume ignores configuration overrides in this tested version, so a competing
 client that already loaded the task is not reconfigured by the recovery RPC.
@@ -351,6 +355,9 @@ A mismatched returned configuration is rejected, without model input.
 The existing transcript resolver first verifies the rollout path and header.
 Recovery reads at most its last 8 MiB and requires a genuine `turn_context`
 record for the native latest turn. Text containing JSON is not a context.
+A later native settings event must agree with that context; recovery never
+rolls back a newer permission change. The exact current and reviewed legacy
+Default-mode instruction texts are accepted, not arbitrary custom instructions.
 Missing context, partial writes and unsupported profiles fail closed. No
 conversation or configuration is copied to a new thread.
 
@@ -358,7 +365,10 @@ The crash integration test kills only a disposable daemon. A local WebSocket
 proxy drops the input acknowledgement after acceptance, then both daemon and
 AM restart. The same request ID remains uncertain and cannot replay; a fresh
 explicit prompt succeeds after reconnecting the same thread. Both supported
-permission presets and unchanged bindings are verified with local inference.
+restricted permission presets, full access and unchanged bindings are verified
+with local inference. Immediately before cold resume, Linux writer ownership,
+native goals and queued inputs are checked. An owned/unknown writer or pending
+work prevents reopening; no process is signalled and no lock is deleted.
 
 ### Pilot shared creation
 
@@ -384,9 +394,9 @@ recency automatically. A known returned ID survives later naming/binding errors.
 The task and all originals are retained; there is no automatic deletion.
 
 A never-used empty task has no last-turn settings record. Its name and native
-identity survive daemon restart, but AM's restricted recovery does not guess
+identity survive daemon restart, but AM's verified recovery does not guess
 its configuration: reopen it through the native client after reviewing settings.
-Once it has a supported persisted turn context, normal explicit AM recovery
+Once it has a supported persisted turn context, normal Reader recovery
 applies. Production-wide defaults, agent/cron semantics and further migration
 remain outside this pilot.
 

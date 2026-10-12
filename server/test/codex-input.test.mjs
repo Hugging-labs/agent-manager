@@ -24,7 +24,7 @@ function fixture() {
   async call(method,params){calls.push({method,params});if(method==='thread/turns/list')return {data:[turn]};if(method==='turn/interrupt')return {};if(['turn/start','thread/queue/add'].includes(method)){if(lost)throw Error('timeout');return method==='thread/queue/add'?{queuedSubmission:{id:'queued-fixture',clientUserMessageId:params.clientUserMessageId}}:{turn:{id:'turn-fixture'}};}return {thread};},
   close(){this.closed=true;},async answer(key,response){replies.push({key,response});this.requests.delete(key);}};
  const deps={getSession:()=>session,listSessions:()=>[session],bindings,endpoint:()=>endpoint,connect:async()=>{connects++;return client;},observe:async()=>client,
-  receipts:path.join(root,`receipts-${n}`),enabled:()=>true,assertWritable:()=>{if(locked)throw Error('locked');}};
+  owner:async()=>({state:'free',activeGoal:false,queuedInput:false}),receipts:path.join(root,`receipts-${n}`),enabled:()=>true,assertWritable:()=>{if(locked)throw Error('locked');}};
  return {session,thread,turn,client,calls,replies,deps,hub:new CodexInput(deps),connects:()=>connects,lock:()=>locked=true,lose:()=>lost=true};
 }
 test.after(()=>fs.rmSync(root,{recursive:true,force:true}));
@@ -185,4 +185,11 @@ test('agent delivery rejects known active targets, stale senders, cancellation a
  await assert.rejects(f.hub.sendFromAgent('am',input,'sender'),{code:'codex-send-uncertain'});
  assert.equal(f.calls.filter(c=>c.method==='thread/queue/add').length,1);
  await assert.rejects(f.hub.sendFromAgent('am',{text:'self',requestId:randomUUID()},'am'),{code:'codex-self-message'});
+});
+
+test('reconnect never resumes a held writer, queued input or active goal',async()=>{
+ for(const owner of [{state:'held',activeGoal:false,queuedInput:false},{state:'unknown'},{state:'free',activeGoal:true,queuedInput:false},{state:'free',activeGoal:false,queuedInput:true}]){
+  const f=fixture();f.thread.status={type:'notLoaded'};f.hub.owner=async()=>owner;f.hub.recovery=async()=>({key:'a'.repeat(64),settings:{params:{},expected:{}}});
+  await assert.rejects(f.hub.reconnect('am',{recoveryKey:'a'.repeat(64)}));assert.equal(f.calls.some(c=>c.method==='thread/resume'),false);
+ }
 });

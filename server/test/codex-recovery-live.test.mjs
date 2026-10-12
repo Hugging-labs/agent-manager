@@ -54,7 +54,7 @@ async function stop(child) {
 }
 function startChild(cmd, args, extra = {}) {
   const child = spawn(cmd, args, { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'], ...extra });
-  children.add(child); child.stdout.resume(); child.stderr.resume(); return child;
+  children.add(child); child.stdout.resume(); child.stderr.on('data',b=>{child.testStderr=((child.testStderr||'')+b.toString()).slice(-10000);}); return child;
 }
 async function connect() {
   const ws = new WebSocket('ws://localhost/', { createConnection: () => net.connect(socket) });
@@ -107,7 +107,7 @@ async function startAM() {
 async function call(route, body) {
   const response = await fetch(base + route, { method: body === undefined ? 'GET' : 'POST',
     headers: { 'x-am-origin': 'operator', 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) });
-  const result = await response.json(); assert.equal(response.status, 200, JSON.stringify(result)); return result;
+  const result = await response.json(); assert.equal(response.status, 200, JSON.stringify(result)+'\n'+(am?.testStderr||'')); return result;
 }
 // Drop only the input acknowledgement to AM, while the real daemon accepts the
 // turn. This proves durable no-replay across both daemon and AM crashes.
@@ -183,7 +183,23 @@ try {
  for(const key of ['model','modelProvider','approvalPolicy','approvalsReviewer','sandbox','cwd','reasoningEffort','serviceTier'])assert.deepEqual(wsRestored[key],workspaceOriginal[key],key);
  const competing=await rpc.call('thread/resume',{threadId:workspace.id,excludeTurns:true,model:'other-fixture',sandbox:'read-only',approvalPolicy:'never'});
  for(const key of ['model','sandbox','approvalPolicy'])assert.deepEqual(competing[key],wsRestored[key], 'loaded resume must ignore '+key);
- console.log(JSON.stringify({loadedResumeDoesNotOverride:true,daemonCrash:true,amRestart:true,exactThread:true,settingsPreserved:true,readOnlyAndWorkspacePresets:true,interruptedNotCompleted:true,lostAcknowledgement:true,durableNoReplay:true,staleRecoveryRefused:true,operatorOnly:true,readDoesNotResume:true,explicitNewPromptWorks:true,externalInferenceCalls:0,providerCalls}));
+
+ // Full-access is an existing operator setting, not a default for old threads.
+ const full=(await rpc.call('thread/start',{cwd,model:'fixture-full',sandbox:'danger-full-access',approvalPolicy:'never',approvalsReviewer:'user'})).thread;
+ await rpc.shell(full.id,'printf full-seed');
+ const fullSession=(await call('/api/codex/import',{threadId:full.id})).session;
+ await call('/api/sessions/'+fullSession.id+'/input',{text:'FULL_SETTINGS_FIXTURE',requestId:randomUUID()});
+ await waitFor(async()=>(await call('/api/trace/'+fullSession.id+'?tail=1&v=2')).interaction.canSend);
+ const fullOriginal=await rpc.call('thread/resume',{threadId:full.id,excludeTurns:true});
+ await crashDaemon();await startDaemon();
+ const fullRow=await waitFor(async()=>{const s=(await call('/api/sessions')).find(s=>s.id===fullSession.id);return s.recoveryKey&&s;});
+ const fullCalls=providerCalls;
+ await call('/api/sessions/'+fullSession.id+'/reconnect',{recoveryKey:fullRow.recoveryKey});
+ const fullRestored=await rpc.call('thread/resume',{threadId:full.id,excludeTurns:true});
+ for(const key of ['model','modelProvider','approvalPolicy','approvalsReviewer','sandbox','cwd','reasoningEffort','serviceTier'])assert.deepEqual(fullRestored[key],fullOriginal[key],key);
+ assert.equal(providerCalls,fullCalls,'full-access reconnection sends no model input');
+ assert.equal((await call('/api/trace/'+fullSession.id+'?tail=1&v=2')).interaction.canSend,true);
+ console.log(JSON.stringify({fullAccessPreserved:true,loadedResumeDoesNotOverride:true,daemonCrash:true,amRestart:true,exactThread:true,settingsPreserved:true,readOnlyAndWorkspacePresets:true,interruptedNotCompleted:true,lostAcknowledgement:true,durableNoReplay:true,staleRecoveryRefused:true,operatorOnly:true,readDoesNotResume:true,explicitNewPromptWorks:true,externalInferenceCalls:0,providerCalls}));
 } finally {
  for(const release of [...heldResponses])release();terminal?.terminate();rpc?.close();
  for(const child of [...children].reverse())await stop(child);

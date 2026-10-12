@@ -1297,13 +1297,29 @@ export default function TerminalPane({
   const sharedTask = !!(session.codexShared || session.codexSharedOnly);
   const [reconnecting, setReconnecting] = useState(false);
   const [reconnectedKey, setReconnectedKey] = useState<string | null>(null);
+  const autoRecoveryAttempt = useRef<string | null>(null);
+  const recoveryInFlight = useRef(false);
   const reconnectTask = async () => {
-    if(!session.recoveryKey || reconnecting || reconnectedKey===session.recoveryKey)return;
+    if(!session.recoveryKey || recoveryInFlight.current || reconnectedKey===session.recoveryKey)return;
+    recoveryInFlight.current=true;
     setReconnecting(true);setInterruptError('');
     try {await api.reconnectSession(session.id,session.recoveryKey);setReconnectedKey(session.recoveryKey);}
     catch(error){setInterruptError(error instanceof Error ? error.message : 'Could not reconnect. Refresh the task.');}
-    finally {setReconnecting(false);}
+    finally {recoveryInFlight.current=false;setReconnecting(false);}
   };
+  // Opening a saved Reader restores its verified native settings. Hidden panes
+  // and archived views stay passive. One attempt per disconnect; an error keeps
+  // the explicit retry button instead of creating a background retry loop.
+  useEffect(() => {
+    if (!session.recoveryKey) {
+      autoRecoveryAttempt.current=null;setReconnectedKey(null);return;
+    }
+    const attempt=session.id+":"+session.recoveryKey;
+    if (!sharedTask || !reading || visible===false || !active || session.archivedAt
+        || autoRecoveryAttempt.current===attempt || recoveryInFlight.current) return;
+    autoRecoveryAttempt.current=attempt;
+    void reconnectTask();
+  }, [session.id, session.recoveryKey, session.archivedAt, sharedTask, reading, visible, active]);
   const interruptTurn = async () => {
     const turnId = session.interruptTurnId;
     if (!turnId || interrupting || interruptedTurn === turnId) return;

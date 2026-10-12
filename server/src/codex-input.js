@@ -6,6 +6,7 @@ import { DATA_DIR } from './config.js';
 import { codexBindings, configuredEndpoint, contextForThread } from './codex-context.js';
 import { ObservationClient, taskStatus } from './codex-shared.js';
 import { sharedCodexRollout } from './codex-reader.js';
+import { writerOwner } from './codex-owner.js';
 import { recoveryPlan, verifyRecovered } from './codex-recovery.js';
 import { CodexInteractiveClient } from './codex-interactive.js';
 
@@ -18,8 +19,8 @@ export class CodexInput {
   constructor({ getSession, listSessions, bindings = codexBindings, endpoint = configuredEndpoint,
     connect = (...args) => CodexInteractiveClient.connect(...args), observe = (...args) => ObservationClient.connect(...args),
     receipts = path.join(DATA_DIR, 'codex-input-receipts'), enabled = () => process.env.AM_CODEX_BINDINGS_PILOT === '1',
-    assertWritable = () => {}, } = {}) {
-    Object.assign(this, { getSession, listSessions, bindings, endpoint, connect, observe, receipts, enabled, assertWritable });
+    assertWritable = () => {}, owner = writerOwner, } = {}) {
+    Object.assign(this, { getSession, listSessions, bindings, endpoint, connect, observe, receipts, enabled, assertWritable, owner });
     this.clients = new Map(); this.busy = new Set(); this.attaching = new Map(); this.reconnecting = new Set();
   }
   context(id, { allowArchived = false } = {}) {
@@ -92,6 +93,11 @@ export class CodexInput {
       this.check(id,context);this.assertWritable();
       if(signal?.aborted)throw fail('codex-recovery-cancelled','The task was not reopened.');
       const params={threadId:context.threadId,excludeTurns:true,...plan.settings.params};
+      const owner=await this.owner(context.endpoint.home,context.threadId);
+      if(!['free','absent'].includes(owner.state))throw fail('codex-recovery-owner','Another client may own this task. No session was stopped; retry after it releases the task.');
+      if(owner.activeGoal!==false || owner.queuedInput!==false || this.getSession(id)?.pendingPrompt || this.getSession(id)?.pendingImagePaths?.length)throw fail('codex-recovery-pending','This task has pending work. Review it before reopening; nothing was replayed.');
+      this.check(id,context);this.assertWritable();
+      if(signal?.aborted)throw fail('codex-recovery-cancelled','The task was not reopened.');
       client.recoveryParams=params; // exact one-shot allowlist, never caller-supplied settings
       let resumed;
       try {resumed=await client.call('thread/resume',params);}
