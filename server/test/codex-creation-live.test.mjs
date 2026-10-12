@@ -166,5 +166,34 @@ try {
  await refused();assert.equal(createdIds.length,beforeCount+1);
  await refused();await stop(am);await startAM();await refused();
  assert.equal(createdIds.length,beforeCount+1);assert.equal(providerCalls,beforeCalls);assert.equal((await call('/api/sessions')).length,2);
- console.log(JSON.stringify({remoteReaderOrder:true,uncertainCreationNoRetry:true,emptyCreation:true,emptyReader:true,durableName:true,exactMapping:true,retrySameIdentity:true,amRestart:true,firstPrompt:true,quickStartOnce:true,noTUI:true,externalInferenceCalls:0,providerCalls}));
+ // Agent API: same creation service, honest source attribution, durable retries.
+ const agentRoute='/api/agents?cli=codex&name=Agent-created&from='+made.id;
+ const agentRequest={requestId:randomUUID(),prompt:'AGENT_CREATION_FIXTURE'};
+ async function agentCall(route=agentRoute,body=agentRequest,origin=made.id,plain=false){
+  const r=await fetch(base+route,{method:'POST',headers:{'x-am-origin':origin,'content-type':plain?'text/plain':'application/json',...(plain?{'x-am-message-id':body.requestId}:{})},body:plain?body.prompt:JSON.stringify(body)});
+  return {status:r.status,body:await r.json()};
+ }
+ const invalidBefore=createdIds.length;
+ assert.equal((await agentCall(agentRoute,{prompt:'missing request id'})).status,400);
+ assert.equal((await agentCall(agentRoute+'&path=../escape')).status,400);
+ assert.equal((await agentCall(agentRoute+'&path=missing')).status,400);
+ assert.ok((await agentCall('/api/agents?cli=codex&from=unknown-source',agentRequest,'unknown-source')).status>=400);
+ assert.equal(createdIds.length,invalidBefore);
+ const agentCreated=await agentCall();assert.equal(agentCreated.status,201,JSON.stringify(agentCreated.body));
+ assert.equal(agentCreated.body.codexShared,true);assert.equal(agentCreated.body.path,'work');
+ const agentId=agentCreated.body.id;
+ assert.equal((await call('/api/codex/context?threadId='+agentCreated.body.threadId)).amSessionId,agentId);
+ await waitFor(async()=>(await call('/api/trace/'+agentId+'?tail=1&v=2')).interaction.canSend);
+ const agentView=await call('/api/trace/'+agentId+'?tail=1&v=2');
+ assert.ok(JSON.stringify(agentView).includes('[message from Empty shared fixture:] AGENT_CREATION_FIXTURE'));
+ const countAfter=createdIds.length,callsAfter=providerCalls;
+ assert.equal((await agentCall()).body.id,agentId);
+ // Plain-text callers can preserve the same retry identity in a header.
+ assert.equal((await agentCall(agentRoute,agentRequest,made.id,true)).body.id,agentId);
+ assert.equal((await agentCall(agentRoute,{...agentRequest,prompt:'changed'})).status,409);
+ await stop(am);await startAM();assert.equal((await agentCall()).body.id,agentId);
+ assert.equal(createdIds.length,countAfter);assert.equal(providerCalls,callsAfter);
+ const ops=await call('/api/operations?limit=100');
+ assert.ok(ops.operations.some(o=>o.path==='/api/agents'&&o.origin?.id===made.id&&o.status===201));
+ console.log(JSON.stringify({agentCreation:true,agentRetries:true,agentAttribution:true,remoteReaderOrder:true,uncertainCreationNoRetry:true,emptyCreation:true,emptyReader:true,durableName:true,exactMapping:true,retrySameIdentity:true,amRestart:true,firstPrompt:true,quickStartOnce:true,noTUI:true,externalInferenceCalls:0,providerCalls}));
 }finally{rpc?.close();for(const child of [...children].reverse())await stop(child);for(const release of [...heldResponses])release();provider.closeAllConnections();await new Promise(r=>provider.close(r));for(const ws of proxyWss.clients)ws.terminate();await new Promise(r=>proxyWss.close(r));await new Promise(r=>proxyHttp.close(r));fs.rmSync(root,{recursive:true,force:true});}

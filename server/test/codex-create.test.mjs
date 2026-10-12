@@ -36,3 +36,11 @@ test('native creation client cannot change defaults or start model work',()=>{
  assert.equal(c.allows('thread/name/set',{threadId:randomUUID(),name:'Task'}),false);
  for(const method of ['turn/start','thread/resume','thread/archive'])assert.equal(c.allows(method,{threadId:c.threadId}),false);
 });
+
+test('agent creation receipts bind the source independently of its display name',async()=>{
+ const f=fixture();f.request.agentSourceId='source-a';
+ await assert.rejects(f.creator.create(f.request),/naming failure/);
+ assert.equal(f.creator.read(f.request.requestId).agentSourceId,'source-a');
+ for(const agentSourceId of ['source-b',null])await assert.rejects(f.creator.create({...f.request,agentSourceId}),e=>e.code==='codex-creation-conflict');
+ assert.equal(f.calls.filter(x=>x==='thread/start').length,1);
+});

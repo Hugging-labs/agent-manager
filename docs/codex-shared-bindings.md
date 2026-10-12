@@ -197,8 +197,8 @@ performed. The native queue, not AM, owns accepted messages thereafter.
 
 An imported source can also use `/api/agents?cli=claude&from=SOURCE_AM_ID` to
 create a reviewer through the existing spawn path. Its workspace/group defaults
-and audit attribution are preserved. New shared Codex agent/cron creation and
-scheduled delivery remain separate, unsupported paths.
+and audit attribution are preserved. Shared Codex creation through the agent API is also supported, as described below.
+Cron creation and scheduled delivery remain separate, unsupported paths.
 
 From a regular tmux/mosh shell:
 
@@ -378,8 +378,8 @@ work prevents reopening; no process is signalled and no lock is deleted.
 With both `AM_CODEX_BINDINGS_PILOT=1` and `AM_CODEX_SHARED_CREATE=1`, the existing
 operator New session and quick-start actions create Codex tasks through the
 configured daemon. Other CLIs and installations without the flags keep their
-existing creation path. Agent/cron Codex creation is explicitly refused in this
-pilot, rather than silently launching a standalone writer.
+existing creation path. Agent Codex creation uses the same durable creation service. Cron creation
+remains explicitly refused rather than silently launching a standalone writer.
 
 The browser persists a request UUID under a content hash, without storing the
 prompt. The server fsyncs intent before `thread/start`, saves the returned exact
@@ -512,3 +512,25 @@ separate turn after concurrent work. No production tasks or external inference
 are used. Protocol reference: [official app-server documentation](https://learn.chatgpt.com/docs/app-server);
 the experimental queue shape and scheduling behavior are also checked against
 the installed 0.162.1 schema and the native fixture.
+
+### Creating a shared Codex session from an agent
+
+Resolve the current thread's AM identity first (`am-context resolve`). Then call
+`POST /api/agents?cli=codex&name=Reviewer&from=SOURCE_AM_ID` with JSON body
+`{"requestId":"a UUID generated once for this operation","prompt":"The task"}`.
+Plain-text callers may instead supply the UUID in `X-AM-Message-Id`.
+Keep the same UUID and payload for retries, including after AM restarts.
+
+Workspace and group default to the source, as with legacy agent creation.
+An explicit `path` must name an existing workspace inside AM; `group` selects
+an existing group or `none`. A prompt is required. The response includes `id`,
+`name`, `workdir`, `group`, `codexShared: true`, and the native `threadId`.
+The first prompt is attributed to the source; creation receipts additionally
+bind its immutable AM ID. Operator creation receipts remain compatible.
+No operator-origin header, standalone TUI, or policy override is required.
+
+An uncertain native creation acknowledgement returns `codex-creation-uncertain`:
+inspect the exact task before taking further action; do not retry with a new UUID.
+Concurrent requests with the same UUID may receive `codex-creation-busy` and can
+retry with that same UUID. Reusing an ID with different inputs is refused.
+This creates a new conversation with the supplied context, not a history fork.

@@ -1155,7 +1155,7 @@ api.post('/api/agents/:id/prompt', promptBody, async (req, res) => {
 });
 
 // Launch a peer, already working on the prompt you give it.
-api.post('/api/agents', promptBody, (req, res) => {
+api.post('/api/agents', promptBody, async (req, res) => {
   const from = sender(req);
   if (from.error) return res.status(400).json({ error: from.error });
   const q = req.query;
@@ -1174,19 +1174,33 @@ api.post('/api/agents', promptBody, (req, res) => {
   // of it. ?group= overrides (id or display name); ?group=none opts out.
   const g = groups.resolveSpawnGroup(q.group, from.session.id);
   if (g.error) return res.status(400).json({ error: g.error });
-  const s = createSession({
+  const creation = {
     name: typeof q.name === 'string' ? q.name : '',
     cli,
     groupId: g.groupId,
     path: where,
     prompt: `[message from ${from.session.name}:] ${prompt}`,
-  });
+  };
+  const shared = cli === 'codex' && sharedCreationEnabled();
+  if (shared) {
+    const chosen = cleanRelPath(where);
+    if (chosen === null || chosen === remote.REMOTE_FOLDER || chosen.startsWith(`${remote.REMOTE_FOLDER}/`)) {
+      throw new ApiError(400, 'invalid-input', 'Choose a valid existing workspace folder.');
+    }
+    creation.path = chosen;
+    creation.requestId = req.body?.requestId ?? req.headers['x-am-message-id'];
+    creation.agentSourceId = from.session.id;
+  }
+  const s = shared
+    ? await codexCreation.create(creation, {signal: res.locals.lockSignal})
+    : createSession(creation);
   if (!s) return res.status(400).json({ error: 'bad path' });
   if (s.error) return res.status(400).json({ error: s.error });
   const joined = g.groupId ? groups.get(g.groupId) : null;
   res.status(201).json({
     id: s.id, name: s.name, cli: s.cli, path: s.path, workdir: workspacePath(s.path),
     group: joined ? joined.name : null,
+    ...(shared ? {codexShared: true, threadId: s.codexSessionId} : {}),
     ...(cat.ready ? {} : { warning: `${def.label} has no credential configured — it may stop at a sign-in prompt` }),
   });
 });
@@ -2122,6 +2136,15 @@ Rules that matter, because nothing enforces them for you:
   history, or your task.
 
 ### Launch a new agent
+
+For shared Codex sessions, use the same endpoint with \`cli=codex\` and an
+existing workspace. Supply a stable UUID as JSON \`requestId\` alongside
+\`prompt\`, or as \`X-AM-Message-Id\` with a plain-text body. Generate it
+once per creation and preserve it for retries. The response includes the AM
+\`id\` and native \`threadId\`; the new conversation receives your prompt
+with source attribution. A missing ID is refused. An uncertain creation must
+be inspected, never repeated with a new ID. This does not fork the history.
+
 \`\`\`sh
 curl -s -H 'X-AM-Request: 1' -X POST "http://localhost:\${AM_PORT:-${PORT}}/api/agents?cli=claude&name=reviewer&from=$AM_ID" \\
   -H 'content-type: text/plain' --data-binary @- <<'EOF'

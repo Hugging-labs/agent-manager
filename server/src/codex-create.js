@@ -1,4 +1,4 @@
-// Explicit operator creation. Persist intent before RPC and identity before any
+// Explicit operator or attributed agent creation. Persist intent before RPC and identity before any
 // prompt/TUI; an ambiguous thread/start is never retried or matched by recency.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -30,7 +30,7 @@ export class CodexCreation {
       if(!first)fs.renameSync(tmp,dest);fd=fs.openSync(this.dir,'r');fs.fsyncSync(fd);
     }finally{if(fd!==undefined)fs.closeSync(fd);if(!first)try{fs.unlinkSync(tmp);}catch(e){if(e.code!=='ENOENT')throw e;}}
   }
-  async create({requestId,name='',path:relative='',groupId=null,prompt=''}, {signal}={}) {
+  async create({requestId,name='',path:relative='',groupId=null,prompt='',agentSourceId=null}, {signal}={}) {
     if(!this.enabled())throw fail('codex-creation-disabled','Shared creation is disabled.');
     if(!validThreadId(requestId)||typeof name!=='string'||name.length>160||typeof relative!=='string'
       ||typeof prompt!=='string'||prompt.length>50000||/[\x00-\x1f\x7f]/.test(name))throw new ApiError(400,'invalid-input','A unique requestId, task name, workspace and text prompt are required.');
@@ -41,7 +41,11 @@ export class CodexCreation {
       try{cwd=fs.realpathSync(path.resolve(base,relative||'.'));}
       catch(e){if(['ENOENT','ENOTDIR'].includes(e.code))throw new ApiError(400,'invalid-input','Choose an existing workspace inside this manager.');throw e;}
       if((cwd!==base&&!cwd.startsWith(base+path.sep))||!fs.statSync(cwd).isDirectory())throw new ApiError(400,'invalid-input','Choose an existing workspace inside this manager.');
-      const endpoint=this.endpoint(),fingerprint=hash([name,relative,groupId,prompt,endpoint.id,cwd]);
+      // Keep operator fingerprints compatible with existing receipts. Agent requests
+      // additionally bind the immutable source identity, even if names coincide.
+      const endpoint=this.endpoint(),intent=[name,relative,groupId,prompt,endpoint.id,cwd];
+      if(agentSourceId!==null)intent.push({agentSourceId});
+      const fingerprint=hash(intent);
       let record=this.read(requestId);
       if(record&&record.fingerprint!==fingerprint)throw fail('codex-creation-conflict','This creation ID belongs to different settings.');
       if(record?.status==='creating')throw fail('codex-creation-uncertain','Creation could not be confirmed. Do not create it again: inspect Shared Codex tasks and import its exact ID if it exists. No prompt was sent.');
@@ -49,7 +53,7 @@ export class CodexCreation {
         if(this.endpoint().id!==endpoint.id||fs.realpathSync(path.resolve(base,relative||'.'))!==cwd)throw fail('codex-creation-changed','The endpoint or workspace changed.');};
       if(!record){
         client=await this.connect(endpoint,{signal});client.cwd=cwd;check();
-        record={version:1,fingerprint,status:'creating',name:name.trim()||this.nextName(),relative:path.relative(base,cwd),groupId,cwd,endpointId:endpoint.id,createdAt:new Date().toISOString()};
+        record={version:1,fingerprint,status:'creating',...(agentSourceId!==null?{agentSourceId}:{}),name:name.trim()||this.nextName(),relative:path.relative(base,cwd),groupId,cwd,endpointId:endpoint.id,createdAt:new Date().toISOString()};
         this.write(requestId,record,true);
         let result;try{result=await client.call('thread/start',{cwd,ephemeral:false});}
         catch{throw fail('codex-creation-uncertain','Creation could not be confirmed. Inspect Shared Codex tasks before retrying; no prompt was sent.');}
