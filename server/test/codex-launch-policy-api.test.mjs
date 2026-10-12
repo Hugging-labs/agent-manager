@@ -48,6 +48,8 @@ try {
  await waitFor(async()=>((await api('/api/crons')).body.crons.find(c=>c.id==='boot').last?.status)==='failed');
  await waitFor(()=>log.includes('codex-migration-required: unbound Codex sessions skipped'));
  assert.match(log,/codex-migration-required: unbound Codex sessions skipped/);
+ const restarted=(await api('/api/crons')).body.crons.find(c=>c.id==='boot').last;
+ assert.equal(restarted.trigger,'restart');assert.equal(restarted.code,'codex-migration-required');assert.equal(restarted.status,'failed');
  assert.equal(fs.existsSync(marker),false,'No PTY launch from any tested entry point');
  assert.equal(fs.readFileSync(historyFile,'utf8'),history,'History bytes preserved');
  const saved=JSON.parse(fs.readFileSync(sessionsFile,'utf8'));assert.equal(saved.length,3,'No replacement conversation');
