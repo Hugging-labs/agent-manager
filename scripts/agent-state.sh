@@ -254,13 +254,16 @@ checkpoint_sqlite_tree() {
   mv "$sqlite_next" "$sqlite_stamp"
 }
 
+# Checkpoints enumerate files explicitly via --files-from. Excluding just a
+# directory name does not exclude its explicitly listed descendants in rsync;
+# subtree patterns cover both root and nested scratch paths in both directions.
 failures=0
 
 if [ "$MODE" = restore ]; then
   restore_tree codex "$CODEX_DURABLE" "$CODEX_HOME" \
     --exclude '*.sqlite*' --exclude '*.db' --exclude '*.db-*' \
-    --exclude '*-wal' --exclude '*-shm' --exclude 'db-backups' \
-    --exclude 'cache' --exclude '.tmp' --exclude 'mcp-oauth-locks' || failures=$((failures + 1))
+    --exclude '*-wal' --exclude '*-shm' --exclude '**/db-backups/***' \
+    --exclude '**/cache/***' --exclude '**/.tmp/***' --exclude '**/mcp-oauth-locks/***' || failures=$((failures + 1))
   restore_tree claude "$CLAUDE_DURABLE" "$CLAUDE_CONFIG_DIR" || failures=$((failures + 1))
   restore_tree gemini "$GEMINI_DURABLE" "$GEMINI_LIVE" || failures=$((failures + 1))
   restore_tree openclaw "$OPENCLAW_DURABLE" "$OPENCLAW_STATE_DIR" || failures=$((failures + 1))
@@ -271,8 +274,8 @@ if [ "$MODE" = restore ]; then
 else
   checkpoint_tree codex "$CODEX_HOME" "$CODEX_DURABLE" \
     --exclude '*.sqlite*' --exclude '*.db' --exclude '*.db-*' \
-    --exclude '*-wal' --exclude '*-shm' --exclude 'db-backups' \
-    --exclude 'cache' --exclude '.tmp' --exclude 'mcp-oauth-locks' || failures=$((failures + 1))
+    --exclude '*-wal' --exclude '*-shm' --exclude '**/db-backups/***' \
+    --exclude '**/cache/***' --exclude '**/.tmp/***' --exclude '**/mcp-oauth-locks/***' || failures=$((failures + 1))
   checkpoint_tree claude "$CLAUDE_CONFIG_DIR" "$CLAUDE_DURABLE" || failures=$((failures + 1))
   checkpoint_tree gemini "$GEMINI_LIVE" "$GEMINI_DURABLE" || failures=$((failures + 1))
   checkpoint_tree openclaw "$OPENCLAW_STATE_DIR" "$OPENCLAW_DURABLE" || failures=$((failures + 1))

@@ -149,6 +149,26 @@ try {
   check('fx pending index stays out of the bucket',
     !fs.existsSync(path.join(env.FX_DURABLE, 'sessions/index.pending')));
 
+  // --files-from supplies descendants explicitly: a directory-only exclusion
+  // does not protect the mounted bucket from Codex's temporary plugin files.
+  const scratch = ['.tmp/plugins/_common.py', 'plugins/cache/blob',
+    'cache/blob', 'nested/.tmp/blob', 'mcp-oauth-locks/pid', 'db-backups/old'];
+  for (const rel of scratch) put(path.join(env.CODEX_HOME, rel), 'temporary');
+  put(path.join(env.CODEX_HOME, 'config.toml'), 'model = "fixture"\n');
+  run('checkpoint');
+  check('Codex scratch descendants stay out of file-list checkpoints',
+    scratch.every(rel => !fs.existsSync(path.join(env.CODEX_DURABLE, rel))));
+  check('Codex configuration still checkpoints alongside scratch files',
+    fs.readFileSync(path.join(env.CODEX_DURABLE, 'config.toml'), 'utf8') === 'model = "fixture"\n');
+  // Older versions may already have copied scratch state to the bucket.
+  for (const rel of scratch) {
+    fs.rmSync(path.join(env.CODEX_HOME, rel));
+    put(path.join(env.CODEX_DURABLE, rel), 'old temporary');
+  }
+  run('restore');
+  check('legacy Codex scratch descendants are not restored',
+    scratch.every(rel => !fs.existsSync(path.join(env.CODEX_HOME, rel))));
+
   // Reproduce the Codex access pattern: append while holding the canonical
   // rollout FD open. Because the canonical file is now local, a different
   // process can checkpoint the visible bytes without waiting for close.
