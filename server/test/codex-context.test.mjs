@@ -8,6 +8,9 @@ import { CodexBindings } from '../src/codex-bindings.js';
 import { run, tuiSpec } from '../../scripts/am-codex-context.mjs';
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'am-context-'));
 process.env.DATA_DIR = root;
+// This fixture includes standalone observation-only hosts.
+delete process.env.AM_CODEX_BINDINGS_PILOT;
+delete process.env.AM_CODEX_SHARED_CREATE;
 const { bindExistingThread, configuredEndpoint, contextForThread, codexBindings, importOperationOrigin } = await import('../src/codex-context.js');
 const { commandFor } = await import('../src/runner.js');
 const threadId = '11111111-1111-4111-8111-111111111111';

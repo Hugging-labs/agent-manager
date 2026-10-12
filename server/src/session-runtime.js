@@ -1,3 +1,4 @@
+import { codexLaunchBlock } from './codex-launch-policy.js';
 // Select execution behind AM's existing HTTP contracts. Views never select a
 // transport; bindings remain the only authority for choosing the shared task.
 import { liveView, requestView } from './codex-view.js';
@@ -20,6 +21,8 @@ export class SessionRuntime {
     return ({working:'working', idle:'waiting', 'needs-input':'waiting', unloaded:'stopped'})[current?.status] || 'unknown';
   }
   presentation(session) {
+    const block = codexLaunchBlock(session, this.bindings);
+    if (block) return {codexMigrationRequired:block};
     if(!this.shared(session))return null;
     const current=this.states.get(session.id);
     if(!current||Date.now()-current.at>3000)void this.refresh(session);
@@ -29,7 +32,10 @@ export class SessionRuntime {
       inputRequired:status==='needs-input'?{kind:'permission',cli:'codex',confidence:'high',detectedAt:new Date(current.at).toISOString()}:null};
   }
   async trace(session,page,{interactive=true}={}) {
-    if(!this.shared(session)||!interactive)return page;
+    if (!interactive) return page;
+    const block = codexLaunchBlock(session, this.bindings);
+    if (block) return {...page, interaction:{canSend:false, requests:[], error:block.message}, codexMigrationRequired:block};
+    if(!this.shared(session))return page;
     if (session.archivedAt) {
       const state = await this.refresh(session);
       return {...page, activity:state.status === 'working' ? 'working' : null,

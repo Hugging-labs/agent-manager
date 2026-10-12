@@ -1,3 +1,4 @@
+import { sharedCodexMode } from './codex-launch-policy.js';
 import { codexBindings } from './codex-context.js';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -208,7 +209,9 @@ export async function reviveOnBoot({ enabled = true, days = 3 } = {}) {
     console.error('[revive] Codex bindings unavailable — skipping Codex revival');
     bound = new Set(listSessions().filter((s) => s.cli === 'codex').map((s) => s.id));
   }
-  const sessions = listSessions().filter((s) => !bound.has(s.id) && !(s.cli === 'codex' && s.codexSharedOnly));
+  if (sharedCodexMode() && listSessions().some(s => s.cli === 'codex' && !bound.has(s.id)))
+    console.warn('[revive] codex-migration-required: unbound Codex sessions skipped; migrate their existing threads through the shared server.');
+  const sessions = listSessions().filter((s) => !bound.has(s.id) && !(s.cli === 'codex' && (s.codexSharedOnly || sharedCodexMode())));
   const plan = selectRevivable({
     snapshot: previous,
     sessions,

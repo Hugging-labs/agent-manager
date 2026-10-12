@@ -534,3 +534,40 @@ inspect the exact task before taking further action; do not retry with a new UUI
 Concurrent requests with the same UUID may receive `codex-creation-busy` and can
 retry with that same UUID. Reusing an ID with different inputs is refused.
 This creates a new conversation with the supplied context, not a history fork.
+
+
+### No implicit standalone fallback on shared hosts
+
+`AM_CODEX_BINDINGS_PILOT=1` or `AM_CODEX_SHARED_CREATE=1` makes shared
+execution mandatory for Codex. A configured socket alone does not: standalone
+observation-only installations remain supported. Endpoint outages never bypass
+this host policy.
+
+An unbound legacy Codex session returns HTTP 409 `codex-migration-required`
+before PTY creation or prompt queuing. This covers agent prompts, Reader input,
+Terminal attachment, quickstart and cron delivery. Boot revival skips these
+sessions. Other CLIs and bound shared sessions retain their existing paths.
+New tasks must use shared creation; crons cannot implicitly create standalone
+Codex tasks. Cron failures retain the public error code in `last.code`.
+
+Session/agent rows expose `codexMigrationRequired` with the exact existing
+`threadId`, message, `previewUrl` and `applyUrl`; this is independent of actual
+process activity. The Reader displays the reason and disables sending. Opening
+a terminal displays the same refusal. No migration is performed just by viewing
+or prompting a session.
+
+For a stopped legacy task with a verified native ID, review
+`GET /api/sessions/:id/codex/migration`, then explicitly apply its returned
+`key` with `POST` to the same URL. Migration must be enabled on the host
+(`AM_CODEX_MIGRATION=1` and binding writes enabled). It verifies writer ownership,
+exact settings, identity and complete history before binding the existing
+thread. A missing ID requires identity reconciliation, not a new conversation.
+A still-unloaded thread cannot be bound successfully. Never clear queued work,
+custom instructions or permission roots merely to make a preview pass.
+The currently supported exact Default prompts are recognized; custom writable
+roots (including visualization roots) still require a separate settings review.
+
+Rollout requires restarting **AM**, not the shared Codex daemon. An AM restart
+can close existing terminal attachments and non-Codex PTYs, so coordinate it
+with the operator. A patch on the backup Space does not update the VPS (or vice
+versa); record each deployed revision separately.

@@ -1,3 +1,4 @@
+import { assertCodexLaunchAllowed } from './codex-launch-policy.js';
 import { codexBindings, contextError } from './codex-context.js';
 import { fileURLToPath } from 'node:url';
 import { ApiError } from './api-errors.js';
@@ -1780,6 +1781,7 @@ const SES_ID = /^ses_[A-Za-z0-9_-]+$/;
 const FX_ID = /^[A-Za-z0-9._-]{1,255}$/;
 
 export function commandFor(session) {
+  assertCodexLaunchAllowed(session);
   const cli = cliById(session.cli) || cliById('shell');
   if (cli.id === 'shell') return bashLaunch;
   if (cli.id === 'codex') {
@@ -1922,9 +1924,7 @@ export function commandFor(session) {
  * exactly the same path.
  */
 export function ensureRunning(session, cols = 120, rows = 34) {
-  if (session.cli === 'codex' && session.codexSharedOnly && !codexBindings.forSession(session.id)) {
-    throw new ApiError(409, 'codex-import-incomplete', 'Finish adding this shared task before opening its terminal.');
-  }
+  assertCodexLaunchAllowed(session);
   // Nothing to start: a remote agent starts itself, on its own machine. Both
   // callers guard this too; keep the refusal here so no future one can spawn
   // a PTY for a pane that can never use it.

@@ -1,3 +1,4 @@
+import { assertCodexLaunchAllowed, assertLegacyCodexCreationAllowed } from './codex-launch-policy.js';
 import { sharedCodexRollout } from './codex-reader.js';
 import { conversationActivity, agentListOptions, filterAgentRows } from './agent-list.js';
 import {CodexMigration} from './codex-migrate.js';
@@ -697,6 +698,7 @@ async function deliver(session, { text, attachments = [] }, from, { signal = nul
 
 async function deliverInner(session, { text, attachments }, from, { cancelled, signal, agentSourceId, requestId }) {
   cancelled();
+  assertCodexLaunchAllowed(session);
   if (sessionRuntime.shared(session)) {
     if (!agentSourceId) throw new ApiError(409, 'codex-shared-delivery-pending', 'Shared scheduled delivery is not enabled.');
     if (attachments.length) throw new ApiError(400, 'invalid-input', 'Agent delivery currently accepts text only.');
@@ -960,6 +962,7 @@ function agentRow(s, act, d, selfId, mates) {
     // Seconds since its screen last changed. Small = actively working.
     idleFor: act ? act.age : null,
     inputRequired: sessionRuntime.presentation(s)?.inputRequired ?? act?.inputRequired ?? null,
+    codexMigrationRequired: sessionRuntime.presentation(s)?.codexMigrationRequired ?? null,
     workdir: workspacePath(folder),
     path: folder,
     // Who else writes to this same folder — the actual collision hazard.
@@ -2917,7 +2920,7 @@ api.get('/api/next-name', (req, res) => {
 // the UI's POST /api/sessions and the agent API's spawn — one creation path, so
 // quickstart behaves identically whoever asked. Returns null for a bad path.
 function createSession({ name, cli, groupId, path: reqPath, prompt }) {
-  if(cli==='codex'&&sharedCreationEnabled())throw new ApiError(409,'codex-shared-operator-required','Create shared Codex tasks from the operator interface. Managed agent/cron creation is not enabled.');
+  assertLegacyCodexCreationAllowed(cli);
   const finalName = name && name.trim() ? name.trim() : nextName(cli);
   // A remote agent's slug IS its folder and its API address, so it is minted
   // here, from the name, and never changes afterwards — the display name stays
@@ -3022,7 +3025,7 @@ function beginCronFire(job, trigger, { signal = null } = {}) {
   const fail = (error) => {
     const message = error instanceof ApiError ? error.message : 'Scheduled prompt could not be delivered.';
     crons.recordLast(job.id, {
-      at: at.toISOString(), status: 'failed', durationMs: Date.now() - started, trigger, error: message,
+      at: at.toISOString(), status: 'failed', durationMs: Date.now() - started, trigger, error: message, code: error instanceof ApiError ? error.code : 'internal-error',
     });
     return message;
   };
@@ -3052,6 +3055,7 @@ function beginCronFire(job, trigger, { signal = null } = {}) {
     if (!promptable(session) || isRemote(session.cli)) {
       throw new ApiError(409, 'cron-unavailable', 'The existing target session cannot receive scheduled prompts.');
     }
+    assertCodexLaunchAllowed(session);
     const text = `[message from cron "${job.name}":] ${job.prompt}`;
     const completion = deliver(session, { text }, `cron: ${job.name}`, { signal })
       .then(() => {
