@@ -1664,7 +1664,10 @@ async function normalizeCodex(file, out, range, allowSubagent = false) {
     }
 
     if (j.type === 'event_msg') {
-      if (p.type === 'task_started') {out.nativeTurnId = p.turn_id || null; cur = null;}
+      if (p.type === 'task_started') {
+        out.nativeTurnId = p.turn_id || null; cur = null;
+        if (range?.reader) out.push({ role: 'system', ts, blocks: [], event: { type: 'task-start', text: '' } });
+      }
       if (p.type === 'token_count') {
         const info = p.info || {};
         const tot = info.total_token_usage;
@@ -1700,6 +1703,7 @@ async function normalizeCodex(file, out, range, allowSubagent = false) {
         const res = { type: 'tool_result', id: p.call_id, ...capText(p.results) };
         if (!stitch.file(res.id, res)) msg.blocks.push(res);
       } else if (p.type === 'task_complete') {
+        if (p.turn_id) out.nativeTurnId = p.turn_id;
         if (range?.reader) {
           out.push({ role: 'system', ts, blocks: [], event: { type: 'task-complete', text: String(p.last_agent_message || '') } });
           out.activity = 'waiting'; out.taskOpen = false; cur = null;

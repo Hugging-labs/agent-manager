@@ -35,6 +35,20 @@ try{
  page={...page,turns:[{id:'phone-done',nativeTurnId:'phone',role:'system',blocks:[],event:{type:'task-complete',text:'Phone answer'}}],window:{...page.window,end:110}};
  await store.loadNewer();
  assert.equal(store.getSnapshot().turns.at(-1).blocks[0].text,'Phone answer');
+ // Real Space regression: a forward byte page starts after turn_context.
+ // Its answer and completion lack nativeTurnId while the live overlay remains.
+ const splitUser=turn('split-u','split','user','Same text');
+ const splitAnswer=turn('split-a',undefined,'assistant','Same text');
+ const splitDone={id:'split-done',role:'system',blocks:[],event:{type:'task-complete',text:'Same text'}};
+ const splitLive={replaceTurnIds:['split'],turns:[turn('lu','split','user','Same text'),turn('la','split','assistant','Same text')]};
+ assert.equal(mergeLiveTrace([splitUser,splitAnswer,splitDone],splitLive).filter(t=>t.role==='assistant').length,1,'split persisted completion must retire its native overlay');
+ assert.equal(mergeLiveTrace([splitUser,splitAnswer],splitLive).filter(t=>t.role==='assistant').length,1,'in-progress persisted fragment must be replaced too');
+ const nextStart={id:'start',nativeTurnId:'next',role:'system',blocks:[],event:{type:'task-start',text:''}};
+ const nextLive={replaceTurnIds:['split','next'],turns:[...splitLive.turns,turn('next-a','next','assistant','Same text')]};
+ assert.equal(mergeLiveTrace([splitUser,splitAnswer,splitDone,nextStart,turn('next-a-disk',undefined,'assistant','Same text')],nextLive).filter(t=>t.role==='assistant').length,2,'identical answers in separate turns must survive');
+ const coldDone={...splitDone,nativeTurnId:'split'};
+ assert.equal(mergeLiveTrace([splitAnswer,coldDone],splitLive).filter(t=>t.role==='assistant').length,1,'completion supplies identity to a cold partial prefix');
+ assert.equal(splitAnswer.nativeTurnId,undefined,'cached fragments stay immutable');
  const memory=new Map();globalThis.localStorage={getItem:k=>memory.get(k)||null,setItem:(k,v)=>memory.set(k,v),removeItem:k=>memory.delete(k)};
  const requests=[];globalThis.fetch=async(url,init)=>{requests.push({url,body:JSON.parse(init.body)});if(requests.length===1)throw Error('lost response');return new Response('{"ok":true}',{headers:{'content-type':'application/json'}});};
  const api=await load('src/api.ts','api');await assert.rejects(api.sendInput('s','hello',['att-fixture']));await api.sendInput('s','hello',['att-fixture']);

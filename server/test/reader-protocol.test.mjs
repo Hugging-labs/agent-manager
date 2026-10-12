@@ -49,6 +49,17 @@ try {
   const legacy = await readTraceByPath(file, { window: { at: 'after', cursor: first.window.end } });
   assert.ok(text(legacy).includes('second prompt'), 'legacy consumers remain supported');
 
+  // Preserve the native boundary even when a forward page contains no user
+  // message yet. A later completion can also identify a cold mid-turn window.
+  const nativeFile = path.join(tmp, 'native-boundaries.jsonl');
+  fs.writeFileSync(nativeFile, jsonl([event('session_meta', {id:'native',cwd:tmp}), event('event_msg', {type:'task_started',turn_id:'native-turn'})]));
+  const nativeStart = await read(nativeFile);
+  assert.equal(nativeStart.turns.at(-1).event.type, 'task-start');
+  assert.equal(nativeStart.turns.at(-1).nativeTurnId, 'native-turn');
+  fs.appendFileSync(nativeFile, jsonl([message('assistant','answer'),event('event_msg',{type:'task_complete',turn_id:'native-turn',last_agent_message:'answer'})]));
+  const nativeEnd = await read(nativeFile,{at:'after',cursor:nativeStart.window.end});
+  assert.equal(nativeEnd.turns.at(-1).nativeTurnId,'native-turn');
+
   // A large backlog stays continuous and respects the requested forward page.
   const cursor = after.window.end;
   fs.appendFileSync(file, jsonl(Array.from({ length: 1000 }, (_, i) => message('user', `backlog-${i} ${'x'.repeat(9000)}`))));

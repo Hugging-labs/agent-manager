@@ -5,6 +5,27 @@ import { countExchanges, reconcileTrace } from './readerModel';
 // position, never move it to the tail merely because it still has live data.
 export function mergeLiveTrace(raw: TraceTurn[], live?: TraceWindow['live']): TraceTurn[] {
   if (!live?.turns.length) return raw;
+  // Byte windows may begin after Codex's turn_context. Carry native identity
+  // across contiguous persisted fragments, bounded by explicit task markers.
+  // Never join by answer text: equal answers can belong to different turns.
+  let nativeId: string | undefined;
+  raw = raw.map(t => {
+    if (t.event?.type === 'task-start') nativeId = undefined;
+    if (t.nativeTurnId) nativeId = t.nativeTurnId;
+    const record = !t.nativeTurnId && nativeId ? { ...t, nativeTurnId: nativeId } : t;
+    if (t.event?.type === 'task-complete') nativeId = undefined;
+    return record;
+  });
+  // A cold window can start mid-turn. Its explicit completion identifies only
+  // that preceding fragment, never records on the other side of a boundary.
+  nativeId = undefined;
+  for (let i = raw.length - 1; i >= 0; i--) {
+    const t = raw[i];
+    if (t.event?.type === 'task-complete') nativeId = t.nativeTurnId;
+    if (t.nativeTurnId) nativeId = t.nativeTurnId;
+    else if (nativeId) raw[i] = { ...t, nativeTurnId: nativeId };
+    if (t.event?.type === 'task-start') nativeId = undefined;
+  }
   const complete = new Set(raw.filter(t => t.event?.type === 'task-complete').map(t => t.nativeTurnId));
   const replacements = new Set(live.replaceTurnIds);
   const groups = new Map<string, TraceTurn[]>();
