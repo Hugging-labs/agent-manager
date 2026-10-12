@@ -71,3 +71,16 @@ test('native settings changed after the last turn cannot be rolled back by recov
   a.permission_profile={type:'disabled'};write();await assert.rejects(recoveryPlan(file,context,t,{id:p.turn_id}));
  }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
+test('cold empty native index can recover only a verified completed last turn',async()=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'am-recovery-cold-')),file=path.join(root,'rollout.jsonl');
+ try{
+  const p=saved(),context={stamp:'binding',workdir:cwd},t={...thread,status:{type:'notLoaded'}};
+  const records=[{type:'turn_context',payload:p},{type:'event_msg',payload:{type:'task_complete',turn_id:p.turn_id}}];
+  const write=()=>fs.writeFileSync(file,records.map(x=>JSON.stringify(x)).join('\n')+'\n');
+  write();const plan=await recoveryPlan(file,context,t,null);assert.equal(plan.key,(await recoveryPlan(file,context,t,{id:p.turn_id})).key);
+  await assert.rejects(recoveryPlan(file,context,t,{id:'different'}));
+  await assert.rejects(recoveryPlan(file,context,{...t,status:{type:'active'}},null));
+  records.push({type:'event_msg',payload:{type:'task_started',turn_id:'new'}});write();await assert.rejects(recoveryPlan(file,context,t,null));
+  records.pop();records[1]={type:'response_item',payload:{text:JSON.stringify({type:'task_complete',turn_id:p.turn_id})}};write();await assert.rejects(recoveryPlan(file,context,t,null));
+ }finally{fs.rmSync(root,{recursive:true,force:true});}
+});

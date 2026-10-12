@@ -50,7 +50,6 @@ export function verifyRecovered(result, settings, threadId) {
   if(result?.thread?.id!==threadId||Object.entries(settings.expected).some(([key,value])=>!isDeepStrictEqual(result[key]??null,value)))throw refused();
 }
 export async function recoveryPlan(file, context, thread, latestTurn) {
-  if(!latestTurn?.id)throw refused();
   const fd=await fs.open(file,'r');
   try {
     const stat=await fd.stat();
@@ -58,12 +57,20 @@ export async function recoveryPlan(file, context, thread, latestTurn) {
     const length=Math.min(stat.size,8*1024*1024),offset=stat.size-length,buffer=Buffer.alloc(length);
     const {bytesRead}=await fd.read(buffer,0,length,offset);
     const lines=buffer.toString('utf8',0,bytesRead).split('\n');if(offset)lines.shift();
-    let saved, applied;
+    let saved, applied, terminal;const nativeTurns=new Set();
     for(let i=lines.length-1;i>=0;i--){if(!lines[i].trim())continue;
       let record;try{record=JSON.parse(lines[i]);}catch{throw refused();}
+      if(record.type==='event_msg' && record.payload?.turn_id)nativeTurns.add(record.payload.turn_id);
+      if(!terminal && record.type==='event_msg' && ['task_complete','task_started','turn_aborted'].includes(record.payload?.type))terminal=record.payload;
       if(!applied && record.type==='event_msg' && record.payload?.type==='thread_settings_applied')applied=record.payload;
       if(record.type==='turn_context'){saved=record.payload;break;}}
-    if(saved?.turn_id!==latestTurn.id)throw refused();
+    if(typeof saved?.turn_id!=='string' || !saved.turn_id)throw refused();
+    if(latestTurn?.id){if(saved.turn_id!==latestTurn.id)throw refused();}
+    // Some 0.162.1 cold threads expose no turns until first resume. The verified
+    // native rollout may supply the missing ID only for a completed final turn,
+    // with no later start or other turn. Never override a nonempty native index.
+    else if(thread.status?.type!=='notLoaded' || terminal?.type!=='task_complete'
+        || terminal.turn_id!==saved.turn_id || [...nativeTurns].some(id=>id!==saved.turn_id))throw refused();
     // A native settings change after the last turn must never be overwritten
     // by stale turn_context (e.g. full access changed to a restricted profile).
     if(applied){
@@ -77,7 +84,7 @@ export async function recoveryPlan(file, context, thread, latestTurn) {
           || (p.service_tier??null)!==(saved.service_tier??null))throw refused();
     }
     const settings=recoverySettings(saved,thread,context.workdir);
-    const key=createHash('sha256').update(JSON.stringify([context.stamp,latestTurn.id,settings])).digest('hex');
+    const key=createHash('sha256').update(JSON.stringify([context.stamp,saved.turn_id,settings])).digest('hex');
     return {key,settings};
   } finally {await fd.close();}
 }

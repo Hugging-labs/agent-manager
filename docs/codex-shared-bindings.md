@@ -354,7 +354,10 @@ A mismatched returned configuration is rejected, without model input.
 
 The existing transcript resolver first verifies the rollout path and header.
 Recovery reads at most its last 8 MiB and requires a genuine `turn_context`
-record for the native latest turn. Text containing JSON is not a context.
+record for the native latest turn. When 0.162.1 returns an empty cold turn
+index, recovery additionally requires an exact native task_complete for that
+context, no later start or other turn, and notLoaded status. A nonempty native
+index always takes precedence. Text containing JSON is not a context.
 A later native settings event must agree with that context; recovery never
 rolls back a newer permission change. The exact current and reviewed legacy
 Default-mode instruction texts are accepted, not arbitrary custom instructions.
