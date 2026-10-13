@@ -1,0 +1,107 @@
+// What the normalizer does with Claude Code's pasted-text wrapper.
+//
+// Claude Code wraps pasted input as `<pasted_content id="…">…</pasted_content
+// id="…">`. Unlike `<system-reminder>` and friends this is the OPERATOR'S OWN
+// TEXT, so it has to be unwrapped and shown, never filtered out.
+//
+// Two things went wrong while it was left in, and they surface in different
+// places, which is why this covers the digest as well as the transcript:
+//
+//   - the digest drops anything starting with `<` as harness noise, so a pasted
+//     prompt never became the session's last prompt and the Overview card
+//     showed the prompt BEFORE it;
+//   - the reader rendered the wrapper, and because the closing tag carries an
+//     `id` attribute — not valid HTML — markdown printed it literally.
+//
+// The reader-side duplicate this also caused is covered end to end in
+// web/test/queuedPrompt.test.mjs, which needs a browser. This half does not.
+//
+// Run with:  node test/pasted-prompt.test.mjs
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { readTraceByPath, __parseClaudeForTest as parseClaude } from '../src/traces.js';
+
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pasted-prompt-'));
+let failed = 0;
+const check = (what, fn) => {
+  try { fn(); console.log(`  ok  ${what}`); } catch (e) {
+    failed++; console.log(`  FAIL ${what}\n       ${e.message.split('\n')[0]}`);
+  }
+};
+
+const TYPED = 'why does this show up twice?';
+// The attachment list matters: it is a markdown block, and the closing tag
+// landing after one is what made the renderer print the tag instead of eating it.
+const SENT = `${TYPED}\n\nAttached files:\n- "/data/state/attachments/x/att_1.png"`;
+const pasted = (t, id = 'df85') => `<pasted_content id="${id}">\n${t}\n</pasted_content id="${id}">`;
+const now = () => new Date().toISOString();
+const write = (name, records) => {
+  const file = path.join(dir, `${name}.jsonl`);
+  fs.writeFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  return file;
+};
+const user = (text) => ({ type: 'user', sessionId: 's', timestamp: now(),
+  message: { role: 'user', content: [{ type: 'text', text }] } });
+const asst = (text, id) => ({ type: 'assistant', sessionId: 's', timestamp: now(),
+  message: { id, role: 'assistant', content: [{ type: 'text', text }] } });
+const queue = (operation, content, reason) => ({ type: 'queue-operation', operation,
+  sessionId: 's', timestamp: now(), ...(content ? { content } : {}),
+  ...(reason ? { reason, deliveryId: '18445368-4b59', commandUuid: 'a26f88b4' } : {}) });
+
+const textOf = (turns) => turns.flatMap((t) => (t.blocks || [])
+  .filter((b) => b.type === 'text').map((b) => b.text))
+  .concat(turns.map((t) => t.event?.text || '')).join('\n');
+
+console.log('\n# the transcript');
+for (const [name, records] of [
+  // Both `remove` shapes are in one real transcript: newer CLIs carry
+  // `reason: "absorbed_mid_turn"`, older ones carry no reason at all.
+  ['absorbed mid-turn', [user('first'), asst('working', 'm1'),
+    queue('enqueue', pasted(SENT)), queue('remove', pasted(SENT), 'absorbed_mid_turn')]],
+  ['removed with no reason', [user('first'), asst('working', 'm1'),
+    queue('enqueue', pasted(SENT)), queue('remove', pasted(SENT))]],
+  ['dequeued, delivered as a user message', [user('first'), asst('working', 'm1'),
+    queue('enqueue', pasted(SENT)), queue('dequeue'), user(pasted(SENT))]],
+]) {
+  for (const reader of [true, false]) {
+    const { turns } = await readTraceByPath(write(`${name}-${reader}`, records), { reader, limit: 200 });
+    const text = textOf(turns);
+    check(`${name}${reader ? '' : ' (trace pane)'}: the wrapper is gone`, () => {
+      assert.ok(!text.includes('pasted_content'), 'the wrapper survived into the transcript');
+    });
+    check(`${name}${reader ? '' : ' (trace pane)'}: the operator's text is kept`, () => {
+      assert.ok(text.includes(TYPED), 'the prompt itself was dropped');
+      assert.ok(text.includes('att_1.png'), 'the attachment list was dropped');
+    });
+  }
+}
+
+console.log('\n# a prompt that only talks about the wrapper');
+// Matched by backreference on the id, so an unpaired mention is not a wrapper.
+const MENTIONS = 'the closing </pasted_content id="df85"> tag is what leaks — see traces.js';
+{
+  const { turns } = await readTraceByPath(write('mentions', [user(MENTIONS), asst('right', 'm1')]), { reader: true, limit: 200 });
+  check('is left exactly as written', () => {
+    assert.ok(textOf(turns).includes(MENTIONS), 'a prompt about the tag was mangled');
+  });
+}
+
+console.log('\n# the digest behind the Overview card');
+{
+  const txt = [user('an ordinary prompt'), asst('ok', 'm1'), user(pasted(SENT))]
+    .map((r) => JSON.stringify(r)).join('\n');
+  const { digest } = parseClaude(txt);
+  const last = digest.lastPromptText || digest.lastPrompt || '';
+  check('a pasted prompt becomes the last prompt', () => {
+    assert.ok(last.includes(TYPED), `the card still shows ${JSON.stringify(String(last).slice(0, 40))}`);
+  });
+  check('and carries no wrapper', () => {
+    assert.ok(!String(last).includes('pasted_content'), 'the wrapper reached the Overview card');
+  });
+}
+
+fs.rmSync(dir, { recursive: true, force: true });
+if (failed) { console.log(`\npasted-prompt: ${failed} failed`); process.exit(1); }
+console.log('\npasted-prompt: the operator\'s pasted text is unwrapped, kept, and shown once');

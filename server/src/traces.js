@@ -156,6 +156,26 @@ function digestTool(d, name, file) {
 // Multi-block assistant messages repeat the same message.id AND usage across
 // several lines — dedupe both turns/usage (by message id) and tool_use blocks
 // (by block id) or everything double-counts.
+// Claude Code wraps pasted text in `<pasted_content id="…">…</pasted_content
+// id="…">`. Unlike the envelopes above this is the OPERATOR'S OWN TEXT, so it
+// is unwrapped and shown rather than filtered out.
+//
+// Left in, it breaks two things. The closing tag carries an `id` attribute,
+// which is not valid HTML, so the markdown renderer prints it literally while
+// swallowing the opening tag as an unknown element — a stray
+// `</pasted_content id="df85">` with nothing that opened it. (It only surfaces
+// when the tag follows a block the renderer has already closed, such as the
+// `Attached files:` list, which is why it tracks with pastes and attachments.)
+// And the reader's optimistic echo retires itself by checking whether the text
+// that came back starts with the text it sent; a wrapper defeats that, leaving
+// the sent prompt on screen beside the copy from the transcript. That is the
+// duplicate the operator reported, wrapped copy first and clean copy second.
+//
+// The id is matched by backreference so only a genuine pair is removed: a
+// prompt that merely mentions the tag — this comment's own subject — survives.
+const unwrapPasted = (t) => String(t == null ? '' : t)
+  .replace(/<pasted_content\s+id="([^"]*)">\n?([\s\S]*?)\n?<\/pasted_content\s+id="\1">/g, '$2');
+
 function parseClaude(txt) {
   const st = emptyStats();
   const dg = emptyDigest();
@@ -208,8 +228,12 @@ function parseClaude(txt) {
         : Array.isArray(mc) ? mc.filter((c) => c && c.type === 'text').map((c) => c.text).join(' ') : '';
       // Skip harness noise (slash-command wrappers, attachments, interrupt
       // markers) as "prompts".
-      const t = text.trim();
-      if (t && !t.startsWith('<') && !t.startsWith('[Request interrupted')) digestPrompt(dg, text, j.timestamp);
+      // Unwrapped first: a pasted prompt opens with `<pasted_content …>`, so the
+      // `<` test below dropped the operator's own text and left the Overview
+      // card showing the prompt BEFORE it as the latest one.
+      const unwrapped = unwrapPasted(text);
+      const t = unwrapped.trim();
+      if (t && !t.startsWith('<') && !t.startsWith('[Request interrupted')) digestPrompt(dg, unwrapped, j.timestamp);
     }
   }
   return { stats: st, digest: dg };
@@ -1367,11 +1391,12 @@ async function normalizeClaude(file, out, range, allowSubagent = false) {
     // It still renders as a `system` turn, which the reader does not draw.
     if ((j.isMeta || j.sourceToolUseID) && j.origin?.kind !== 'task-notification') continue;
     if (j.type === 'queue-operation') {
-      const text = queueKey(j.content);
+      const content = unwrapPasted(j.content);
+      const text = queueKey(content);
       if (range?.reader) {
         if (isHarnessText(text)) continue;
         out.push({ role: 'system', ts: Date.parse(j.timestamp) || undefined, blocks: [],
-          event: { type: 'queue', operation: j.operation, text: String(j.content || '') } });
+          event: { type: 'queue', operation: j.operation, text: content } });
         continue;
       }
       if (j.operation === 'enqueue') {
@@ -1383,7 +1408,7 @@ async function normalizeClaude(file, out, range, allowSubagent = false) {
           role: 'user',
           ts: j.timestamp ? Date.parse(j.timestamp) || undefined : undefined,
           queued: true,
-          blocks: [textBlock('text', String(j.content))],
+          blocks: [textBlock('text', content)],
         };
         out.push(msg);
         pending.push({ text, msg });
@@ -1429,7 +1454,7 @@ async function normalizeClaude(file, out, range, allowSubagent = false) {
     for (const c of items) {
       if (!c || typeof c !== 'object') continue;
       if (c.type === 'text') {
-        const t = String(c.text || '');
+        const t = j.type === 'user' ? unwrapPasted(c.text) : String(c.text || '');
         if (!t.trim()) continue;
         // Injected environment/reminder blobs are not prompts — show them, but
         // as system so the conversation reads correctly (same rule the digest
