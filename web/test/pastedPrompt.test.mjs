@@ -104,6 +104,12 @@ await build({
         root = createRoot(host); root.render(<App/>);
       },
       serve(next){ turns = next; },
+      // What the operator gets after refreshing: the same transcript, a reader
+      // with no optimistic echo in it. A new id because stores cache by session.
+      reload(){ cfg = {id:'s'+(++window.__case)};
+        const host = document.getElementById('fixture-root');
+        root.unmount(); host.innerHTML = '';
+        root = createRoot(host); root.render(<App/>); },
     };
   `, sourcefile: 'fixture.tsx' },
   bundle: true, format: 'iife', outfile: bundle, jsx: 'automatic',
@@ -168,6 +174,11 @@ try {
   };
 
   const CASES = [
+    // The operator's actual case, and the common one: a multi-line message with
+    // an attachment list, sent to an idle agent. Claude Code wraps any
+    // multi-line paste, so there is a wrapper but no queue record anywhere.
+    ['sent normally, arriving as a plain user record', [
+      rec.user(pasted(SENT), 2), rec.asst('on it', 3)]],
     ['absorbed into the running turn, pasted', [
       rec.enqueue(pasted(SENT), 2), rec.remove(pasted(SENT), 3, 'absorbed_mid_turn'),
       rec.absorbed(pasted(SENT), 4), rec.asst('answering it', 5)]],
@@ -197,6 +208,19 @@ try {
     check('with no wrapper left in the page', () => {
       assert.ok(!text.includes('pasted_content'), `wrapper visible: ${text.slice(text.indexOf('pasted_content') - 60, text.indexOf('pasted_content') + 30)}`);
     });
+
+    // And it has to survive a refresh: the echo is client-only, so a reload is
+    // what proves the transcript itself carries exactly one copy of the prompt.
+    await p.evaluate(() => window.fixture.reload());
+    await p.waitForSelector('.cxv-body');
+    await p.waitForTimeout(900);
+    const reloaded = await copies();
+    const reloadedText = await bodyText();
+    console.log(`  after a reload: ${reloaded}`);
+    check('still one copy after a reload', () => {
+      assert.equal(reloaded, 1, `it is on screen ${reloaded} times`);
+      assert.ok(!reloadedText.includes('pasted_content'), 'the wrapper is back after a reload');
+    });
   }
 
   check('no page errors', () => assert.deepEqual(errors, [], errors.slice(0, 2).join(' | ')));
@@ -205,5 +229,5 @@ try {
   await browser.close();
   fs.rmSync(tmp, { recursive: true, force: true });
 }
-if (failed) { console.log(`\nqueued-prompt: ${failed} failed`); process.exit(1); }
-console.log('\nqueued-prompt: one copy of every queued prompt, wrapper unwrapped');
+if (failed) { console.log(`\npasted-prompt: ${failed} failed`); process.exit(1); }
+console.log('\npasted-prompt: one copy of every pasted prompt, wrapper unwrapped');
