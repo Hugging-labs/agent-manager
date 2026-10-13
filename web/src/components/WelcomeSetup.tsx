@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import type { Cli } from '../types';
 import { KeyGlyph, LockGlyph, PlusGlyph } from './icons';
 import StateLogo from './StateLogo';
@@ -22,6 +23,20 @@ export const setupCandidates = (clis: Cli[]) =>
 
 export const configuredCount = (clis: Cli[]) => setupCandidates(clis).filter((c) => c.ready).length;
 
+/**
+ * Should closing this window be remembered, or should it come back next load?
+ *
+ * It comes back only while there is both nothing working AND something here to
+ * act on. The second half matters outside a Space: with no agent CLIs installed
+ * there are no rows, so a window that kept reopening would offer nothing and
+ * could never be got rid of — worse than not showing it. There it says how to
+ * install one and then takes no for an answer; Settings reopens it.
+ */
+export const keepOffering = (clis: Cli[]) => {
+  const candidates = setupCandidates(clis);
+  return candidates.length > 0 && candidates.every((c) => !c.ready);
+};
+
 export default function WelcomeSetup({
   clis, spaceId, presentSecrets, bucketUnverified, onStartSession, onTour, onClose,
 }: {
@@ -35,10 +50,22 @@ export default function WelcomeSetup({
   onTour: () => void;
   onClose: () => void;
 }) {
+  const [copied, setCopied] = useState<string | null>(null);
+  const copy = (text: string) => {
+    navigator.clipboard?.writeText(text).then(() => {
+      setCopied(text);
+      window.setTimeout(() => setCopied((c) => (c === text ? null : c)), 1400);
+    }, () => {});
+  };
   const agents = setupCandidates(clis);
   const ready = agents.filter((c) => c.ready);
   const have = new Set(presentSecrets);
   // The Space's own settings page, built rather than described.
+  // No SPACE_ID means this is not a Space: a local or self-hosted install.
+  // Only the SECRET route differs — a Space keeps them in its settings, a local
+  // install reads the environment the server was started in. Signing in through
+  // a session works identically in both, so nothing about it is gated here.
+  const local = !spaceId;
   const settingsUrl = spaceId ? `https://huggingface.co/spaces/${spaceId}/settings` : null;
   const anySignIn = agents.some((c) => !c.ready && c.signIn);
   const anyKeyOnly = agents.some((c) => !c.ready && !c.signIn && c.secrets?.length);
@@ -50,9 +77,11 @@ export default function WelcomeSetup({
         <div>
           <h2 id="welcome-title">Connect your first agent</h2>
           <p>
-            {ready.length
-              ? <><b>{ready.length} of {agents.length}</b> ready. Start one, or set up another below.</>
-              : <>Nothing is signed in yet. Pick an agent — whichever route you use, it persists across restarts.</>}
+            {!agents.length
+              ? <>This install has no agents yet. One command adds them.</>
+              : ready.length
+                ? <><b>{ready.length} of {agents.length}</b> ready. Start one, or set up another below.</>
+                : <>Nothing is signed in yet. Pick an agent — whichever route you use, it persists across restarts.</>}
           </p>
         </div>
       </div>
@@ -74,15 +103,46 @@ export default function WelcomeSetup({
           {anySignIn && (
             <p>
               <b>Open a session</b> and the agent walks you through signing in — it shows a link to
-              open and a code to bring back, because a Space has no browser of its own.
+              open and a code to bring back, because the machine it runs on has no browser of its own.
             </p>
           )}
-          {anyKeyOnly && settingsUrl && (
+          {anyKeyOnly && (local ? (
+            <p>
+              <b>Or use an API key.</b> Set it in the environment Agent Manager runs in — an
+              <span className="mono"> export</span> in the service's unit or shell — then restart
+              it. Keys are read at startup.
+            </p>
+          ) : (
             <p>
               <b>Or use an API key.</b> Add it as a Space <b>secret</b>; that <b>restarts the
               Space</b>, and your files, logins and history are on the bucket and survive it.
             </p>
-          )}
+          ))}
+        </div>
+      )}
+
+      {/* Nothing is installed in this image. On a Space that cannot happen —
+          the container builds the CLIs in — so this is the local case, and the
+          only useful thing to say is how to get one. An empty list under "pick
+          an agent" is the bug this replaces. */}
+      {!agents.length && (
+        <div className="setup-row setup-empty">
+          <span className="setup-name">No agent CLIs are installed yet</span>
+          <p className="setup-note">
+            Agent Manager runs the agents' own command-line tools, and outside the container image
+            they are not installed for you. From the checkout:
+          </p>
+          <div className="setup-cmd">
+            <code className="mono">./scripts/install-local-clis.sh</code>
+            <button className="mini-btn" onClick={() => copy('./scripts/install-local-clis.sh')}>
+              {copied === './scripts/install-local-clis.sh' ? 'copied' : 'copy'}
+            </button>
+          </div>
+          <p className="setup-note">
+            Put that prefix's <span className="mono">bin</span> on the server's{' '}
+            <span className="mono">PATH</span> and restart it — availability is read once at
+            startup. See <b>Local installation</b> in the README for the whole list.
+          </p>
         </div>
       )}
 
@@ -130,10 +190,19 @@ export default function WelcomeSetup({
                         <span key={k}>{i ? ' / ' : ''}<span className={`mono${have.has(k) ? ' setup-have' : ''}`}>{k}</span></span>
                       ))}
                     </span>
-                    {settingsUrl && (
+                    {settingsUrl ? (
                       <a className="btn-ghost setup-go" href={settingsUrl} target="_blank" rel="noreferrer">
                         Add a secret ↗
                       </a>
+                    ) : (
+                      // Local: there is no settings page to send them to, so the
+                      // action is the line they have to add themselves.
+                      <button
+                        className="btn-ghost setup-go"
+                        onClick={() => copy(`export ${(c.secrets || [])[0]}=…`)}
+                      >
+                        {copied === `export ${(c.secrets || [])[0]}=…` ? 'copied' : 'Copy export line'}
+                      </button>
                     )}
                   </>
                 )}
