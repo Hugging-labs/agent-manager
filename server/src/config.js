@@ -65,30 +65,36 @@ export function cliVersion(id) {
 const setupHint = (...keys) =>
   `Launch it once — the first run walks you through sign-in. Or add ${keys.join(' / ')} as a Space secret.`;
 
-// How to sign in INTERACTIVELY, from a terminal pane on a remote machine.
+// What OPENING A SESSION actually shows an operator with no credentials.
 //
-// This is not the same question as "does the CLI have a login command". A Space
-// runs in a container the operator's browser cannot reach, so any OAuth flow
-// that redirects to localhost is unusable here however well it works on a
-// laptop. Each entry below was run and watched:
+// This is not what the docs say and not what the CLI's own login command does
+// — it is what appeared on screen when each agent was launched the way
+// runner.js launches it (bash -lc <run>, in a PTY) with a HOME holding no
+// credentials. A Space runs in a container the operator's browser cannot
+// reach, so any flow that redirects to localhost is useless here however well
+// it works on a laptop.
 //
-//  - claude: `claude auth login` redirects to platform.claude.com and then asks
-//    for the code to be pasted back. Works in a pane.
-//  - codex:  plain `codex login` starts a server on localhost:1455 and the CLI
-//    itself says "On a remote or headless machine? Use `codex login
-//    --device-auth` instead." The device flow prints a URL and a one-time code.
-//    So the pane command is the device one, NOT what its TUI offers by default.
+//  - claude: theme picker, then a login-method menu, then "Browser didn't
+//    open? Use the url below to sign in" with a platform.claude.com URL and
+//    "Paste code here if prompted". Completes in the pane. Nothing to type.
+//  - codex:  the first screen is a menu — "Sign in with ChatGPT" (serves a
+//    localhost:1455 redirect, dead from a Space), "Sign in with Device Code"
+//    (auth.openai.com/codex/device plus a one-time code, completes in the
+//    pane), "Provide your own API key". So opening a session is enough, but
+//    the operator has to pick the second entry rather than the first.
+//  - gemini / opencode / hermes / openclaw / fx: no sign-in was observed that
+//    is confirmed to complete from a Space. fx offers a menu (Vercel / Codex /
+//    Grok) whose routes are unverified here; openclaw opens straight into a
+//    working TUI; gemini opens a folder-trust dialog first. Rather than guess,
+//    these are `null` and the UI recommends the API key.
 //
-// `null` means we have not confirmed a pane-usable flow, and the UI should send
-// the operator to the API-key path instead of inventing instructions.
-const SIGN_IN = {
-  claude: 'claude auth login',
-  codex: 'codex login --device-auth',
-  opencode: 'opencode auth login',
+// `note` is the one thing the operator must know that the pane does not make
+// obvious. Keep it to a sentence, or leave it out.
+const IN_SESSION_SIGN_IN = {
+  claude: { note: null },
+  codex: { note: 'Choose "Sign in with Device Code" — the ChatGPT option needs a browser redirect a Space cannot receive.' },
 };
 
-// Panels rather than processes: no binary, nothing to launch, no trace of their
-// own. Everywhere the app asks "is this an agent?" it means "not one of these".
 export const PASSIVE_CLIS = ['files', 'trace'];
 
 // A remote agent IS an agent (card, digest, status light) but has no process
@@ -225,7 +231,10 @@ export function cliCatalog() {
     // show the real ones per agent instead of a sentence that has to be kept in
     // sync by hand. `signIn` is null where no pane-usable flow is confirmed.
     secrets: c.secrets || [],
-    signIn: SIGN_IN[c.id] || null,
+    // Whether opening a session presents a sign-in that completes from a
+    // Space, and anything the operator must know to use it. null = we did not
+    // confirm one, so the UI must not invent instructions.
+    signIn: IN_SESSION_SIGN_IN[c.id] || null,
   }));
 }
 

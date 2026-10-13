@@ -24,9 +24,10 @@ const bundle = path.join(tmp, 'fixture.js');
 
 const cli = (id, label, color, ready, secrets, signIn) =>
   ({ id, label, color, available: true, ready, secrets, signIn });
+const NOTE = 'Choose "Sign in with Device Code" — the ChatGPT option needs a browser redirect a Space cannot receive.';
 const CATALOG = (ready = []) => [
-  cli('claude', 'Claude Code', '#d97757', ready.includes('claude'), ['ANTHROPIC_API_KEY'], 'claude auth login'),
-  cli('codex', 'Codex', '#5eb6a6', ready.includes('codex'), ['OPENAI_API_KEY'], 'codex login --device-auth'),
+  cli('claude', 'Claude Code', '#d97757', ready.includes('claude'), ['ANTHROPIC_API_KEY'], { note: null }),
+  cli('codex', 'Codex', '#5eb6a6', ready.includes('codex'), ['OPENAI_API_KEY'], { note: NOTE }),
   cli('gemini', 'Gemini CLI', '#4796e3', ready.includes('gemini'), ['GEMINI_API_KEY'], null),
 ];
 
@@ -82,17 +83,30 @@ try {
   await check('every agent reads as needing setup', () => {
     assert.equal((fresh.match(/needs setup/g) || []).length, 3);
   });
-  await check('offers the sign-in command that works on a remote machine', () =>
-    assert.match(fresh, /codex login --device-auth/));
-  await check('and never the localhost form a Space cannot complete', () =>
-    assert.ok(!/codex login(?! --device-auth)/.test(fresh), 'plain `codex login` was offered'));
-  await check('names the secret for each agent', () => {
-    assert.match(fresh, /ANTHROPIC_API_KEY/); assert.match(fresh, /OPENAI_API_KEY/);
+  // Launching each agent in a PTY with no credentials showed that opening a
+  // session IS the sign-in for claude and codex, so the card must not ask for
+  // a command. It cannot: a Claude pane runs Claude, and anything typed there
+  // goes to the model as a prompt.
+  await check('asks only that a session be opened, with no command to type', () => {
+    assert.match(fresh, /Open a session/);
+    assert.ok(!/auth login|--device-auth|\$ /.test(fresh), `a command leaked into the card: ${fresh.slice(0, 200)}`);
+  });
+  await check('steers Codex past the option that cannot work from a Space', () =>
+    assert.match(fresh, /Sign in with Device Code/));
+  // Named only where it is the route: an agent whose session signs itself in
+  // does not need a key paragraph, and listing one would be extra to do.
+  await check('names the secret only for the agents that need one', () => {
+    assert.match(fresh, /Needs a key: GEMINI_API_KEY/);
+    assert.ok(!/Needs a key: ANTHROPIC_API_KEY/.test(fresh), 'asked Claude for a key it does not need');
   });
   await check('warns that adding a secret restarts the Space', () =>
-    assert.match(fresh, /restarts this Space/));
-  await check('says so for an agent with no confirmed remote sign-in', () =>
-    assert.match(fresh, /have not confirmed a sign-in flow for Gemini CLI/));
+    assert.match(fresh, /restarts the Space/));
+  await check('an agent with no confirmed sign-in is offered the key instead', () => {
+    assert.match(fresh, /Needs a key: GEMINI_API_KEY/);
+    assert.ok(!/Open a Gemini CLI session/.test(fresh), 'offered a session it cannot sign in from');
+  });
+  await check('the shared explanation is said once, not once per agent', () =>
+    assert.equal((fresh.match(/because a Space has no browser of its own/g) || []).length, 1));
 
   const href = await page.locator('a.setup-go').first().getAttribute('href');
   await check(' deep-links to this Space\'s settings', () =>
@@ -104,17 +118,23 @@ try {
 
   console.log('\npartly configured');
   await mount({ clis: CATALOG(['claude']), secrets: ['OPENAI_API_KEY'] });
-  await page.locator('.btn-ghost').click();   // one agent works, so it opened on the tour
+  await page.locator('.welcome-foot .btn-ghost').click();   // one agent works, so it opened on the tour
   await page.waitForTimeout(80);
   const part = await text();
   await check('counts what already works', () => assert.match(part, /1 of 3/));
+  await check('each agent carries its own mark, with its readiness on it', async () => {
+    const marks = await page.$$eval('.setup-logo .state-logo', (els) => els.map((e) => e.className));
+    assert.equal(marks.length, 3, `expected one mark per agent, got ${marks.length}`);
+    // Same vocabulary as the sidebar: a live frame for an agent that can run.
+    assert.deepEqual(marks.map((c) => c.split(' ').pop()), ['idle', 'stopped', 'stopped']);
+  });
   await check('a ready agent offers a session instead of setup', () =>
-    assert.match(part, /Signed in\. Its login is kept on your bucket\./));
+    assert.match(part, /signed in/));
 
   await mount({ clis: CATALOG(['codex']), secrets: ['OPENAI_API_KEY'] });
-  await page.locator('.btn-ghost').click();   // one agent works, so it opened on the tour
+  await page.locator('.welcome-foot .btn-ghost').click();   // one agent works, so it opened on the tour
   await check('and says WHICH secret is doing the work', async () =>
-    assert.match(await text(), /Using the OPENAI_API_KEY secret/));
+    assert.match(await text(), /via the OPENAI_API_KEY secret/));
 
   console.log('\nprivacy not verified');
   await mount({ clis: CATALOG([]), unverified: true });
@@ -128,10 +148,10 @@ try {
   await mount({ clis: CATALOG(['claude']) });
   await check('an already-working Space opens on the tour', async () =>
     assert.match(await text(), /Welcome to Agent Manager/));
-  await page.locator('.btn-ghost').click();
+  await page.locator('.welcome-foot .btn-ghost').click();
   await check('and setup is one click back from it', async () =>
     assert.match(await text(), /Connect your first agent/));
-  await page.locator('.btn-ghost').click();
+  await page.locator('.welcome-foot .btn-ghost').click();
   await check('the tour is one click forward from setup', async () =>
     assert.match(await text(), /Welcome to Agent Manager/));
 
@@ -175,11 +195,17 @@ try {
     });
     // The command is the one thing a reader retypes, so it must not be clipped:
     // at phone width `codex login --device-auth` was cut to "--device-aut".
-    const cut = await page.$$eval('.setup-cmd code', (els) => els
-      .filter((e) => e.scrollWidth > e.clientWidth + 1)
-      .map((e) => e.textContent));
-    await check(`${name}: no sign-in command is cut off`, () =>
-      assert.deepEqual(cut, [], `clipped: ${JSON.stringify(cut)}`));
+    // Nothing in a row may run under the button beside it — the secret names
+    // for an agent that accepts three of them did exactly that.
+    const overlap = await page.$$eval('.setup-act', (els) => els.flatMap((row) => {
+      const note = row.querySelector('.setup-note'); const btn = row.querySelector('.setup-go');
+      if (!note || !btn) return [];
+      const a = note.getBoundingClientRect(); const b = btn.getBoundingClientRect();
+      const hit = a.right > b.left + 1 && a.left < b.right - 1 && a.bottom > b.top + 1 && a.top < b.bottom - 1;
+      return hit ? [note.textContent.slice(0, 40)] : [];
+    }));
+    await check(`${name}: nothing collides with its button`, () =>
+      assert.deepEqual(overlap, [], `overlapping: ${JSON.stringify(overlap)}`));
   }
   await page.setViewportSize({ width: 1000, height: 900 });
 

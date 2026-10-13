@@ -1,16 +1,20 @@
-import { useState } from 'react';
 import type { Cli } from '../types';
 import { KeyGlyph, LockGlyph, PlusGlyph } from './icons';
+import StateLogo from './StateLogo';
 
-// First-run SETUP: which agents can actually run, and the two honest ways to
-// make one work. The tour next door explains what the product does; this
-// answers the only question a brand-new operator has, which is how to get a
-// single agent answering them.
+// First-run SETUP: which agents can actually run, and the least a person has to
+// do to make one answer them. The tour next door explains what the product is.
 //
-// Everything here is live. `ready` is the same signal behind the coloured dot
-// in Settings -> Agents (isConfigured in server/src/config.js), and `secrets`
-// and `signIn` come from the same catalog, so this window cannot drift out of
-// step with what the app will actually do.
+// Everything is live. `ready` is the same signal behind the mark in the sidebar
+// and Settings (isConfigured in server/src/config.js); `secrets` and `signIn`
+// come from the same catalog, so this cannot drift from what the app will do.
+//
+// The rule for every line here is that a reader can carry it out from where the
+// button leaves them. An earlier draft said "open a session and run `claude
+// auth login` in the pane" — but a Claude session's pane runs Claude, so that
+// text would have gone to the model as a prompt. Each agent below says only
+// what opening its session actually requires, which for the two that work is
+// nothing, or one choice.
 
 /** Which agents are worth offering: real CLIs, present in this image. */
 export const setupCandidates = (clis: Cli[]) =>
@@ -31,20 +35,13 @@ export default function WelcomeSetup({
   onTour: () => void;
   onClose: () => void;
 }) {
-  const [copied, setCopied] = useState<string | null>(null);
   const agents = setupCandidates(clis);
   const ready = agents.filter((c) => c.ready);
   const have = new Set(presentSecrets);
-  // The Space's own settings page, built rather than described — that is where
-  // secrets are added, and it is two clicks deep otherwise.
+  // The Space's own settings page, built rather than described.
   const settingsUrl = spaceId ? `https://huggingface.co/spaces/${spaceId}/settings` : null;
-
-  const copy = (text: string) => {
-    navigator.clipboard?.writeText(text).then(() => {
-      setCopied(text);
-      window.setTimeout(() => setCopied((c) => (c === text ? null : c)), 1400);
-    }, () => {});
-  };
+  const anySignIn = agents.some((c) => !c.ready && c.signIn);
+  const anyKeyOnly = agents.some((c) => !c.ready && !c.signIn && c.secrets?.length);
 
   return (
     <>
@@ -54,8 +51,8 @@ export default function WelcomeSetup({
           <h2 id="welcome-title">Connect your first agent</h2>
           <p>
             {ready.length
-              ? <><b>{ready.length} of {agents.length}</b> agents are ready to run. Start one, or set up another below.</>
-              : <>Nothing is signed in yet. Pick an agent and use either route — both persist across restarts.</>}
+              ? <><b>{ready.length} of {agents.length}</b> ready. Start one, or set up another below.</>
+              : <>Nothing is signed in yet. Pick an agent — whichever route you use, it persists across restarts.</>}
           </p>
         </div>
       </div>
@@ -71,84 +68,76 @@ export default function WelcomeSetup({
         </div>
       )}
 
+      {/* Said once, not once per agent. */}
+      {(anySignIn || anyKeyOnly) && (
+        <div className="setup-how">
+          {anySignIn && (
+            <p>
+              <b>Open a session</b> and the agent walks you through signing in — it shows a link to
+              open and a code to bring back, because a Space has no browser of its own.
+            </p>
+          )}
+          {anyKeyOnly && settingsUrl && (
+            <p>
+              <b>Or use an API key.</b> Add it as a Space <b>secret</b>; that <b>restarts the
+              Space</b>, and your files, logins and history are on the bucket and survive it.
+            </p>
+          )}
+        </div>
+      )}
+
       <div className="setup-list">
         {agents.map((c) => {
           const held = (c.secrets || []).filter((k) => have.has(k));
           return (
             <div key={c.id} className={`setup-row${c.ready ? ' ok' : ''}`}>
-              <div className="setup-agent">
-                <span className="setup-dot" style={{ background: c.ready ? c.color : 'transparent', borderColor: c.color }} />
-                <span className="setup-name">{c.label}</span>
-                <span className="setup-state mono">{c.ready ? 'ready' : 'needs setup'}</span>
+              <span className="setup-logo">
+                {/* One mark for both questions: which agent, and is it ready.
+                    Same vocabulary as the sidebar — a live frame for an agent
+                    that can run, the off frame for one that cannot yet. */}
+                <StateLogo cli={c.id} state={c.ready ? 'idle' : 'stopped'} size={16} tint={c.color} />
+              </span>
+              <span className="setup-name">{c.label}</span>
+              <span className="setup-state mono">{c.ready ? 'ready' : 'needs setup'}</span>
+              <div className="setup-act">
+                {c.ready ? (
+                  <>
+                    <span className="setup-note">
+                      {held.length ? <>via the <span className="mono">{held[0]}</span> secret</> : <>signed in</>}
+                    </span>
+                    <button className="btn-primary setup-go" onClick={() => onStartSession(c.id)}>Start a session</button>
+                  </>
+                ) : c.signIn ? (
+                  <>
+                    {c.signIn.note && <span className="setup-note">{c.signIn.note}</span>}
+                    <button className="btn-primary setup-go" onClick={() => onStartSession(c.id)}>
+                      Open a {c.label} session
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <span className="setup-note">
+                      <KeyGlyph /> Needs a key:{' '}
+                      {(c.secrets || []).map((k, i) => (
+                        <span key={k}>{i ? ' / ' : ''}<span className={`mono${have.has(k) ? ' setup-have' : ''}`}>{k}</span></span>
+                      ))}
+                    </span>
+                    {settingsUrl && (
+                      <a className="btn-ghost setup-go" href={settingsUrl} target="_blank" rel="noreferrer">
+                        Add a secret ↗
+                      </a>
+                    )}
+                  </>
+                )}
               </div>
-              {c.ready ? (
-                <div className="setup-ways">
-                  <span className="setup-ready-note">
-                    {held.length ? <>Using the <span className="mono">{held[0]}</span> secret.</> : <>Signed in. Its login is kept on your bucket.</>}
-                  </span>
-                  <button className="btn-primary setup-go" onClick={() => onStartSession(c.id)}>Start a session</button>
-                </div>
-              ) : (
-                <div className="setup-ways">
-                  {c.signIn ? (
-                    <div className="setup-way">
-                      <div className="setup-way-head">Sign in with your subscription</div>
-                      <p>
-                        Open a session and run this in the pane. It prints a link and a code to
-                        bring back — no browser redirect, which is what a Space needs.
-                      </p>
-                      <div className="setup-cmd">
-                        <code className="mono">{c.signIn}</code>
-                        <button className="mini-btn" onClick={() => copy(c.signIn!)}>{copied === c.signIn ? 'copied' : 'copy'}</button>
-                      </div>
-                      <button className="btn-primary setup-go" onClick={() => onStartSession(c.id)}>Open a {c.label} session</button>
-                    </div>
-                  ) : (
-                    <div className="setup-way">
-                      <div className="setup-way-head">Sign in with your subscription</div>
-                      <p>
-                        We have not confirmed a sign-in flow for {c.label} that completes from a
-                        terminal on a remote machine, so use an API key below.
-                      </p>
-                    </div>
-                  )}
-                  {!!(c.secrets || []).length && (
-                    <div className="setup-way">
-                      <div className="setup-way-head"><KeyGlyph /> Use an API key</div>
-                      <p>
-                        Add any one of these as a Space <b>secret</b>:{' '}
-                        {(c.secrets || []).map((k, i) => (
-                          <span key={k}>{i ? ' / ' : ''}<span className={`mono${have.has(k) ? ' setup-have' : ''}`}>{k}</span></span>
-                        ))}
-                        {held.length ? <> — already set.</> : null}
-                      </p>
-                      {settingsUrl && (
-                        <a className="btn-primary setup-go" href={settingsUrl} target="_blank" rel="noreferrer">
-                          Open Space settings ↗
-                        </a>
-                      )}
-                    </div>
-                  )}
-                </div>
-              )}
             </div>
           );
         })}
       </div>
 
-      {settingsUrl && (
-        <p className="setup-restart">
-          Adding a secret <b>restarts this Space</b>, so the app will reload. Your files, logins and
-          history are on the bucket and survive it — come back to this window and the agent will be
-          ready.
-        </p>
-      )}
-
       <div className="welcome-foot">
         <button className="btn-ghost" onClick={onTour}>What else can it do? →</button>
-        <button className="btn-primary" onClick={onClose}>
-          {ready.length ? 'Done' : 'Skip for now'}
-        </button>
+        <button className="btn-primary" onClick={onClose}>{ready.length ? 'Done' : 'Skip for now'}</button>
       </div>
     </>
   );
