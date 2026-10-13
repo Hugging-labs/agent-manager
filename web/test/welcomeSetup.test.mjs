@@ -154,6 +154,35 @@ try {
   await check('one working agent does', () => assert.equal(counts.one, 1));
   await check('an agent missing from the image is not offered', () => assert.equal(counts.missingBinary, 0));
 
+  console.log('\nicons and commands, by size');
+  // Every glyph in icons.tsx is <svg viewBox> with NO width/height, so its size
+  // is entirely CSS's job. A glyph dropped into a flex row with no rule fills
+  // it — the API-key key rendered at 406px — and one in a plain span collapses
+  // to 0. Both shipped. This asserts the whole class rather than the one that
+  // was noticed.
+  for (const [w, name] of [[1000, 'desktop'], [390, 'phone']]) {
+    await page.setViewportSize({ width: w, height: 900 });
+    await mount({ clis: CATALOG([]), unverified: true });
+    const icons = await page.$$eval('.welcome-card svg', (els) => els.map((e) => ({
+      where: String(e.parentElement?.className || '?'),
+      w: Math.round(e.getBoundingClientRect().width),
+      h: Math.round(e.getBoundingClientRect().height),
+    })));
+    await check(`${name}: every icon has a sane size`, () => {
+      assert.ok(icons.length >= 3, `only ${icons.length} icons found`);
+      const bad = icons.filter((i) => i.w < 8 || i.w > 28 || i.h < 8 || i.h > 28);
+      assert.deepEqual(bad, [], `off-size icons: ${JSON.stringify(bad)}`);
+    });
+    // The command is the one thing a reader retypes, so it must not be clipped:
+    // at phone width `codex login --device-auth` was cut to "--device-aut".
+    const cut = await page.$$eval('.setup-cmd code', (els) => els
+      .filter((e) => e.scrollWidth > e.clientWidth + 1)
+      .map((e) => e.textContent));
+    await check(`${name}: no sign-in command is cut off`, () =>
+      assert.deepEqual(cut, [], `clipped: ${JSON.stringify(cut)}`));
+  }
+  await page.setViewportSize({ width: 1000, height: 900 });
+
   await check('no page errors', () => assert.deepEqual(errors, [], errors[0]));
 } finally {
   await browser.close();
