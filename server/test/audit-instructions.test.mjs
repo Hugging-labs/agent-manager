@@ -1,6 +1,11 @@
-// The environment skill is generated at boot. Exercise that output in an
-// isolated data/home tree so its privacy claims cannot drift from the API-log
-// documentation again.
+// The environment skill is generated at boot and read-only, so the only way to
+// pin what it tells every agent is to render it. Boot the server in an isolated
+// data/home tree and assert on the output: its privacy claims, so they cannot
+// drift from the API-log documentation again, and the rule that a dispatched
+// task is still the dispatcher's — which is asserted PER SECTION, because that
+// rule failed by being true in the wrong place. It was stated once under
+// "Watch instead of asking", several screens above every way of handing work
+// over, so an agent reading the send instructions never met it.
 //
 // Run with: node test/audit-instructions.test.mjs
 import assert from 'node:assert/strict';
@@ -49,11 +54,54 @@ try {
   assert.match(text, /older records were not rewritten/);
   assert.doesNotMatch(text, /prompt and file contents are hashed rather than copied/);
 
+  // Everything from `### <heading>` up to the next heading at the same level or
+  // higher. Asserting against the whole file would pass on a rule that sits
+  // anywhere, which is the bug.
+  const section = (heading) => {
+    const start = text.indexOf(`\n${heading}`);
+    assert.ok(start >= 0, `the generated skill has no "${heading}" section`);
+    const rest = text.slice(start + heading.length + 1);
+    const depth = heading.match(/^#+/)[0].length;
+    const next = rest.search(new RegExp(`\\n#{1,${depth}} `));
+    return next < 0 ? rest : rest.slice(0, next);
+  };
+
+  // Sending a prompt is the common dispatch: the rule lives here in full.
+  const send = section('### Send an agent a prompt');
+  assert.match(send, /A task you hand over is still yours/);
+  assert.match(send, /start the background `wait` loop/);
+  assert.match(send, /`tail` it and act on what it actually produced/);
+  assert.match(send, /not finished when the prompt is sent/);
+  assert.match(send, /Never report work as done that you only delegated/);
+
+  // Launching an agent and spawning into a group are dispatches too — each one
+  // has to arm the watch where it happens, not leave it to a section the reader
+  // may never reach.
+  const launch = section('### Launch a new agent');
+  assert.match(launch, /it is a\s+dispatch and the rule under \*\*Send an agent a prompt\*\* applies/);
+  assert.match(launch, /start the background `wait` loop right\s+then/);
+  assert.match(launch, /read its screen before you\s+call the job done/);
+  assert.match(launch, /arming each\s+one's watch as you go/, 'spawning into a group arms a watch per agent');
+
+  // A remote agent has no pane to tail, so its result has to be named instead.
+  const remote = section('## Remote agents');
+  assert.match(remote, /a task handed to one is still yours/);
+  assert.match(remote, /no result until you have read it there/);
+
+  // `wait` answering is not the work succeeding. A CLI that rejects its own
+  // flags returns to its input box and reports `waiting`, which is why the
+  // state alone must never be read as a result.
+  const watch = section('### Watch instead of asking');
+  assert.match(watch, /`matched` means the agent STOPPED, not that it succeeded/);
+  assert.match(watch, /Read `tail` afterwards and judge the\s+work, not the state/);
+  assert.doesNotMatch(watch, /`matched: true`\s+is finished/);
+
   const docs = fs.readFileSync(path.resolve('..', 'docs', 'api-audit-log.md'), 'utf8');
   assert.match(docs, /full non-secret\s+request, prompt, file-write, result and error content/);
   assert.match(docs, /not an export-safe artifact/);
   assert.match(docs, /existing JSONL bytes and backups are not inspected, rewritten/);
   console.log('audit-instructions: generated and long-form policy describe retained, filtered, prospective private logs');
+  console.log('env-skill: every dispatch section arms the watch and owns the result');
 } finally {
   server.kill('SIGTERM');
   await Promise.race([
