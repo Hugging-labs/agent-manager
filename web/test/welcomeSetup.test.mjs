@@ -195,6 +195,21 @@ try {
     });
     // The command is the one thing a reader retypes, so it must not be clipped:
     // at phone width `codex login --device-auth` was cut to "--device-aut".
+    // Every row is text-left / action-right. Claude's had a button alone on
+    // the left once its command was removed, because the note was optional —
+    // so this asserts the shape rather than that one row, and the actions
+    // share an edge rather than each finding its own.
+    const shape = await page.$$eval('.setup-act', (rows) => rows.map((r) => {
+      const btn = r.querySelector('.setup-go'); const note = r.querySelector('.setup-note');
+      return { note: !!note && !!note.textContent.trim(), right: btn ? Math.round(btn.getBoundingClientRect().right) : null };
+    }));
+    await check(`${name}: every row has a note beside its action`, () =>
+      assert.deepEqual(shape.filter((r) => !r.note), [], 'a row had an action with nothing to say'));
+    await check(`${name}: every action sits in the same slot`, () => {
+      const edges = [...new Set(shape.map((r) => r.right).filter((x) => x !== null))];
+      assert.equal(edges.length, 1, `actions ended at ${JSON.stringify(edges)}`);
+    });
+
     // Nothing in a row may run under the button beside it — the secret names
     // for an agent that accepts three of them did exactly that.
     const overlap = await page.$$eval('.setup-act', (els) => els.flatMap((row) => {

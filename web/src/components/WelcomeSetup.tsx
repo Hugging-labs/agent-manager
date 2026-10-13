@@ -109,7 +109,15 @@ export default function WelcomeSetup({
                   </>
                 ) : c.signIn ? (
                   <>
-                    {c.signIn.note && <span className="setup-note">{c.signIn.note}</span>}
+                    {/* Every row is a line of text and an action, so the note is
+                        not optional: `note` carries the one thing a particular
+                        pane does not make obvious, and otherwise this says what
+                        the session will do. Without it an agent that needs no
+                        caveat — Claude — had a button alone on the left. */}
+                    <span className="setup-note">
+                      {c.signIn.note
+                        || <>Sign in when the session opens — it shows a link, and a code to paste back.</>}
+                    </span>
                     <button className="btn-primary setup-go" onClick={() => onStartSession(c.id)}>
                       Open a {c.label} session
                     </button>

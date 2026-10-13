@@ -880,9 +880,10 @@ body {
 .setup-note { font-size: 12.5px; line-height: 1.45; opacity: .8; flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .setup-note svg { width: 13px; height: 13px; flex: none; vertical-align: -2px; margin-right: 4px; }
 .setup-have { color: var(--ok, #4a9e6b); }
-.setup-go { flex: none; padding: 5px 12px; font-size: 12.5px; text-decoration: none; display: inline-block; }
+.setup-go { flex: none; margin-left: auto; padding: 5px 12px; font-size: 12.5px; text-decoration: none; display: inline-block; }
 @media (max-width: 720px) {
   .setup-act { flex-direction: column; align-items: stretch; }
+  .setup-go { margin-left: 0; }
   .setup-go { text-align: center; }
 }
 
