@@ -88,6 +88,45 @@ const MENTIONS = 'the closing </pasted_content id="df85"> tag is what leaks — 
   });
 }
 
+console.log('\n# a paste whose BODY opens with a harness envelope');
+// Someone asking about `<system-reminder>` pastes one. The wrapper is proof the
+// harness is quoting the operator rather than talking to itself, so the
+// envelope test has to run on the RAW record: unwrapping first turned these
+// into harness noise, which demotes a plain record to a `system` turn and drops
+// a queued one outright -- a lost operator prompt.
+for (const envelope of ['<system-reminder>', '<task-notification>', '<environment_context>']) {
+  const BODY = `${envelope}\nwhat does this mean when I see it?\n`;
+  for (const [name, records] of [
+    ['plain', [user(pasted(BODY)), asst('it is the harness', 'm1')]],
+    ['queued', [user('first'), asst('working', 'm1'),
+      queue('enqueue', pasted(BODY)), queue('remove', pasted(BODY), 'absorbed_mid_turn')]],
+  ]) {
+    const { turns } = await readTraceByPath(write(`env-${envelope.length}-${name}`, records), { reader: true, limit: 200 });
+    const mine = turns.filter((t) => t.role === 'user' || t.event?.type === 'queue');
+    check(`${envelope} pasted (${name}): survives as the operator's own`, () => {
+      assert.ok(textOf(mine).includes('what does this mean when I see it?'),
+        'the pasted envelope was treated as harness noise and lost');
+    });
+    check(`${envelope} pasted (${name}): is not demoted to a system turn`, () => {
+      assert.ok(!turns.some((t) => t.role === 'system' && (t.blocks || [])
+        .some((b) => b.type === 'text' && b.text.includes('what does this mean'))),
+        'the operator\'s paste was rendered as harness output');
+    });
+  }
+}
+
+// The envelope itself, unwrapped, is still harness noise and must stay out.
+{
+  const { turns } = await readTraceByPath(write('bare-envelope', [
+    user('first'), asst('working', 'm1'),
+    queue('enqueue', '<task-notification>\n<task-id>abc</task-id>\n'),
+    queue('remove', '<task-notification>\n<task-id>abc</task-id>\n', 'absorbed_mid_turn'),
+  ]), { reader: true, limit: 200 });
+  check('a bare harness envelope is still filtered', () => {
+    assert.ok(!textOf(turns).includes('task-id'), 'harness noise reached the reader as a prompt');
+  });
+}
+
 console.log('\n# the digest behind the Overview card');
 {
   const txt = [user('an ordinary prompt'), asst('ok', 'm1'), user(pasted(SENT))]
@@ -99,6 +138,25 @@ console.log('\n# the digest behind the Overview card');
   });
   check('and carries no wrapper', () => {
     assert.ok(!String(last).includes('pasted_content'), 'the wrapper reached the Overview card');
+  });
+}
+
+{
+  // Same trap as the transcript: the card's noise filter must not eat a paste
+  // whose body happens to open with an envelope.
+  const BODY = '<system-reminder>\nwhat does this mean when I see it?\n';
+  const txt = [user('an ordinary prompt'), asst('ok', 'm1'), user(pasted(BODY))]
+    .map((r) => JSON.stringify(r)).join('\n');
+  const { digest } = parseClaude(txt);
+  const last = String(digest.lastPromptText || digest.lastPrompt || '');
+  check('a pasted envelope still becomes the last prompt', () => {
+    assert.ok(last.includes('what does this mean when I see it?'),
+      `the card shows ${JSON.stringify(last.slice(0, 40))}`);
+  });
+  const bare = parseClaude([user('an ordinary prompt'), asst('ok', 'm1'),
+    user('<task-notification>\n<task-id>abc</task-id>\n')].map((r) => JSON.stringify(r)).join('\n'));
+  check('a bare envelope still does not', () => {
+    assert.equal(String(bare.digest.lastPromptText || '').includes('task-id'), false);
   });
 }
 

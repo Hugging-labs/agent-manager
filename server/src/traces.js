@@ -228,12 +228,22 @@ function parseClaude(txt) {
         : Array.isArray(mc) ? mc.filter((c) => c && c.type === 'text').map((c) => c.text).join(' ') : '';
       // Skip harness noise (slash-command wrappers, attachments, interrupt
       // markers) as "prompts".
-      // Unwrapped first: a pasted prompt opens with `<pasted_content …>`, so the
-      // `<` test below dropped the operator's own text and left the Overview
-      // card showing the prompt BEFORE it as the latest one.
+      // A pasted prompt opens with `<pasted_content …>`, so the `<` test below
+      // dropped the operator's own text and left the Overview card showing the
+      // prompt BEFORE it as the latest one.
+      //
+      // Testing the raw text is not the answer here the way it is in the
+      // normalizer: this test is a broad "looks like a tag", which `<pasted_
+      // content …>` trips by construction. The wrapper is itself the proof that
+      // the harness is quoting the operator, so a wrapped prompt skips the
+      // heuristic rather than being measured by it — otherwise someone pasting
+      // a `<system-reminder>` to ask about it loses the prompt here too.
       const unwrapped = unwrapPasted(text);
+      const wasWrapped = unwrapped !== text;
       const t = unwrapped.trim();
-      if (t && !t.startsWith('<') && !t.startsWith('[Request interrupted')) digestPrompt(dg, unwrapped, j.timestamp);
+      if (t && (wasWrapped || (!t.startsWith('<') && !t.startsWith('[Request interrupted')))) {
+        digestPrompt(dg, unwrapped, j.timestamp);
+      }
     }
   }
   return { stats: st, digest: dg };
@@ -1391,10 +1401,17 @@ async function normalizeClaude(file, out, range, allowSubagent = false) {
     // It still renders as a `system` turn, which the reader does not draw.
     if ((j.isMeta || j.sourceToolUseID) && j.origin?.kind !== 'task-notification') continue;
     if (j.type === 'queue-operation') {
-      const content = unwrapPasted(j.content);
+      // Classified on the RAW record, rendered unwrapped. A `pasted_content`
+      // wrapper is the harness quoting what the operator pasted, so a wrapped
+      // envelope is by definition not harness output — and testing the
+      // unwrapped text would drop the prompt of anyone asking what a
+      // <system-reminder> is. The pending/remove key stays on the unwrapped
+      // text, which is consistent because both sides compute it the same way.
+      const raw = String(j.content == null ? '' : j.content);
+      const content = unwrapPasted(raw);
       const text = queueKey(content);
       if (range?.reader) {
-        if (isHarnessText(text)) continue;
+        if (isHarnessText(queueKey(raw))) continue;
         out.push({ role: 'system', ts: Date.parse(j.timestamp) || undefined, blocks: [],
           event: { type: 'queue', operation: j.operation, text: content } });
         continue;
@@ -1403,7 +1420,7 @@ async function normalizeClaude(file, out, range, allowSubagent = false) {
         // Harness noise is not a prompt: one of the five removes in the
         // reference transcript is an enqueued <task-notification>, and showing
         // that as something the operator typed would be a new bug for an old one.
-        if (!text || isHarnessText(text)) continue;
+        if (!text || isHarnessText(queueKey(raw))) continue;
         const msg = {
           role: 'user',
           ts: j.timestamp ? Date.parse(j.timestamp) || undefined : undefined,
@@ -1454,7 +1471,10 @@ async function normalizeClaude(file, out, range, allowSubagent = false) {
     for (const c of items) {
       if (!c || typeof c !== 'object') continue;
       if (c.type === 'text') {
-        const t = j.type === 'user' ? unwrapPasted(c.text) : String(c.text || '');
+        const raw = String(c.text || '');
+        // Same rule as the queue path above: the envelope test runs on the raw
+        // record, the reader is given the unwrapped text.
+        const t = j.type === 'user' ? unwrapPasted(raw) : raw;
         if (!t.trim()) continue;
         // Injected environment/reminder blobs are not prompts — show them, but
         // as system so the conversation reads correctly (same rule the digest
@@ -1464,12 +1484,12 @@ async function normalizeClaude(file, out, range, allowSubagent = false) {
         // copy opens with the tag itself. It says so on the tin; without it in
         // this list the record reads as something the operator typed, and the
         // reader would open a new exchange with harness noise in the prompt band.
-        if (j.type === 'user' && isHarnessText(t)) {
-          if (allowSubagent && forkEnd === null && t.startsWith('<fork-boilerplate>')) {
+        if (j.type === 'user' && isHarnessText(raw)) {
+          if (allowSubagent && forkEnd === null && raw.startsWith('<fork-boilerplate>')) {
             forkEnd = out.messages.length;
             if (range?.reader) { range.logicalStart = true; range.start = range.recordOffset; }
           }
-          out.push({ role: 'system', ts, blocks: [textBlock('text', t)] });
+          out.push({ role: 'system', ts, blocks: [textBlock('text', raw)] });
           continue;
         }
         msg.blocks.push(textBlock('text', t));

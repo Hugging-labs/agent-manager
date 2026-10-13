@@ -230,6 +230,33 @@ try {
     });
   }
 
+  // The echo has to be retired by the exchange that CARRIES the message, not by
+  // any recent one. A short follow-up is easily a substring of the prompt
+  // before it, and the one-minute window reaches back over that prompt — so an
+  // unanchored containment test retires the echo on sight and the operator's
+  // message is missing until the transcript catches up.
+  console.log('\n### a short follow-up that the previous prompt contains');
+  {
+    const PREV = 'should we ship the login guide today?';
+    const FOLLOWUP = 'the login guide';
+    const opening = [rec.user(PREV, 0), rec.asst('not yet', 1)];
+    await p.evaluate((t) => window.fixture.mount(t), await normalize(opening));
+    await p.waitForSelector('.cxv-body');
+    await p.waitForTimeout(400);
+    // Deliberately no new records: this is the window between sending and the
+    // transcript catching up, which is the whole point of the echo.
+    await p.locator('.ov-live textarea').fill(FOLLOWUP);
+    await p.locator('button[aria-label="Send"]').click();
+    await p.waitForTimeout(1400);
+    const bands = await p.evaluate((n) => [...document.querySelectorAll('.cx-prompt')]
+      .map((el) => el.textContent.replace(/\s+/g, ' ').trim()), FOLLOWUP);
+    const echoed = bands.filter((t) => t === FOLLOWUP).length;
+    console.log(`  prompt bands: ${JSON.stringify(bands)}`);
+    check('the message stays on screen until the transcript catches up', () => {
+      assert.equal(echoed, 1, 'the echo was retired by the PREVIOUS exchange, so the message vanished');
+    });
+  }
+
   check('no page errors', () => assert.deepEqual(errors, [], errors.slice(0, 2).join(' | ')));
   await context.close();
 } finally {
