@@ -206,10 +206,26 @@ export default function ConversationView({
     const attachment = attachmentsRef.current.find((item) => item.key === key);
     if (attachment && !sending) void uploadPendingAttachments(session.id, [attachment], updateAttachment).catch(() => {});
   };
+  // Retire the optimistic echo once the transcript carries what was sent.
+  //
+  // What came back has to CONTAIN what was sent, not start with it. The harness
+  // records a prompt with whatever was already on its input line in front of
+  // it, and there are two ways that happens: a line the operator half-typed in
+  // the terminal pane and never submitted, and Claude Code's `<pasted_content>`
+  // wrapper around any multi-line paste. Against `startsWith` both read as a
+  // different prompt, so the echo was never retired here and the operator saw
+  // their message twice — the transcript's copy and the echo — until something
+  // else cleared it.
+  //
+  // Whitespace is squeezed because a multi-line paste comes back reflowed, and
+  // the window still bounds it to a turn from the last minute, so an older
+  // exchange that happens to quote the same words cannot retire it.
   useEffect(() => {
     const last = exchanges[exchanges.length - 1];
     const text = last?.prompt?.blocks.filter((b) => b.type === 'text').map((b) => 'text' in b ? b.text : '').join('').trim();
-    if (sent && (last?.startTs || 0) >= sent.at - 60_000 && text?.startsWith(sent.text)) setSent(null);
+    const squeeze = (value: string) => value.replace(/\s+/g, ' ').trim();
+    if (sent && (last?.startTs || 0) >= sent.at - 60_000
+      && text && squeeze(text).includes(squeeze(sent.text))) setSent(null);
   }, [exchanges, sent]);
   const latest = () => {
     following.current = true; setAtLatest(true); touched.current = true;

@@ -179,6 +179,13 @@ try {
     // multi-line paste, so there is a wrapper but no queue record anywhere.
     ['sent normally, arriving as a plain user record', [
       rec.user(pasted(SENT), 2), rec.asst('on it', 3)]],
+    // The other way a prefix gets in front of the prompt: AM submits onto a
+    // line the operator half-typed in the terminal and never sent, so the
+    // harness records the concatenation. No wrapper — this one is single-line.
+    // The merged text is a separate bug (the agent receives it too); what is
+    // pinned here is that the reader still shows the message once.
+    ['sent onto a line already half-typed in the terminal', [
+      rec.user(`how are we going on the ${SENT}`, 2), rec.asst('on it', 3)]],
     ['absorbed into the running turn, pasted', [
       rec.enqueue(pasted(SENT), 2), rec.remove(pasted(SENT), 3, 'absorbed_mid_turn'),
       rec.absorbed(pasted(SENT), 4), rec.asst('answering it', 5)]],
