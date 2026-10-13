@@ -65,6 +65,28 @@ export function cliVersion(id) {
 const setupHint = (...keys) =>
   `Launch it once — the first run walks you through sign-in. Or add ${keys.join(' / ')} as a Space secret.`;
 
+// How to sign in INTERACTIVELY, from a terminal pane on a remote machine.
+//
+// This is not the same question as "does the CLI have a login command". A Space
+// runs in a container the operator's browser cannot reach, so any OAuth flow
+// that redirects to localhost is unusable here however well it works on a
+// laptop. Each entry below was run and watched:
+//
+//  - claude: `claude auth login` redirects to platform.claude.com and then asks
+//    for the code to be pasted back. Works in a pane.
+//  - codex:  plain `codex login` starts a server on localhost:1455 and the CLI
+//    itself says "On a remote or headless machine? Use `codex login
+//    --device-auth` instead." The device flow prints a URL and a one-time code.
+//    So the pane command is the device one, NOT what its TUI offers by default.
+//
+// `null` means we have not confirmed a pane-usable flow, and the UI should send
+// the operator to the API-key path instead of inventing instructions.
+const SIGN_IN = {
+  claude: 'claude auth login',
+  codex: 'codex login --device-auth',
+  opencode: 'opencode auth login',
+};
+
 // Panels rather than processes: no binary, nothing to launch, no trace of their
 // own. Everywhere the app asks "is this an agent?" it means "not one of these".
 export const PASSIVE_CLIS = ['files', 'trace'];
@@ -99,24 +121,24 @@ export const CLIS = [
   { id: 'remote',   label: 'Remote agent', bin: null,      color: '#5ec2e0', run: null,             cont: null },
   { id: 'claude',   label: 'Claude Code', bin: 'claude',   color: '#d97757', run: 'claude',         cont: 'claude --continue', resizeMode: 'repaint',
     withPrompt: (q) => `claude ${q}`,
-    setup: setupHint('ANTHROPIC_API_KEY') },
+    secrets: ['ANTHROPIC_API_KEY'], setup: setupHint('ANTHROPIC_API_KEY') },
   { id: 'codex',    label: 'Codex',       bin: 'codex',    color: '#5eb6a6', run: codexCommand(),   cont: codexCommand('resume --last'), resizeMode: 'repaint',
     resume: (id) => codexCommand(`resume ${id}`),
     // `q` and image paths arrive shell-quoted from runner.commandFor(). Repeat
     // -i because Codex's variadic flag would otherwise consume the prompt.
     withPrompt: (q, images = []) => `${codexCommand()}${images.length ? ` ${images.map((image) => `-i ${image}`).join(' ')}` : ''} ${q}`,
-    setup: setupHint('OPENAI_API_KEY') },
+    secrets: ['OPENAI_API_KEY'], setup: setupHint('OPENAI_API_KEY') },
   { id: 'gemini',   label: 'Gemini CLI',  bin: 'gemini',   color: '#4796e3', run: 'gemini',         cont: null, resizeMode: 'repaint',
     withPrompt: (q) => `gemini -i ${q}`, // -i = interactive session seeded with the prompt
-    setup: setupHint('GEMINI_API_KEY') },
+    secrets: ['GEMINI_API_KEY'], setup: setupHint('GEMINI_API_KEY') },
   { id: 'opencode', label: 'opencode',    bin: 'opencode', color: '#8a93a0', run: 'opencode',       cont: 'opencode --continue', resizeMode: 'repaint',
     withPrompt: (q) => `opencode --prompt ${q}`,
-    setup: setupHint('ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY') },
+    secrets: ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY'], setup: setupHint('ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY') },
   { id: 'hermes',   label: 'Hermes',      bin: 'hermes',   color: '#a78bfa', run: 'hermes',         cont: 'hermes -c', resizeMode: 'repaint',
-    setup: setupHint('HF_TOKEN', 'ANTHROPIC_API_KEY', 'OPENROUTER_API_KEY', 'NOUS_API_KEY') },
+    secrets: ['HF_TOKEN', 'ANTHROPIC_API_KEY', 'OPENROUTER_API_KEY', 'NOUS_API_KEY'], setup: setupHint('HF_TOKEN', 'ANTHROPIC_API_KEY', 'OPENROUTER_API_KEY', 'NOUS_API_KEY') },
   // `chat` = TUI in --local mode: embedded agent, no gateway/daemon needed.
   { id: 'openclaw', label: 'OpenClaw',    bin: 'openclaw', color: '#c83636', run: 'openclaw chat',  cont: null, resizeMode: 'repaint',
-    setup: setupHint('ANTHROPIC_API_KEY') },
+    secrets: ['ANTHROPIC_API_KEY'], setup: setupHint('ANTHROPIC_API_KEY') },
   // fx has no config-dir override: its state (auth, settings, sessions) is
   // hardcoded to ~/.fx, which entrypoint.sh points at local disk and
   // checkpoints — the same treatment opencode and Hermes get.
@@ -125,7 +147,7 @@ export const CLIS = [
     // fx has no "start interactive, seeded with this prompt" form: `fx ask` runs
     // one request and exits, which would end the pane instead of opening it. So
     // no withPrompt — a queued first prompt is typed into the TUI instead.
-    setup: setupHint('AI_GATEWAY_API_KEY') },
+    secrets: ['AI_GATEWAY_API_KEY'], setup: setupHint('AI_GATEWAY_API_KEY') },
   // Test-only primary-screen repaint fixture. Absent from every normal runtime.
   ...(process.env.AM_TEST_REPAINT_CMD
     ? [{ id: 'test-repaint', label: 'Repaint fixture', bin: 'bash', color: '#8aa0ad', run: process.env.AM_TEST_REPAINT_CMD, cont: null, resizeMode: 'repaint' }]
@@ -199,6 +221,11 @@ export function cliCatalog() {
     ready: (c.bin ? commandExists(c.bin) : true) && isConfigured(c.id),
     version: versionCache.get(c.id) || null,
     setup: c.setup || null,
+    // The two ways in, as data rather than prose, so the first-run window can
+    // show the real ones per agent instead of a sentence that has to be kept in
+    // sync by hand. `signIn` is null where no pane-usable flow is confirmed.
+    secrets: c.secrets || [],
+    signIn: SIGN_IN[c.id] || null,
   }));
 }
 

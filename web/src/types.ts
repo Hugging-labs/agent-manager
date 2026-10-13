@@ -45,6 +45,11 @@ export interface Cli {
   ready?: boolean;
   version?: string | null;
   setup?: string | null; // how to configure it (shown on the "needs setup" hint)
+  // The two routes in, as data: secret names this CLI accepts, and the sign-in
+  // command confirmed to complete from a terminal on a remote machine (null
+  // where none is confirmed). Both from the server catalog — see config.js.
+  secrets?: string[];
+  signIn?: string | null;
 }
 
 // Pane arrangement for a group's tiles. Absent/null = auto (grow with agents).
