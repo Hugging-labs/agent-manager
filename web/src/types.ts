@@ -45,6 +45,13 @@ export interface Cli {
   ready?: boolean;
   version?: string | null;
   setup?: string | null; // how to configure it (shown on the "needs setup" hint)
+  // The two routes in, as data: secret names this CLI accepts, and the sign-in
+  // command confirmed to complete from a terminal on a remote machine (null
+  // where none is confirmed). Both from the server catalog — see config.js.
+  secrets?: string[];
+  // Present when opening a session shows a sign-in that completes from a Space;
+  // `note` is the one thing the pane does not make obvious. null = unconfirmed.
+  signIn?: { note: string | null } | null;
 }
 
 // Pane arrangement for a group's tiles. Absent/null = auto (grow with agents).

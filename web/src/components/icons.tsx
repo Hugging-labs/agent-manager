@@ -3,7 +3,7 @@ import type { ReactNode } from 'react';
 // Shared minimal stroke glyphs (inherit currentColor, scale to their box).
 // One pen for the whole UI: 16px grid, 1.2 stroke, round joins.
 const G = ({ className, children }: { className?: string; children: ReactNode }) => (
-  <svg className={className} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" strokeLinecap="round">
+  <svg className={className} width="1em" height="1em" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" strokeLinecap="round">
     {children}
   </svg>
 );

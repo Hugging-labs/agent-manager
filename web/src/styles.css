@@ -864,6 +864,29 @@ body {
 .welcome-reopen { font-size: 11px; color: var(--muted); }
 .welcome-foot .btn-primary { flex: none; padding: 8px 18px; }
 
+/* ---- first-run setup (the welcome card's first step) ---- */
+.setup-warn { display: flex; gap: 10px; padding: 10px 12px; border-radius: var(--r-md); border: 1px solid var(--warn, #c9972f); background: color-mix(in srgb, var(--warn, #c9972f) 12%, transparent); font-size: 12.5px; line-height: 1.45; }
+.setup-warn-ico { flex: none; opacity: .9; display: flex; }
+.setup-warn-ico svg { width: 14px; height: 14px; flex: none; }
+.setup-how { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; line-height: 1.5; opacity: .85; }
+.setup-how p { margin: 0; }
+.setup-list { display: flex; flex-direction: column; gap: 8px; }
+.setup-row { border: 1px solid var(--border); border-radius: var(--r-md); padding: 10px 12px; display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 4px 10px; }
+.setup-row.ok { background: color-mix(in srgb, var(--panel-2, var(--panel)) 60%, transparent); }
+.setup-logo { display: flex; align-items: center; flex: none; }
+.setup-name { font-weight: 600; }
+.setup-state { font-size: 11px; opacity: .6; }
+.setup-act { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.setup-note { font-size: 12.5px; line-height: 1.45; opacity: .8; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.setup-note svg { width: 13px; height: 13px; flex: none; vertical-align: -2px; margin-right: 4px; }
+.setup-have { color: var(--ok, #4a9e6b); }
+.setup-go { flex: none; margin-left: auto; padding: 5px 12px; font-size: 12.5px; text-decoration: none; display: inline-block; }
+@media (max-width: 720px) {
+  .setup-act { flex-direction: column; align-items: stretch; }
+  .setup-go { margin-left: 0; }
+  .setup-go { text-align: center; }
+}
+
 /* The side columns keep a min-content floor. Without one the centre track is
    sized to its max-content BEFORE the two `1fr` tracks get anything, so a wide
    title takes its width out of its neighbours: the logo and the close button

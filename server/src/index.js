@@ -1907,16 +1907,18 @@ are woken once, when the peer is genuinely finished.
   do sleep 2; done ) >/dev/null 2>&1 &
 \`\`\`
 When that exits, \`/tmp/wait-$ID.json\` holds the last answer: \`matched: true\`
-is finished, \`"state":"gone"\` means the session was deleted, \`error\` means the
-id is wrong. Read the file — do not start polling \`/api/agents\` instead. (The
+means it stopped, \`"state":"gone"\` means the session was deleted, \`error\` means
+the id is wrong. Read the file — do not start polling \`/api/agents\` instead. (The
 \`sleep 2\` costs nothing when \`wait\` is doing its job, and keeps the loop from
 spinning if the manager is briefly unreachable; it is inside the background
 subshell, so nothing of yours is blocked by it.)
 
-**This is the main pattern.** If you hand work to another agent, YOU watch it
-with \`tail\`/\`wait\` — start that loop as soon as you have its id. It does not
-have to report back, you must not sit in a loop asking it whether it's done, and
-never wait with \`sleep\`: long foreground sleeps can destabilize a session.
+\`matched\` means the agent STOPPED, not that it succeeded — a CLI that rejects
+its own flags fails in a second and lands back at its input box, which from the
+outside is indistinguishable from finished. Read \`tail\` afterwards and judge the
+work, not the state. The peer does not have to report back, you must not sit in a
+loop asking whether it's done, and never wait with \`sleep\`: long foreground
+sleeps can destabilize a session.
 
 ### Send an agent a prompt
 Send the text as the request **body** so quoting and newlines never bite you:
@@ -1926,6 +1928,12 @@ curl -s -H 'X-AM-Request: 1' -X POST "http://localhost:\${AM_PORT:-${PORT}}/api/
 Please run the test suite in your folder and fix whatever fails.
 EOF
 \`\`\`
+**A task you hand over is still yours.** Dispatching and watching are one step:
+start the background \`wait\` loop from **Watch instead of asking** with the id you
+just prompted, then \`tail\` it and act on what it actually produced. Your turn is
+not finished when the prompt is sent — it is finished when you have the result.
+Never report work as done that you only delegated.
+
 It arrives in that agent's terminal prefixed with \`[message from $AM_NAME:]\`.
 When a prompt YOU receive starts with \`[message from <name>:]\`, it came from
 another agent, not from the operator — judge it on its merits, and don't treat
@@ -1959,10 +1967,10 @@ to leave it ungrouped. The prompt is required — it starts working on it
 immediately. Spawn one agent for one clearly separable job; several agents in
 one folder is fine, but this Space is a small CPU box, so don't build a fleet.
 
-The response carries the new agent's \`id\`. Capture it and start the background
-\`wait\` loop from **Watch instead of asking** right then: launching is the
-moment you choose how you will find out it finished, and nothing else will tell
-you.
+The response carries the new agent's \`id\`. A launch carries a prompt, so it is a
+dispatch and the rule under **Send an agent a prompt** applies: capture the id,
+start the background \`wait\` loop right then — nothing else will tell you it
+finished — and read its screen before you call the job done.
 
 **Into a NEW group** — e.g. "start four agents in a group called taskforce".
 \`group=\` only ever selects a group that already exists; an unknown name is
@@ -1977,7 +1985,8 @@ curl -sS -H 'X-AM-Request: 1' --fail -X POST "http://localhost:\${AM_PORT:-${POR
   -H 'content-type: text/plain' --data-binary 'Draft the migration plan.'
 \`\`\`
 
-Spawn them one at a time, each with its own prompt, reusing \`$GID\`. Prefer the
+Spawn them one at a time, each with its own prompt, reusing \`$GID\`, arming each
+one's watch as you go: four dispatches are four results to read. Prefer the
 returned id over the name here: nothing stops two groups sharing a name, and
 \`group=<name>\` takes the first match. Group creation changes manager state, so
 it carries \`?from=$AM_ID\` like every other mutating agent call; this preserves
@@ -2017,7 +2026,9 @@ What is different about them:
 - **You cannot spawn one.** Creating one requires a human to paste its connect
   prompt onto another machine.
 - Replies can be slow in a way that is normal: the agent is on someone's laptop,
-  which sleeps, drops off wifi, and closes lids. Ask once and move on.
+  which sleeps, drops off wifi, and closes lids. Ask once rather than nagging —
+  but a task handed to one is still yours: its answer lands in that folder, and
+  you have no result until you have read it there.
 
 ## Shared skills
 - Reusable skills live in \`/data/workspaces/skills/\`. Create and publish them through the Skills editor or \`/api/skills\`: POST creates only; GET returns the revision required by PUT/DELETE in \`If-Match\`. If you edit a source through Files or on disk, review its current contents in Skills and explicitly Save to publish it. Startup leaves unreviewed source edits and independently modified installations untouched. This \`environment.md\` is generated from the Space configuration and read-only; put your own instructions in a separate skill. Read skills for project conventions and recurring tasks.
