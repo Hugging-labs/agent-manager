@@ -461,7 +461,21 @@ try {
       window.fixture.grid(grid.cols,grid.rows,false);
       window.fixture.grid(grid.cols,grid.rows,true,snapshot);
     },{grid,snapshot:bigScreen});
-    await p.waitForTimeout(250);
+    // Wait for the terminal to stop moving, not for a guess at how long that
+    // takes. The renderer sizes the viewport element after the snapshot is
+    // parsed, so a fixed delay samples mid-repaint on a loaded box — and what
+    // it caught was real (the restore being undone by that resize), reported
+    // as a flake. Settling is not the thing under test: the assertions below
+    // read where it settled, and still fail if that is the wrong place.
+    await p.waitForFunction(() => {
+      const v = document.querySelector('.xterm-viewport');
+      if (!v) return false;
+      const now = `${Math.round(v.scrollTop)}/${v.scrollHeight}/${v.clientHeight}`;
+      const stable = window.__repaintLast === now;
+      window.__repaintLast = now;
+      return stable;
+    }, null, { timeout: 10_000, polling: 150 }).catch(() => {});
+    await p.evaluate(() => { delete window.__repaintLast; });
   };
   // Stay at the live end through both shrink and expansion.
   await p.locator('.xterm-helper-textarea').focus();
