@@ -40,6 +40,7 @@ import { splitExchanges } from './exchanges';
 import { searchIndex } from './readerSearch';
 import { useVirtualRows } from './useVirtualRows';
 import { cachedRoster, loadRoster } from '../../lib/subagentRoster';
+import { anyMoving, byExchange, cachedDispatches, loadDispatches, type Dispatch } from '../../lib/dispatches';
 import ExchangeView, { PendingExchange } from './Exchange';
 import Attachments from '../Attachments';
 import Composer from './Composer';
@@ -181,6 +182,26 @@ export default function ConversationView({
     const timer = session.running ? window.setInterval(tick, 15_000) : undefined;
     return () => { alive = false; window.clearInterval(timer); };
   }, [session.id, session.running, paused]);
+
+  // The sessions this one launched or prompted, from the start of the loaded
+  // window on. Asked again while this session works (it may dispatch more) and
+  // while anything it dispatched is still moving — a peer keeps working after
+  // the turn that sent it work has ended. `since` is rounded to the minute so a
+  // window that grows by a turn does not refetch.
+  const firstStart = exchanges.find((x) => x.startTs)?.startTs || 0;
+  const since = firstStart ? Math.floor(firstStart / 60_000) * 60_000 - 60_000 : 0;
+  const [dispatches, setDispatches] = useState<Dispatch[] | null>(() => cachedDispatches(session.id));
+  const moving = useMemo(() => anyMoving(dispatches || []), [dispatches]);
+  useEffect(() => {
+    if (paused || !since) return;
+    let alive = true;
+    const tick = (force: boolean) => loadDispatches(session.id, since, force)
+      .then((list) => { if (alive) setDispatches(list); }).catch(() => {});
+    void tick(false);
+    const timer = session.running || moving ? window.setInterval(() => tick(true), session.running ? 10_000 : 15_000) : undefined;
+    return () => { alive = false; window.clearInterval(timer); };
+  }, [session.id, session.running, paused, since, moving]);
+  const dispatchesOf = useMemo(() => byExchange(exchanges, dispatches || []), [exchanges, dispatches]);
 
   useEffect(() => { attachmentsRef.current = attachments; }, [attachments]);
   useEffect(() => () => discardPendingAttachments(session.id, attachmentsRef.current), [session.id]);
@@ -661,6 +682,7 @@ export default function ConversationView({
             <ExchangeView x={x} n={n + 1} total={exchanges.length} q={q || undefined} baseModel={head?.model || undefined}
               open={q ? undefined : openWork.get(x.key) || false} onToggle={() => setOpenWork((map) => new Map(map).set(x.key, !map.get(x.key)))}
               running={live && n === exchanges.length - 1 && !sent} turns={turns} sessionId={session.id} live={!!session.running && !paused} roster={roster}
+              dispatches={dispatchesOf.get(x.key)}
               // The observer rides the newest exchange's ANSWER. Watching the
               // whole exchange would let a visible prompt, with its answer
               // thousands of pixels below the fold, clear the unread mark.

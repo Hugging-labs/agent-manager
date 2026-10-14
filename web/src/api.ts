@@ -1,6 +1,6 @@
 import { withDurableIntent } from './lib/durableIntent';
 import {withCreationIntent} from './lib/creationIntent';
-import type { Cli, Group, MoveTarget, RemoteInfo, RemoteMessage, Session, Tree } from './types';
+import type { Cli, Group, MoveTarget, RemoteInfo, RemoteMessage, Session, SessionState, Tree } from './types';
 import { ApiError, connectionError, decodeJsonText, decodeResponse } from './apiResponse';
 export { ApiError } from './apiResponse';
 import { requestHeaders } from './requestIntent';
@@ -782,6 +782,8 @@ export interface TraceTurn {
    * this was typed and queued — rather than claiming it was answered.
    */
   queued?: boolean;
+  /** claude: the harness wrote this turn because the request failed (`authentication_failed`, …) */
+  error?: string;
   ts?: number;
   model?: string;
   usage?: { in: number; out: number; cacheRead?: number };
@@ -976,6 +978,24 @@ export const getSubAgentWindow = (id: string, agentId: string, req: TraceReq, by
   traceFetch(`/api/agents/${id}/subagents/${encodeURIComponent(agentId)}?${traceRange(req)}${windowSize(bytes, min)}`, signal);
 export const getSubAgentSummary = (id: string, agentId: string, signal?: AbortSignal): Promise<TraceSummary> =>
   traceFetch(`/api/agents/${id}/subagents/${encodeURIComponent(agentId)}?summary=1`, signal);
+
+// The peer sessions a session launched or prompted through this API, each with
+// the turn its prompt started over there (server/src/dispatches.js). `exchange`
+// holds that turn only, slimmed: text, tool names and usage, no tool bodies.
+export interface Dispatch {
+  id: string;
+  at: number;
+  kind: 'launch' | 'prompt';
+  status: number;
+  ok: boolean;
+  target: { id: string | null; name: string | null; cli: string | null; color: string | null; exists: boolean; state: SessionState | null };
+  prompt: string;
+  exchange: { turns: TraceTurn[]; ended: boolean; truncated: boolean } | null;
+  untraced?: boolean;
+}
+
+export const getDispatches = (id: string, since = 0, signal?: AbortSignal): Promise<{ id: string; dispatches: Dispatch[] }> =>
+  traceFetch(`/api/agents/${id}/dispatches?since=${Math.max(0, Math.floor(since))}`, signal);
 
 export const getFileTraceSummary = (id: string, p: string, signal?: AbortSignal): Promise<TraceSummary> =>
   traceFetch(`/api/files/${id}/trace?path=${encodeURIComponent(p)}&summary=1`, signal);

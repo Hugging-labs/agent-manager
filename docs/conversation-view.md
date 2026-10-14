@@ -559,6 +559,37 @@ uniformly and why codex's `task_complete` needs no special case.
 | `system` | *not rendered* in card; behind a toggle in D3 | — |
 | `more` (truncation) | `+412 KB not retained` — **never** silently dropped | — |
 
+#### Dispatched sessions
+
+A session that launches or prompts *other sessions* through the manager's API
+(`POST /api/agents`, `POST /api/agents/:id/prompt`) shows them on the turn that
+made the call. These are peers, not the harness's own sub-agents.
+
+- **Collapsed:** one CLI logo per session on the summary line, filling the
+  space up to the turn number and wrapping inside it. A narrow pane gives them
+  a line of their own. The logos use the `StateLogo` frames: running animates,
+  finished is the ordinary frame, and failed is the same frame in `--danger`.
+  There is no checkmark: a turn that ended says the peer stopped, not that it
+  did the job. Running sessions sit on the left, finished ones to their right,
+  and failed ones at the very right. A session that finishes slides over,
+  except while a preview is open.
+- **Preview:** shown on hover, or on the first tap on touch, where it is a
+  sheet. It holds this turn's latest prompt to that session, the tool count,
+  time and tokens of the turn the prompt started over there, its last message,
+  and always an **Open session** button. Clicking the icon also opens the
+  session, at its latest turn.
+- **Expanded:** the tool call that dispatched becomes its own step (`launched
+  ×3` plus the sessions) instead of folding into `Bash ×N`.
+- **Failed** covers only what the records prove: the harness wrote an error
+  turn (`authentication_failed`), the call was refused, the turn ended with no
+  final message, or the prompt never started a turn.
+
+Data: `GET /api/agents/:id/dispatches?since=` (server/src/dispatches.js). It
+reads the dispatches from the operations log. It finds the turn each prompt
+started in the target's transcript by bisecting on line timestamps, then
+matching the prompt text, including a Claude queue event for a prompt that
+arrived mid-turn. The rules live in web/src/lib/dispatches.ts.
+
 ### 4.3 Visual grammar — the overview's, everywhere
 
 Role is expressed by typography and position, not by a badge.

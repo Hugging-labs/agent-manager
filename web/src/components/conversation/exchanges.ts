@@ -119,6 +119,13 @@ export type Step =
    */
   | { kind: 'agent'; toolUseId: string; description: string; agentType: string; taskName?: string; blocks: TraceBlock[] }
   | { kind: 'tools'; name: string; count: number; details: string[]; failed: boolean; pending: boolean; blocks: TraceBlock[] }
+  /**
+   * A tool call that launched or prompted other sessions through the
+   * manager's API. Its own kind for the same reason as `agent`: it must not
+   * fold into `Bash ×3`, and what it started has a life after the call.
+   * `call` is the tool_use block, the key the reader's dispatch map uses.
+   */
+  | { kind: 'dispatch'; call: TraceBlock; failed: boolean; blocks: TraceBlock[] }
   | { kind: 'note'; text: string; more?: number }
   | { kind: 'shell'; command: string; out: string; failed: boolean }
   | { kind: 'image'; src: string }
@@ -171,6 +178,7 @@ export function stepText(s: Step): string {
   // A sub-agent row is searchable by the task it was given and by the call's
   // own input; its transcript is a different file and is not in this window.
   if (s.kind === 'agent') return [s.description, s.agentType, ...s.blocks.map((b) => ('text' in b ? b.text : ''))].join('\n');
+  if (s.kind === 'dispatch') return s.blocks.map((b) => ('text' in b ? b.text : '')).join('\n');
   return s.text;
 }
 
@@ -179,7 +187,7 @@ export const oneLine = (s: string, n = 90) => {
   return t.length > n ? `${t.slice(0, n)}…` : t;
 };
 
-export function stepsOf(turns: TraceTurn[]): Step[] {
+export function stepsOf(turns: TraceTurn[], dispatched?: (call: TraceBlock) => boolean): Step[] {
   const out: Step[] = [];
   const pushTool = (name: string, detail: string, blocks: TraceBlock[], failed: boolean) => {
     const pending = blocks.some((b) => b.type === 'tool_use') && !blocks.some((b) => b.type === 'tool_result');
@@ -212,6 +220,10 @@ export function stepsOf(turns: TraceTurn[]): Step[] {
           j++;
         }
         i = j - 1;
+        if (dispatched && dispatched(b)) {
+          out.push({ kind: 'dispatch', call: b, failed, blocks: group });
+          continue;
+        }
         if (AGENT_TOOLS.has(b.name) && b.id) {
           const input = agentInput(b.text);
           const task = (input.task_name || '').split('/').filter(Boolean).pop() || '';
