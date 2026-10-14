@@ -112,7 +112,9 @@ export default function ConversationView({
   const [attachmentDrop, setAttachmentDrop] = useState(false);
   const [sending, setSending] = useState(false);
   const [failed, setFailed] = useState<string | null>(null);
-  const [sent, setSent] = useState<(PendingPrompt & { at: number }) | null>(null);
+  /** The prompt just sent, and `after`: where the conversation ended when it
+   *  went out, so the echo can only be retired by an exchange newer than that. */
+  const [sent, setSent] = useState<(PendingPrompt & { at: number; after: number }) | null>(null);
   const allowAttachments = !isRemote(session.cli);
   const [openWork, setOpenWork] = useState(new Map<string, boolean>());
   const [restoreNotice, setRestoreNotice] = useState<string | null>(null);
@@ -206,10 +208,34 @@ export default function ConversationView({
     const attachment = attachmentsRef.current.find((item) => item.key === key);
     if (attachment && !sending) void uploadPendingAttachments(session.id, [attachment], updateAttachment).catch(() => {});
   };
+  // Retire the optimistic echo once the transcript carries what was sent.
+  //
+  // What came back has to CONTAIN what was sent, not start with it. The harness
+  // records a prompt with whatever was already on its input line in front of
+  // it, and there are two ways that happens: a line the operator half-typed in
+  // the terminal pane and never submitted, and Claude Code's `<pasted_content>`
+  // wrapper around any multi-line paste. Against `startsWith` both read as a
+  // different prompt, so the echo was never retired here and the operator saw
+  // their message twice — the transcript's copy and the echo — until something
+  // else cleared it.
+  //
+  // Whitespace is squeezed because a multi-line paste comes back reflowed.
+  //
+  // Containment alone is not enough to say the message arrived. A short
+  // follow-up is easily a substring of the prompt before it — "the login guide"
+  // after "should we ship the login guide today?" — and a recency window alone
+  // still reaches back over that prompt, so the echo retired on sight and the
+  // message was missing until the transcript caught up. So the exchange that
+  // retires it must be NEWER than the one the conversation ended on when it was
+  // sent. Both timestamps come from the transcript, so no clock is compared
+  // against the browser's.
   useEffect(() => {
     const last = exchanges[exchanges.length - 1];
     const text = last?.prompt?.blocks.filter((b) => b.type === 'text').map((b) => 'text' in b ? b.text : '').join('').trim();
-    if (sent && (last?.startTs || 0) >= sent.at - 60_000 && text?.startsWith(sent.text)) setSent(null);
+    const squeeze = (value: string) => value.replace(/\s+/g, ' ').trim();
+    const startTs = last?.startTs || 0;
+    if (sent && startTs > sent.after && startTs >= sent.at - 60_000
+      && text && squeeze(text).includes(squeeze(sent.text))) setSent(null);
   }, [exchanges, sent]);
   const latest = () => {
     following.current = true; setAtLatest(true); touched.current = true;
@@ -220,7 +246,8 @@ export default function ConversationView({
     if ((!text && !batch.length) || sending || batch.some((item) => !item.attachment)) return;
     const uploaded = batch.map((item) => item.attachment!);
     const optimistic = buildPendingPrompt(session.cli, text, uploaded);
-    setSending(true); setFailed(null); setDraft(''); setSent({ ...optimistic, at: Date.now() });
+    setSending(true); setFailed(null); setDraft('');
+    setSent({ ...optimistic, at: Date.now(), after: exchanges[exchanges.length - 1]?.startTs || 0 });
     if (inputRef.current) inputRef.current.style.height = 'auto';
     latest();
     try {
