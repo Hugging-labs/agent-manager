@@ -218,6 +218,48 @@ try {
   });
   narrow.ws.close();
 
+  // The 409 tells the operator to "send or clear that line". Submitting it is
+  // covered above; this is the other half of its own advice.
+  console.log('\n# clearing input that was held during a send');
+  at = ran().length;
+  const held = post(`/api/sessions/${pane.id}/input`, { text: runs('APICLEAR') });
+  await sleep(100);                       // inside the gap, so it is held
+  pane.type(runs('CLEARED_RACER'));
+  await held;
+  await until(() => ran().includes('APICLEAR'), 8000);
+  await sleep(1200);                      // the replayed text is on a fresh line
+  pane.type('\x15');                      // and the operator clears it
+  await sleep(1200);
+  const afterHeldClear = await post(`/api/sessions/${pane.id}/input`, { text: runs('AFTERHELDCLEAR') });
+  await until(() => ran().includes('AFTERHELDCLEAR'), 8000);
+  check('clearing it lets the next prompt through', () => {
+    assert.equal(afterHeldClear.status, 200,
+      `POST /input answered ${afterHeldClear.status} against a line the operator had just cleared`);
+    assert.deepEqual(ran().slice(at), ['APICLEAR', 'AFTERHELDCLEAR']);
+  });
+
+  // A phone rotating, or a pane narrowing. The prompt reflows, so an empty line
+  // stops looking like the picture taken of it at the old width.
+  console.log('\n# the terminal is resized while the line is empty');
+  at = ran().length;
+  await post(`/api/sessions/${pane.id}/input`, { text: `PS1='${'p'.repeat(28)}$ '` });
+  await sleep(1200);
+  pane.type('discard me');
+  await sleep(600);
+  pane.type('\x15');                      // cleared, so the line is empty again
+  await sleep(600);
+  pane.ws.send(JSON.stringify({ t: 'r', cols: 20, rows: 30 }));
+  await sleep(1500);
+  const afterResize = await post(`/api/sessions/${pane.id}/input`, { text: runs('AFTERRESIZE') });
+  await until(() => ran().includes('AFTERRESIZE'), 8000);
+  check('a reflowed empty prompt still takes a prompt', () => {
+    assert.equal(afterResize.status, 200,
+      `POST /input answered ${afterResize.status} after the pane was narrowed`);
+    assert.ok(ran().slice(at).includes('AFTERRESIZE'), 'the prompt never ran');
+  });
+  pane.ws.send(JSON.stringify({ t: 'r', cols: 100, rows: 30 }));
+  await sleep(800);
+
   console.log('\n# a line that only LOOKS busy');
   // Scrollback ending in the same words is not the composer: this used to
   // refuse a send against an empty prompt, then tell the operator to clear it.

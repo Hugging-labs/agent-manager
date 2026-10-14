@@ -2263,8 +2263,39 @@ export function composerShape(snapshot) {
   };
 }
 
-export const sameComposer = (a, b) => !!a && !!b
-  && a.col === b.col && a.alt === b.alt && a.before === b.before;
+/**
+ * Does `now` still look like the empty line `empty` was a picture of?
+ *
+ * Equal text is the ordinary answer. The suffix cases are a redraw of the SAME
+ * empty line at a different width: narrowing a pane wraps the prompt, so the
+ * cursor's row holds only its tail, and widening puts the whole prompt back on
+ * one row. The operator rotating a phone must not read as text appearing on the
+ * line. Both directions, because a pane can go either way.
+ *
+ * The cursor column is not compared: it is the length of the text in front of
+ * the cursor, so equal text already implies it, and a reflow changes it while
+ * changing nothing about the line.
+ */
+export const sameComposer = (a, b) => {
+  if (!a || !b || a.alt !== b.alt) return false;
+  if (a.before === b.before) return true;
+  // One empty string is a suffix of everything, which would make any line look
+  // like an empty one.
+  if (!a.before || !b.before) return false;
+  return a.before.endsWith(b.before) || b.before.endsWith(a.before);
+};
+
+/** Wait for the pane to stop painting, bounded. */
+async function settled(host, quietMs = 250, maxMs = 3000) {
+  const deadline = Date.now() + maxMs;
+  let last = host.outputSeq;
+  for (;;) {
+    await new Promise((r) => setTimeout(r, quietMs));
+    if (host.outputSeq === last) return true;
+    if (Date.now() >= deadline) return false;   // still busy; take what we have
+    last = host.outputSeq;
+  }
+}
 
 const shapeNow = (host) => {
   try { return composerShape(host.vt.snapshot({ includeCells: false })); } catch { return null; }
@@ -2334,6 +2365,13 @@ export async function sendInput(id, text, opts = {}) {
     const held = host.heldInput || [];
     host.sending = false;
     host.heldInput = [];
+    // Let the pane finish repainting before anything is replayed. Our Enter
+    // leaves the line empty, but the shell has not drawn its new prompt yet,
+    // and whatever is photographed as "empty" for the replayed keystrokes is
+    // the picture the operator's next send is judged against. Taken too early
+    // it is the command we just submitted, and clearing the replayed text then
+    // recovers nothing.
+    if (held.length) await settled(host);
     // Replay in order, now that the line is ours no longer.
     for (const chunk of held) {
       notePaneInput(host, chunk);
