@@ -23,7 +23,7 @@ for (const [name, entry] of [['d.mjs', '../src/lib/dispatches.ts'], ['v.mjs', '.
   await build({ entryPoints: [path.join(HERE, entry)], outfile: path.join(dir, name), format: 'esm', bundle: true, logLevel: 'error' });
 }
 const { resultOf, byExchange, dispatchBlocks } = await import(pathToFileURL(path.join(dir, 'd.mjs')).href);
-const { iconsOf, ordered, placeCard } = await import(pathToFileURL(path.join(dir, 'v.mjs')).href);
+const { iconsOf, ordered, placeCard, within } = await import(pathToFileURL(path.join(dir, 'v.mjs')).href);
 const { splitExchanges, stepsOf } = await import(pathToFileURL(path.join(dir, 'x.mjs')).href);
 
 let failed = 0;
@@ -177,6 +177,19 @@ console.log('\nwhere the preview card goes');
     assert.deepEqual([phone.left, phone.width], [8, 374]);
   });
 }
+
+check('the bound is the reader\'s history, clipped to what the window shows', () => {
+  assert.deepEqual(within({ left: 10, top: 83, right: 1090, bottom: 273 }, { left: 0, top: 0, width: 1100, height: 800 }),
+    { left: 10, top: 83, width: 1080, height: 190 });
+  assert.deepEqual(within({ left: -50, top: -20, right: 400, bottom: 2000 }, { left: 0, top: 0, width: 390, height: 844 }),
+    { left: 0, top: 0, width: 390, height: 844 });
+});
+check('a short history caps the card to the room beside the icon inside it', () => {
+  const p = placeCard({ left: 200, top: 105, bottom: 125 }, { width: 440, height: 284 }, { left: 10, top: 83, width: 1080, height: 190 });
+  assert.equal(p.side, 'below');
+  assert.equal(p.top, 131);
+  assert.equal(p.top + p.maxHeight, 83 + 190 - 8);
+});
 
 fs.rmSync(dir, { recursive: true, force: true });
 if (failed) { console.log(`\n${failed} failed`); process.exit(1); }

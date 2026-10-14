@@ -78,6 +78,16 @@ export function viewport() {
     : { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
 }
 
+type Rect = { left: number; top: number; width: number; height: number };
+/** The part of `box` (a DOMRect-like) that is also inside `vp`. */
+export function within(box: { left: number; top: number; right: number; bottom: number }, vp: Rect): Rect {
+  const left = Math.max(box.left, vp.left);
+  const top = Math.max(box.top, vp.top);
+  const right = Math.min(box.right, vp.left + vp.width);
+  const bottom = Math.min(box.bottom, vp.top + vp.height);
+  return { left, top, width: Math.max(0, right - left), height: Math.max(0, bottom - top) };
+}
+
 /**
  * Where the card goes: below the icon, above it when there is not room below,
  * and — when it fits neither way — on the roomier side with its height capped,

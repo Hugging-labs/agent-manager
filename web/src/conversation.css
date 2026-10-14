@@ -703,8 +703,12 @@ mark.cx-hit.on { background: var(--accent); color: var(--panel); }
 .dx-open:disabled { opacity: 0.45; cursor: default; }
 
 /* touch: the first tap shows the preview as a sheet */
-.dx-sheet-wrap { position: fixed; inset: 0; z-index: 1000; background: rgb(0 0 0 / 0.28); display: flex; align-items: flex-end; }
-.dx-sheet { width: 100%; max-height: 80vh; overflow: auto; background: var(--panel); border-radius: 14px 14px 0 0;
+/* the backdrop dims and lets every gesture through; Dispatches.tsx closes the
+   sheet on a touch outside it (and a drag there scrolls the history) */
+.dx-sheet-wrap { position: fixed; inset: 0; z-index: 1000; background: rgb(0 0 0 / 0.28); display: flex; align-items: flex-end; pointer-events: none; }
+.dx-sheet-wrap > .dx-sheet { pointer-events: auto; }
+/* 60%, not more: some history stays in view above it, to read and to drag */
+.dx-sheet { width: 100%; max-height: 60vh; max-height: 60dvh; overflow: auto; overscroll-behavior: contain; background: var(--panel); border-radius: 14px 14px 0 0;
   padding: 6px 4px calc(14px + env(safe-area-inset-bottom)); box-shadow: 0 -8px 30px rgb(0 0 0 / 0.25); }
 .dx-sheet .dx-card { border: none; box-shadow: none; }
 .dx-sheet .dx-open { padding: 9px 16px; font-size: 13px; }
@@ -717,3 +721,6 @@ mark.cx-hit.on { background: var(--accent); color: var(--panel); }
 .dx-chip { display: inline-flex; align-items: center; gap: 5px; background: none; border: none; padding: 1px 4px 1px 1px;
   border-radius: var(--r-sm); font: inherit; font-size: 0.96em; color: var(--text); cursor: pointer; }
 .dx-chip:hover, .dx-chip.on { background: color-mix(in srgb, var(--border) 55%, transparent); }
+/* capped, the card scrolls; its one action stays in reach at the bottom edge */
+.dx-pop.capped .dx-card-foot { position: sticky; bottom: -10px; margin: 8px -12px -10px; padding: 8px 12px 10px;
+  background: var(--panel); border-top: 1px solid var(--border); }

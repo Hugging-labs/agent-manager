@@ -14,7 +14,7 @@ import StateLogo from '../StateLogo';
 import { renderMarkdown } from '../../lib/markdown';
 import { fmtClock, fmtDur, fmtTok, oneLine } from './exchanges';
 import { openSession, type Dispatch, type DispatchResult } from '../../lib/dispatches';
-import { iconsOf, ordered, placeCard, viewport, type PeerIcon } from '../../lib/dispatchView';
+import { iconsOf, ordered, placeCard, viewport, within, type PeerIcon } from '../../lib/dispatchView';
 
 const ENVELOPE = /^(?:\s*\[message from [^\]]*\]\s*)+/;
 const plainPrompt = (t: string) => oneLine(t.replace(ENVELOPE, '').replace(/^#+\s*/gm, '').replace(/\*\*|`/g, ''), 280);
@@ -145,6 +145,11 @@ const scrollerOf = (el: HTMLElement) => el.closest('.cxv-body') as HTMLElement |
  * card takes no part in the scroller's layout at all; it is placed against the
  * icon's rect in the viewport instead.
  *
+ * It stays inside the reader's history area. Where it has to be capped it
+ * scrolls itself, and a scroll that reaches its end stops there rather than
+ * moving the history behind it (overscroll-behavior: contain). Everywhere
+ * else the history scrolls as always — nothing here touches wheel or touch.
+ *
  * While it is open it follows its icon: live turns arrive mid-hover, and a card
  * that vanished every time the reader appended a line could not be read. When
  * the icon leaves the reader's visible area the card closes — a preview pointing
@@ -155,6 +160,25 @@ function Floating({ p, sheet, anchor, close }: {
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<ReturnType<typeof placeCard> | null>(null);
+  // The sheet's backdrop dims, but does not catch: a touch anywhere outside the
+  // sheet closes it and carries on — a drag scrolls the history as it always
+  // does. Only a plain TAP outside is kept from also landing on whatever is
+  // underneath, since that tap meant "close", not "follow this link".
+  useEffect(() => {
+    if (!sheet) return;
+    const down = (e: PointerEvent) => {
+      if (ref.current?.contains(e.target as Node)) return;
+      const x0 = e.clientX; const y0 = e.clientY;
+      const swallow = (c: MouseEvent) => {
+        if (Math.hypot(c.clientX - x0, c.clientY - y0) < 10) { c.preventDefault(); c.stopPropagation(); }
+      };
+      window.addEventListener('click', swallow, { capture: true, once: true });
+      window.setTimeout(() => window.removeEventListener('click', swallow, { capture: true }), 700);
+      close();
+    };
+    document.addEventListener('pointerdown', down, true);
+    return () => document.removeEventListener('pointerdown', down, true);
+  }, [sheet]);
   useLayoutEffect(() => {
     if (sheet) return;
     let frame = 0;
@@ -166,23 +190,31 @@ function Floating({ p, sheet, anchor, close }: {
       const r = anchor.getBoundingClientRect();
       const box = scrollerOf(anchor)?.getBoundingClientRect();
       if (box && (r.bottom < box.top || r.top > box.bottom)) { close(); return; }
-      // Measured at its natural height; a cap from the last placement must not
-      // decide whether it fits this time.
-      const prev = el.style.maxHeight;
-      el.style.maxHeight = 'none';
-      const natural = { width: Math.min(WIDTH, el.offsetWidth || WIDTH), height: el.scrollHeight };
-      el.style.maxHeight = prev;
-      setPos(placeCard(r, natural, viewport()));
+      // The card's natural height is its content's, read without touching the
+      // capped box around it. (Lifting the cap to measure — what this did —
+      // clamped the box's own scrollTop to 0 on every scroll, so a capped
+      // card could not be scrolled at all.)
+      const inner = el.firstElementChild as HTMLElement | null;
+      const natural = { width: WIDTH, height: inner ? inner.getBoundingClientRect().height : el.scrollHeight };
+      // Bounded by the reader's history, not the window: in a short pane the
+      // window has room the pane does not, and a card that hangs past the
+      // history covers the composer — or the next pane in a grid.
+      setPos(placeCard(r, natural, box ? within(box, viewport()) : viewport()));
     };
     place();
-    const soon = () => { if (!frame) frame = requestAnimationFrame(place); };
+    const soon = (e?: Event) => {
+      // the card scrolling its own content moves nothing it is placed against
+      if (e && e.type === 'scroll' && e.target instanceof Node && ref.current?.contains(e.target)) return;
+      if (!frame) frame = requestAnimationFrame(place);
+    };
     // capture: the reader scrolls inside its own element, not the window
     window.addEventListener('scroll', soon, { capture: true, passive: true });
     window.addEventListener('resize', soon);
     window.visualViewport?.addEventListener('resize', soon);
     window.visualViewport?.addEventListener('scroll', soon);
-    const ro = new ResizeObserver(soon);
-    if (ref.current) ro.observe(ref.current);
+    const ro = new ResizeObserver(() => soon());
+    const inner = ref.current?.firstElementChild;
+    if (inner) ro.observe(inner);
     return () => {
       cancelAnimationFrame(frame);
       window.removeEventListener('scroll', soon, { capture: true });
@@ -194,8 +226,8 @@ function Floating({ p, sheet, anchor, close }: {
   }, [anchor, sheet, p.key]);
   if (sheet) {
     return createPortal(
-      <div className="dx-sheet-wrap" onClick={close}>
-        <div className="dx-sheet" onClick={(e) => e.stopPropagation()}><div className="dx-grab" /><Preview p={p} /></div>
+      <div className="dx-sheet-wrap">
+        <div className="dx-sheet" ref={ref} onClick={(e) => e.stopPropagation()}><div className="dx-grab" /><Preview p={p} /></div>
       </div>, document.body);
   }
   const style: CSSProperties = pos
