@@ -2137,6 +2137,7 @@ export function ensureRunning(session, cols = 120, rows = 34) {
     consumeBreadcrumb(session, host, workdir, true)
       .catch((e) => console.warn(`[${session.cli}] ${session.id}: final breadcrumb read failed (${e && e.message})`));
     hosts.delete(session.id);
+    clearPaneInput(session.id);   // a dead pane holds no input line
     host.inputRequired.close();
     stopping.delete(session.id);
     if (host.gridTimer) { clearTimeout(host.gridTimer); host.gridTimer = null; }
@@ -2201,7 +2202,17 @@ export function attach(session, cols, rows) {
     // Input and terminal-query responses are accepted from one emulator only.
     write: (d, { terminalReply = false } = {}) => {
       if (host.controller !== sub) return;
-      if (!terminalReply) host.inputRequired.observeInput();
+      // A terminal query answered by the emulator is not someone typing, and
+      // must not look like text left on the input line. It also must not be
+      // held back: a TUI waiting on a device report would stall.
+      if (terminalReply) { try { host.pty.write(d); } catch {} return; }
+      host.inputRequired.observeInput();
+      // Checking the line, typing the prompt and pressing Enter is one
+      // transaction. A keystroke landing inside it would be submitted by our
+      // own Enter — the same merge, just later. Held, not dropped: it is
+      // replayed after the Enter, where it starts a line of its own.
+      if (host.sending) { host.heldInput.push(d); return; }
+      notePaneInput(host, d);
       try { host.pty.write(d); } catch {}
     },
     // Every viewer remembers what it can display, but only the current
@@ -2242,10 +2253,176 @@ export function attach(session, cols, rows) {
   };
 }
 
+/**
+ * Is this pane's input line empty?
+ *
+ * AM sends a prompt by typing it into the TUI and pressing Enter, and it never
+ * clears the composer first — clearing would destroy whatever the operator had
+ * typed there. So the prompt is glued onto whatever is already on the line and
+ * both are submitted as one message (#165).
+ *
+ * Knowing the line is empty means reading the composer, and the eight CLIs each
+ * draw one differently: `❯ `, `› `, `┃ `, a shell's arbitrary PS1, a question
+ * from a first-run prompt. None of that can be matched by pattern. But AM does
+ * not have to RECOGNISE a composer, only notice a change in one — and it knows
+ * exactly when to look. The instant before the first keystroke after a submit,
+ * the line is empty by construction, so whatever the grid shows then is this
+ * pane's own picture of "empty".
+ *
+ * So: keep that picture and compare against it. Identical means nothing is on
+ * the line. Anything else means something is — including every case a ledger of
+ * typed characters cannot model, because they all move the cursor or change the
+ * text in front of it: a command recalled with Up, an edit in the middle of a
+ * line, a line long enough to wrap onto another row.
+ *
+ * The comparison is deliberately one-sided. Looking exactly like empty is the
+ * only thing that permits a send; everything else refuses. For a guard whose
+ * job is to stop two messages becoming one, "I could not tell" has to mean no.
+ */
+const lineTouched = new Set();      // panes typed into since their last submit
+const lineEmpty = new Map();        // id -> what an empty line looks like here
+
+/** The cursor, and the text in front of it. */
+export function composerShape(snapshot) {
+  if (!snapshot) return null;
+  const line = (snapshot.visibleLines || []).find((l) => l.row === snapshot.cursorRow);
+  return {
+    col: snapshot.cursorCol,
+    alt: !!snapshot.isAltScreen,
+    // Not the row number: arriving output scrolls the composer up the screen
+    // without anybody touching what is on it.
+    before: line ? line.text.slice(0, snapshot.cursorCol) : '',
+  };
+}
+
+/**
+ * Does `now` still look like the empty line `empty` was a picture of?
+ *
+ * Equal text is the ordinary answer. The suffix cases are a redraw of the SAME
+ * empty line at a different width: narrowing a pane wraps the prompt, so the
+ * cursor's row holds only its tail, and widening puts the whole prompt back on
+ * one row. The operator rotating a phone must not read as text appearing on the
+ * line. Both directions, because a pane can go either way.
+ *
+ * The cursor column is not compared: it is the length of the text in front of
+ * the cursor, so equal text already implies it, and a reflow changes it while
+ * changing nothing about the line.
+ */
+export const sameComposer = (a, b) => {
+  if (!a || !b || a.alt !== b.alt) return false;
+  if (a.before === b.before) return true;
+  // One empty string is a suffix of everything, which would make any line look
+  // like an empty one.
+  if (!a.before || !b.before) return false;
+  return a.before.endsWith(b.before) || b.before.endsWith(a.before);
+};
+
+/** Wait for the pane to stop painting, bounded. */
+async function settled(host, quietMs = 250, maxMs = 3000) {
+  const deadline = Date.now() + maxMs;
+  let last = host.outputSeq;
+  for (;;) {
+    await new Promise((r) => setTimeout(r, quietMs));
+    if (host.outputSeq === last) return true;
+    if (Date.now() >= deadline) return false;   // still busy; take what we have
+    last = host.outputSeq;
+  }
+}
+
+const shapeNow = (host) => {
+  try { return composerShape(host.vt.snapshot({ includeCells: false })); } catch { return null; }
+};
+
+/**
+ * Follow the pane's input well enough to know when the line was last empty.
+ * Called with the keystroke still UNWRITTEN, which is what makes the first one
+ * after a submit a reliable photograph of an empty composer.
+ */
+function notePaneInput(host, data) {
+  const id = host.id;
+  const text = String(data == null ? '' : data);
+  if (!text) return;
+  if (!lineTouched.has(id)) {
+    const shape = shapeNow(host);
+    if (shape) lineEmpty.set(id, shape); else lineEmpty.delete(id);
+    lineTouched.add(id);
+  }
+  // A submit empties the line again, whoever pressed it — but only if nothing
+  // was typed after it in the same chunk.
+  const lastBreak = Math.max(text.lastIndexOf('\r'), text.lastIndexOf('\n'));
+  if (lastBreak === text.length - 1) lineTouched.delete(id);
+}
+
+/** Forget the line: it was submitted by us, or the pane is gone. */
+function clearPaneInput(id) { lineTouched.delete(id); lineEmpty.delete(id); }
+
+/**
+ * What is in the way of sending, or null when the line is clear.
+ *
+ * A pane nobody has touched since its last submit needs no grid read at all,
+ * which is the overwhelmingly common case and costs nothing.
+ */
+export function unsubmittedInput(id) {
+  const host = hosts.get(id);
+  if (!host) { clearPaneInput(id); return null; }
+  if (!lineTouched.has(id)) return null;
+  const empty = lineEmpty.get(id);
+  const now = shapeNow(host);
+  // No picture to compare against, or no grid to read: refuse. The alternative
+  // is sending blind into a line we have reason to think was typed into.
+  if (!empty || !now) return 'something that could not be read';
+  if (sameComposer(now, empty)) { lineTouched.delete(id); return null; }
+  // Show what is actually on the line rather than what we think was typed: if
+  // the composer still starts the way an empty one does, the rest is theirs.
+  const shown = now.before.startsWith(empty.before)
+    ? now.before.slice(empty.before.length) : now.before.trim();
+  return shown.trim() || 'an edit in progress';
+}
+
 /** Type a line into the session's terminal (works with no browser attached). */
-export async function sendInput(id, text, { confirmEcho = false } = {}) {
+export async function sendInput(id, text, opts = {}) {
   const host = hosts.get(id);
   if (!host || stopping.has(id)) throw new ApiError(409, 'input-not-ready', 'session is not running');
+  // Sends are serialised per pane: two at once would interleave their text on
+  // one line as surely as a keystroke would.
+  const previous = host.sendChain || Promise.resolve();
+  let done;
+  host.sendChain = new Promise((resolve) => { done = resolve; });
+  try { await previous; } catch {}
+  host.sending = true;
+  host.heldInput = [];
+  try {
+    return await typeAndSubmit(host, id, text, opts);
+  } finally {
+    const held = host.heldInput || [];
+    host.sending = false;
+    host.heldInput = [];
+    // Let the pane finish repainting before anything is replayed. Our Enter
+    // leaves the line empty, but the shell has not drawn its new prompt yet,
+    // and whatever is photographed as "empty" for the replayed keystrokes is
+    // the picture the operator's next send is judged against. Taken too early
+    // it is the command we just submitted, and clearing the replayed text then
+    // recovers nothing.
+    if (held.length) await settled(host);
+    // Replay in order, now that the line is ours no longer.
+    for (const chunk of held) {
+      notePaneInput(host, chunk);
+      try { host.pty.write(chunk); } catch {}
+    }
+    done();
+  }
+}
+
+async function typeAndSubmit(host, id, text, { confirmEcho = false } = {}) {
+  // Typing a prompt onto a line that already holds something submits both as
+  // one message. Clearing the line first would destroy what the operator
+  // typed, so the send stops here instead and says what is in the way.
+  const waiting = unsubmittedInput(id);
+  if (waiting) {
+    const shown = waiting.length > 60 ? `${waiting.slice(0, 60)}…` : waiting;
+    throw new ApiError(409, 'input-line-busy',
+      `this session's terminal has unsent text on its input line (${JSON.stringify(shown)}), and sending now would submit both as one message. Send or clear that line in the terminal, then try again.`);
+  }
   host.inputRequired.observeInput();
   // Multi-line prompts go in as a bracketed paste so the CLI's composer treats
   // the inner newlines as soft line breaks instead of submitting early.
@@ -2290,6 +2467,7 @@ export async function sendInput(id, text, { confirmEcho = false } = {}) {
   }
   await new Promise((r) => setTimeout(r, 300));
   host.pty.write('\r');
+  clearPaneInput(id);   // our own Enter emptied it
 }
 
 /** Insert text into a running terminal's composer without submitting it. */
@@ -2299,6 +2477,7 @@ export function pasteInput(id, text) {
   const value = String(text || '');
   if (!value) return;
   host.inputRequired.observeInput();
+  notePaneInput(host, value);
   const payload = value.includes('\n') ? `\x1b[200~${value}\x1b[201~` : value;
   host.pty.write(payload);
 }
