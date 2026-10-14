@@ -315,17 +315,43 @@ try {
   // Switching inside the 150ms save debounce keeps the gesture's position.
   await open({ id: 'debounce', payload: [shellScreen] });
   await settleReader();
+  // Visit the target position once and come back. Rows are measured the first
+  // time they are rendered, and that first measurement can take longer than
+  // the 150ms window this is about to switch inside — leaving the list with
+  // nothing drawn across the top of the viewport at the moment it is read.
+  // Warm here, where there is no clock running, rather than race it below.
+  const jump = () => p.evaluate(() => {
+    const el = document.querySelector('.cxv-body');
+    el.scrollTop = Math.max(0, el.scrollTop - 4000);
+  });
+  await jump();
+  await settleReader();
+  await p.getByRole('button', { name: /latest/i }).click();
+  await settleReader();
   // Movement first, event second: the reverse order of scrollBack.
   await p.evaluate(() => {
     const el = document.querySelector('.cxv-body');
     el.scrollTop = Math.max(0, el.scrollTop - 4000);
     el.dispatchEvent(new WheelEvent('wheel', { deltaY: -4000, bubbles: true }));
   });
-  await p.waitForTimeout(20);          // inside the 150ms save debounce
+  // Inside the 150ms save debounce, and only once a row actually covers the
+  // top of the viewport: read before that, "the message it was on" is a row
+  // from far below the fold, and the comparison after the switch is against
+  // something that was never on screen.
+  await p.waitForFunction(() => {
+    const el = document.querySelector('.cxv-body');
+    const top = el.getBoundingClientRect().top;
+    const row = [...document.querySelectorAll('[data-x]')].find((n) => n.getBoundingClientRect().bottom > top + 4);
+    return !!row && row.getBoundingClientRect().top - top <= 4;
+  }, null, { timeout: 120, polling: 10 }).catch(() => {});
   const beforeDebounce = await geometry();
   await toTerminal(); await toReader(); await settleReader();
   const afterDebounce = await geometry();
   check('a switch inside the save debounce keeps the message it was on', () => {
+    // Said plainly, so a list that never drew is not reported as the reader
+    // losing someone's place.
+    assert.ok(beforeDebounce.offset <= 4,
+      `nothing was drawn across the top of the viewport to compare against: ${JSON.stringify(beforeDebounce)}`);
     assert.equal(afterDebounce.key, beforeDebounce.key, JSON.stringify({ beforeDebounce, afterDebounce }));
     assert.equal(afterDebounce.label, false);
   });
