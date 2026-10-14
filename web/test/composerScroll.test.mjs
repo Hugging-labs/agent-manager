@@ -28,20 +28,23 @@ await build({
   stdin: { resolveDir: web, loader: 'tsx', contents: `
     import React from 'react'; import { createRoot } from 'react-dom/client';
     import Composer from './src/components/conversation/Composer';
-    const Host = ({ mobile }) => {
+    const Host = ({ mobile, variant }) => {
       const [draft, setDraft] = React.useState('');
       const ref = React.useRef(null);
       window.__setDraft = setDraft;
-      // A scrolling page behind it, the way the reader is laid out.
+      // A scrolling page behind it with range left on BOTH sides, so a chained
+      // scroll has somewhere to go in either direction.
       return <div id="page" style={{ height: '300px', overflowY: 'auto' }}>
-        <div style={{ height: '900px' }} />
+        <div style={{ height: '600px' }} />
         <Composer draft={draft} onChange={setDraft} inputRef={ref} isMobile={mobile}
-          onKeyDown={() => {}} sending={false} className="" />
+          onKeyDown={() => {}} sending={false}
+          className={variant.className} containerClassName={variant.containerClassName} />
+        <div style={{ height: '600px' }} />
       </div>;
     };
-    window.mount = (mobile) => {
+    window.mount = (mobile, variant) => {
       document.getElementById('root').innerHTML = '';
-      createRoot(document.getElementById('root')).render(<Host mobile={mobile} />);
+      createRoot(document.getElementById('root')).render(<Host mobile={mobile} variant={variant} />);
     };
   ` },
   outfile: bundle, bundle: true, format: 'iife', platform: 'browser', logLevel: 'error',
@@ -56,16 +59,31 @@ const check = async (what, fn) => {
 };
 const browser = await chromium.launch(chromiumLaunchOptions());
 try {
+  // The Reader composer is the one the operator reported, and it carries extra
+  // classes that conversation.css targets with higher specificity than the
+  // shared .ov-live rule. A fixture that renders only the bare Overview variant
+  // stays green while a `.cxv-live textarea { overflow-y: hidden }` breaks the
+  // Reader — which is exactly what review found.
+  const VARIANTS = [
+    { name: 'overview', className: '', containerClassName: '' },
+    { name: 'reader', className: 'cxv-live', containerClassName: 'cxv-composer' },
+  ];
   for (const [label, width, mobile] of [['desktop', 1000, false], ['phone', 390, true]]) {
-    console.log(`\n${label} ${width}px`);
+   for (const variant of VARIANTS) {
+    const label_ = `${label}/${variant.name}`;
+    console.log(`\n${label_} ${width}px`);
     const page = await browser.newPage({ viewport: { width, height: 700 }, deviceScaleFactor: 2, hasTouch: mobile, isMobile: mobile });
     const errors = []; page.on('pageerror', (e) => errors.push(e.message));
     await page.setContent(`<style>${fs.readFileSync(path.join(web, 'src/styles.css'), 'utf8')}
       ${fs.readFileSync(path.join(web, 'src/conversation.css'), 'utf8')}</style><div id="root"></div>`);
     await page.addScriptTag({ path: bundle });
-    await page.evaluate((m) => window.mount(m), mobile);
+    await page.evaluate(([m, v]) => window.mount(m, v), [mobile, variant]);
     await page.waitForSelector('.ov-live textarea');
     const ta = page.locator('.ov-live textarea');
+    const classes = await page.evaluate(() => document.querySelector('.ov-live').className);
+    await check(`${label_}: the fixture renders the ${variant.name} composer`, () =>
+      assert.ok(variant.className === '' || classes.includes(variant.className),
+        `.ov-live is "${classes}", expected to carry "${variant.className}"`));
 
     // ---- below the cap: grows, and has nothing to scroll ----
     await ta.click();
@@ -75,7 +93,7 @@ try {
       el.style.height = 'auto'; el.style.height = `${el.scrollHeight}px`;
     });
     const small = await ta.evaluate((el) => ({ h: el.clientHeight, s: el.scrollHeight, w: el.clientWidth }));
-    await check(`${label}: a short draft is not scrollable`, () =>
+    await check(`${label_}: a short draft is not scrollable`, () =>
       assert.ok(small.s <= small.h + 1, `scrollHeight ${small.s} > clientHeight ${small.h}`));
 
     // ---- grow past the cap one line at a time, watching for a flicker ----
@@ -93,7 +111,7 @@ try {
       return seen;
     }, CAP);
     const below = widths.filter((x) => !x.over);
-    await check(`${label}: no scrollbar appears while it is still growing`, () => {
+    await check(`${label_}: no scrollbar appears while it is still growing`, () => {
       const distinct = [...new Set(below.map((x) => x.w))];
       assert.equal(distinct.length, 1, `width changed below the cap: ${JSON.stringify(distinct)}`);
     });
@@ -106,21 +124,25 @@ try {
       el.style.height = 'auto'; el.style.height = `${el.scrollHeight}px`;
     });
     const big = await ta.evaluate((el) => ({ h: el.clientHeight, s: el.scrollHeight }));
-    await check(`${label}: a long draft is capped`, () => assert.ok(big.h <= CAP + 1, `height ${big.h}`));
-    await check(`${label}: and the rest can be reached`, () =>
+    await check(`${label_}: a long draft is capped`, () => assert.ok(big.h <= CAP + 1, `height ${big.h}`));
+    await check(`${label_}: and the rest can be reached`, () =>
       assert.ok(big.s > big.h + 10, `scrollHeight ${big.s} vs clientHeight ${big.h}`));
-    await page.evaluate(() => { const p = document.getElementById('page'); p.scrollTop = p.scrollHeight; });
+    await page.evaluate(() => {
+      const el = document.querySelector('.ov-live textarea');
+      el.scrollIntoView({ block: 'center' });
+    });
+    await page.waitForTimeout(120);
     await page.waitForTimeout(120);
     await ta.evaluate((el) => { el.scrollTop = 0; });
     const box = await ta.boundingBox();
     const onScreen = await page.evaluate((b) => b && b.y >= 0 && b.y + b.height <= window.innerHeight, box);
-    await check(`${label}: the draft is on screen for the wheel checks`, () =>
+    await check(`${label_}: the draft is on screen for the wheel checks`, () =>
       assert.ok(onScreen, `composer box ${JSON.stringify(box)} is not in the viewport`));
     await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
     await page.mouse.wheel(0, 120);
     await page.waitForTimeout(160);
     const byWheel = await ta.evaluate((el) => ({ top: el.scrollTop, overflow: getComputedStyle(el).overflowY }));
-    await check(`${label}: the operator can scroll it, not just a script`, () => {
+    await check(`${label_}: the operator can scroll it, not just a script`, () => {
       assert.notEqual(byWheel.overflow, 'hidden', 'overflow-y is hidden: the draft is unreachable');
       assert.ok(byWheel.top > 0, `a wheel over the draft moved it ${byWheel.top}px`);
     });
@@ -141,33 +163,52 @@ try {
     const caret = await ta.evaluate((el) => ({
       top: el.scrollTop, max: el.scrollHeight - el.clientHeight, len: el.value.length,
     }));
-    await check(`${label}: the keystroke actually landed`, () =>
+    await check(`${label_}: the keystroke actually landed`, () =>
       assert.equal(caret.len, lengthBefore + 1, 'nothing was typed, so the caret check proves nothing'));
-    await check(`${label}: typing at the end scrolls the caret back into view`, () =>
+    await check(`${label_}: typing at the end scrolls the caret back into view`, () =>
       assert.ok(caret.top > caret.max - 40, `scrollTop ${caret.top} of ${caret.max}`));
 
     // ---- iOS chaining: the page behind must not move ----
-    const before = await page.evaluate(() => {
-      const el = document.querySelector('.ov-live textarea');
-      el.scrollTop = el.scrollHeight;          // already at the draft's end
-      return document.getElementById('page').scrollTop;
+    // Both directions, each with somewhere for the page to go if the scroll
+    // chains: at the draft's end push further down, at its top push further up.
+    const chainRun = async (atEnd) => {
+      const start = await page.evaluate((end) => {
+        const el = document.querySelector('.ov-live textarea');
+        const pg = document.getElementById('page');
+        el.scrollTop = end ? el.scrollHeight : 0;
+        return { page: pg.scrollTop, room: end ? pg.scrollHeight - pg.clientHeight - pg.scrollTop : pg.scrollTop };
+      }, atEnd);
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+      await page.mouse.wheel(0, atEnd ? 300 : -300);
+      await page.waitForTimeout(200);
+      const after = await page.evaluate(() => document.getElementById('page').scrollTop);
+      return { ...start, after };
+    };
+    const down = await chainRun(true);
+    const up = await chainRun(false);
+    const chain = {
+      down, up,
+      contain: await ta.evaluate((el) => getComputedStyle(el).overscrollBehaviorY),
+      before: down.page, after: down.after,
+    };
+    // Without room to move, "it did not move" proves nothing.
+    await check(`${label_}: the page has room to be dragged in both directions`, () => {
+      assert.ok(down.room > 40, `only ${down.room}px of downward range`);
+      assert.ok(up.room > 40, `only ${up.room}px of upward range`);
     });
-    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-    await page.mouse.wheel(0, 300);            // keep pushing past the end
-    await page.waitForTimeout(200);
-    const chain = await page.evaluate((b) => ({
-      before: b, after: document.getElementById('page').scrollTop,
-      contain: getComputedStyle(document.querySelector('.ov-live textarea')).overscrollBehaviorY,
-    }), before);
-    await check(`${label}: scrolling past the draft's end does not drag the page`, () => {
-      assert.equal(chain.contain, 'contain', `overscroll-behavior-y is ${chain.contain}`);
-      assert.equal(chain.after, chain.before, `page moved ${chain.before} -> ${chain.after}`);
+    await check(`${label_}: scrolling past the draft's end does not drag the page`, () => {
+      assert.equal(chain.down.after, chain.down.page,
+        `page moved ${chain.down.page} -> ${chain.down.after} with ${chain.down.room}px of room`);
+    });
+    await check(`${label_}: and scrolling above its top does not either`, () => {
+      assert.equal(chain.up.after, chain.up.page,
+        `page moved ${chain.up.page} -> ${chain.up.after} with ${chain.up.room}px of room`);
     });
 
-    if (mobile) await page.locator('.ov-live').screenshot({ path: '/tmp/composer-phone.png' });
-    else await page.locator('.ov-live').screenshot({ path: '/tmp/composer-desktop.png' });
-    await check(`${label}: no page errors`, () => assert.deepEqual(errors, [], errors[0]));
+    await page.locator('.ov-live').screenshot({ path: `/tmp/composer-${label}-${variant.name}.png` });
+    await check(`${label_}: no page errors`, () => assert.deepEqual(errors, [], errors[0]));
     await page.close();
+   }
   }
 } finally {
   await browser.close();
