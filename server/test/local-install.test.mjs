@@ -18,6 +18,9 @@ const config = await import('../src/config.js');
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const scripts = path.join(root, 'scripts');
 
+assert.equal(config.resolveBindHost({ AM_BIND_HOST: '127.0.0.2' }), '127.0.0.2');
+assert.equal(config.resolveBindHost({ BIND_HOST: '::1', AM_BIND_HOST: '127.0.0.2' }), '::1');
+assert.equal(config.internalHostForUrl({ AM_BIND_HOST: '127.0.0.2' }), '127.0.0.2');
 assert.equal(config.resolveBindHost({}), '127.0.0.1', 'local installs bind only to loopback by default');
 assert.equal(config.resolveBindHost({ BIND_HOST: '0.0.0.0' }), '0.0.0.0', 'the bind address is configurable');
 const dockerfile = fs.readFileSync(path.join(root, 'Dockerfile'), 'utf8');

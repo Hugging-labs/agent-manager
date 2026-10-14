@@ -27,6 +27,7 @@ import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { WORKSPACES_DIR, DATA_DIR } from './config.js';
+import { sharedCodexRollout } from './codex-reader.js';
 
 const HF = 'https://huggingface.co';
 const hfToken = () =>
@@ -243,6 +244,8 @@ export async function findTranscript(session, allSessions = []) {
  * the cwd but are not the user's conversation.
  */
 export async function findRollout(session, allSessions = []) {
+  const shared = await sharedCodexRollout(session);
+  if (shared !== undefined) return shared;
   if (session.codexRollout) {
     try { if ((await fsp.stat(session.codexRollout)).isFile()) return session.codexRollout; } catch { /* rotated away */ }
   }

@@ -1,3 +1,4 @@
+import { traceActivity } from './trace-activity.js';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
@@ -52,7 +53,7 @@ function mergeInto(a, b) {
 // Built in the same parse pass: every real user prompt resets the segment, so
 // whatever accumulated by EOF is the activity since the last thing you said.
 function emptyDigest() {
-  return { lastPromptText: '', lastPromptRaw: '', lastPromptTs: 0, lastAssistantText: '', lastAssistantMd: '', lastAssistantTs: 0, sinceTurns: 0, sinceToolCalls: 0, sinceTools: {}, sinceFiles: [], sinceTokens: 0, running: false, turnsLog: [], outSeq: 0, outHash: '', outClipped: false, outFresh: false, outKey: null };
+  return { lastPromptText: '', lastPromptRaw: '', lastPromptTs: 0, lastAssistantText: '', lastAssistantMd: '', lastAssistantTs: 0, lastAnswerTs: 0, sinceTurns: 0, sinceToolCalls: 0, sinceTools: {}, sinceFiles: [], sinceTokens: 0, running: false, turnsLog: [], outSeq: 0, outHash: '', outClipped: false, outFresh: false, outKey: null };
 }
 
 // ---------- which reply is this? (the Overview's unread cursor) ----------
@@ -131,7 +132,10 @@ function digestAssistant(d, text, ts, key) {
   const fresh = key !== undefined && key !== null
     ? key !== d.outKey
     : (hash !== d.outHash || d.outFresh);
-  if (fresh) d.outSeq += 1;
+  if (fresh) {
+    d.outSeq += 1;
+  }
+  if (fresh || hash !== d.outHash) d.lastAnswerTs = Date.parse(ts) || d.lastAnswerTs;
   // A revision of the SAME message (a second text block, a streaming answer
   // that grew) keeps its sequence and changes its hash, which is a new version
   // to be seen without being a new reply.
@@ -176,9 +180,8 @@ function digestTool(d, name, file) {
 const unwrapPasted = (t) => String(t == null ? '' : t)
   .replace(/<pasted_content\s+id="([^"]*)">\n?([\s\S]*?)\n?<\/pasted_content\s+id="\1">/g, '$2');
 
-function parseClaude(txt) {
+function parseClaude(txt, dg = emptyDigest()) {
   const st = emptyStats();
-  const dg = emptyDigest();
   st.files = 1;
   const seenMsg = new Set();
   const seenTool = new Set();
@@ -252,9 +255,8 @@ function parseClaude(txt) {
 // ---------- Codex rollouts (CODEX_HOME/sessions/**/rollout-*-<uuid>.jsonl) ----------
 const codexText = (p) => (Array.isArray(p.content) ? p.content.map((c) => (c && c.text) || '').join(' ') : '');
 
-function parseCodex(txt) {
+function parseCodex(txt, dg = emptyDigest()) {
   const st = emptyStats();
-  const dg = emptyDigest();
   st.files = 1;
   let tok = null; // token_count events are cumulative per run — keep the last
   let tokAtPrompt = 0; // cumulative total when you last prompted (for sinceTokens)
@@ -283,7 +285,7 @@ function parseCodex(txt) {
             st.prompts++;
             const t = codexText(p);
             // Codex wraps environment/instructions as user items — skip those.
-            if (t.trim() && !t.trim().startsWith('<')) {
+            if (t.trim() && !t.trim().startsWith('<') && !t.trim().startsWith('# AGENTS.md instructions')) {
               digestPrompt(dg, t, j.timestamp);
               tokAtPrompt = tok ? (tok.total_tokens || 0) : 0;
             }
@@ -626,6 +628,8 @@ function readOpencode() {
         dg.sinceTokens = qSinceTok.get(s.id, t0).t || 0;
       }
       // Only an answer NEWER than the prompt counts — a stale one means "working".
+      const latestAnswer = qLastAssistant.get(s.id, 0);
+      dg.lastAnswerTs = Number(latestAnswer?.ts) || 0;
       const lastA = qLastAssistant.get(s.id, t0);
       if (lastA && lastA.t) {
         dg.lastAssistantText = clip(lastA.t);
@@ -783,6 +787,8 @@ function readHermes() {
         }
         dg.sinceTokens = qTok.get(s.id, t0).t || 0;
       }
+      const latestAnswer = qLastAssistant.get(s.id, 0);
+      dg.lastAnswerTs = Math.round((Number(latestAnswer?.timestamp) || 0) * 1000);
       const lastA = qLastAssistant.get(s.id, t0);
       if (lastA && lastA.content) {
         dg.lastAssistantText = clip(lastA.content);
@@ -841,6 +847,12 @@ async function statsFor(p, parser, quietMs = 0) {
   let parsed;
   const t0 = Date.now();
   try { parsed = parser(await readTraceFile(p, m.size)); } catch { return null; }
+  if (m.size > MAX_TRACE_BYTES) {
+    if (parser === parseCodex || parser === parseClaude) {
+      try { Object.assign(parsed.digest, await traceActivity(p, parser, emptyDigest)); }
+      catch { parsed.digest.activityError = 'activity-unavailable'; }
+    } else parsed.digest.activityError = 'activity-incomplete';
+  }
   fileCache.set(p, { key, parsed, cost: Date.now() - t0, at: t0, statAt: now, mtimeMs: m.mtimeMs });
   return parsed;
 }
@@ -1086,6 +1098,7 @@ function memoized() {
 // Exposed for tests: the unread cursor's rules live in the parser, and a
 // hand-built digest object would exercise none of them.
 export const __parseClaudeForTest = parseClaude;
+export const __parseCodexForTest = parseCodex;
 
 export async function buildTraces() {
   const { perSession, totals, sessions } = await memoized();
@@ -1105,8 +1118,9 @@ export async function buildTraces() {
 }
 
 /** Per-session "since your last prompt" digests, keyed by session id. */
-export async function traceDigests() {
-  const { digests } = await memoized();
+export async function traceDigests({fresh = false} = {}) {
+  const cached = memoized();
+  const { digests } = await (fresh && building ? building : cached);
   return digests;
 }
 
@@ -1617,6 +1631,7 @@ async function normalizeCodex(file, out, range, allowSubagent = false) {
 
     // One per user turn, and the only place the model is named.
     if (j.type === 'turn_context') {
+      if (p.turn_id) out.nativeTurnId = p.turn_id;
       if (p.model) out.model = p.model;
       out.cwd = out.cwd || p.cwd || null;
       continue;
@@ -1694,6 +1709,10 @@ async function normalizeCodex(file, out, range, allowSubagent = false) {
     }
 
     if (j.type === 'event_msg') {
+      if (p.type === 'task_started') {
+        out.nativeTurnId = p.turn_id || null; cur = null;
+        if (range?.reader) out.push({ role: 'system', ts, blocks: [], event: { type: 'task-start', text: '' } });
+      }
       if (p.type === 'token_count') {
         const info = p.info || {};
         const tot = info.total_token_usage;
@@ -1729,6 +1748,7 @@ async function normalizeCodex(file, out, range, allowSubagent = false) {
         const res = { type: 'tool_result', id: p.call_id, ...capText(p.results) };
         if (!stitch.file(res.id, res)) msg.blocks.push(res);
       } else if (p.type === 'task_complete') {
+        if (p.turn_id) out.nativeTurnId = p.turn_id;
         if (range?.reader) {
           out.push({ role: 'system', ts, blocks: [], event: { type: 'task-complete', text: String(p.last_agent_message || '') } });
           out.activity = 'waiting'; out.taskOpen = false; cur = null;
@@ -2056,6 +2076,7 @@ function newTrace(harness, range) {
     harness, harnessLabel: HARNESS_LABEL[harness] || harness, sessionId: null, title: '', model: null, cwd: null,
     firstTs: 0, lastTs: 0, usage: null, usageSum: null, source: null, sharedBy: null, note: null, messages: [],
     push(msg) {
+      if (this.nativeTurnId) msg.nativeTurnId = this.nativeTurnId;
       if (range?.reader && !msg.id) msg.id = `${harness}:${range.recordOffset ?? range.from}:${range.recordPart++ || 0}`;
       if (this.messages.length >= VIEW_MAX_MESSAGES) { this.truncated = true; return; }
       if (msg.ts) {

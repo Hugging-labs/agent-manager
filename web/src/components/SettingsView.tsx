@@ -1,3 +1,4 @@
+import CodexSharedSessions from './CodexSharedSessions';
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { isPassive, isRemote, type Cli } from '../types';
 import * as api from '../api';
@@ -975,6 +976,8 @@ export default function SettingsView({
                 </div>
               </>
             )}
+
+            <CodexSharedSessions />
 
             <PushRow />
 

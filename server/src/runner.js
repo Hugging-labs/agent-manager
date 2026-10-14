@@ -1,3 +1,6 @@
+import { assertCodexLaunchAllowed } from './codex-launch-policy.js';
+import { codexBindings, contextError } from './codex-context.js';
+import { fileURLToPath } from 'node:url';
 import { ApiError } from './api-errors.js';
 import os from 'node:os';
 import path from 'node:path';
@@ -6,7 +9,6 @@ import pty from 'node-pty';
 import { dismissCodexUpdatePrompt, trustCodexWorkspace } from './first-run.js';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
-import { fileURLToPath } from 'node:url';
 import { remoteState, setPaused } from './remote.js';
 import { fxSessionForPid } from './fx-process.js';
 import { cliById, cliVersion, isRemote, INTERNAL_HOST, PORT, STATE_DIR, WORKSPACES_DIR } from './config.js';
@@ -881,7 +883,7 @@ async function tryCaptureCodexId(sessionId, workdir, sinceMs, stillOurs = () => 
     // folderIsShared refuses to guess at. Writing on the strength of the
     // pre-walk answer lets a disposed chain overwrite a correct pin or claim a
     // sibling's rollout. Same re-check the claude re-pin does before its write.
-    if (!stillOurs() || folderIsShared(sessionId, workdir, 'codex')) return false;
+    if (!stillOurs() || codexBindings.forSession(sessionId) || folderIsShared(sessionId, workdir, 'codex')) return false;
     if (pinned) console.warn(`[codex] re-pinning ${sessionId}: ${pinned} -> ${m[1]} (conversation was replaced)`);
     update(sessionId, { codexSessionId: m[1], codexRollout: c.p });
     return true;
@@ -955,7 +957,7 @@ function scheduleCodexCapture(session, workdir) {
     if (!checkedStale) {
       checkedStale = true;
       const live = list().find((s) => s.id === session.id);
-      if (live && live.codexSessionId && await pinIsStale(live) && stillOurs()) {
+      if (live && live.codexSessionId && await pinIsStale(live) && stillOurs() && !codexBindings.forSession(session.id)) {
         update(session.id, { codexSessionId: undefined, codexRollout: undefined });
       }
     }
@@ -1444,6 +1446,7 @@ function exactPinFacts(session, host, workdir, pinField) {
 // or database row is newest: the reported id is the lookup key, and local state
 // is used only to validate that exact key before persisting it.
 async function applyBreadcrumb(session, host, workdir, crumb) {
+  if (session.cli === 'codex' && codexBindings.forSession(session.id)) return { repin: null, why: 'shared binding' };
   let facts;
   let patch;
   if (session.cli === 'claude') {
@@ -1799,8 +1802,20 @@ const SES_ID = /^ses_[A-Za-z0-9_-]+$/;
 const FX_ID = /^[A-Za-z0-9._-]{1,255}$/;
 
 export function commandFor(session) {
+  assertCodexLaunchAllowed(session);
   const cli = cliById(session.cli) || cliById('shell');
   if (cli.id === 'shell') return bashLaunch;
+  if (cli.id === 'codex') {
+    let binding;
+    try { binding = codexBindings.forSession(session.id); } catch (error) { throw contextError(error); }
+    if (!binding && session.codexSharedOnly) throw new ApiError(409, 'codex-import-incomplete', 'Finish adding this shared task before opening its terminal. No standalone session was started.');
+    if (binding) {
+      const helper = fileURLToPath(new URL('../../scripts/am-codex-context.mjs', import.meta.url));
+      // The child verifies endpoint/home/thread via AM before exec. No --last,
+      // rollout-existence fallback, prompt replay or standalone writer.
+      return `exec ${shq(process.execPath)} ${shq(helper)} --base-url ${shq(`http://${INTERNAL_HOST}:${PORT}`)} tui ${shq(session.id)}`;
+    }
+  }
   // Quickstart: a prompt queued at creation rides the FIRST launch command
   // (claude 'p', codex 'p', gemini -i 'p', opencode --prompt 'p') — the CLI
   // starts already working on it, no typing race against a booting TUI.
@@ -1930,6 +1945,7 @@ export function commandFor(session) {
  * exactly the same path.
  */
 export function ensureRunning(session, cols = 120, rows = 34) {
+  assertCodexLaunchAllowed(session);
   // Nothing to start: a remote agent starts itself, on its own machine. Both
   // callers guard this too; keep the refusal here so no future one can spawn
   // a PTY for a pane that can never use it.
@@ -1969,7 +1985,7 @@ export function ensureRunning(session, cols = 120, rows = 34) {
   // with no prompt. The cache behind it is refreshed in the background hours
   // after boot, so it is checked per launch rather than once, as a
   // compare-and-set. See first-run.js.
-  if (session.cli === 'codex') {
+  if (session.cli === 'codex' && !codexBindings.forSession(session.id)) {
     trustCodexWorkspace(realWork);
     dismissCodexUpdatePrompt(cliVersion('codex'));
   }
@@ -2143,8 +2159,8 @@ export function ensureRunning(session, cols = 120, rows = 34) {
   if (!session.everStarted) update(session.id, {
     everStarted: true, pendingPrompt: undefined, pendingImagePaths: undefined,
   });
-  scheduleBreadcrumbCapture(session, workdir);
-  if (session.cli === 'codex') scheduleCodexCapture(session, workdir);
+  if (session.cli !== 'codex' || !codexBindings.forSession(session.id)) scheduleBreadcrumbCapture(session, workdir);
+  if (session.cli === 'codex' && !codexBindings.forSession(session.id)) scheduleCodexCapture(session, workdir);
   if (session.cli === 'opencode') scheduleOpencodeCapture(session, workdir);
   if (session.cli === 'fx') scheduleFxCapture(session, workdir);
   if (session.cli === 'claude') scheduleClaudeCapture(session, workdir);
@@ -2346,6 +2362,8 @@ export function capturePane(id, lines = 80) {
  * does not survive is whatever the agent was in the middle of.
  */
 export async function restart(session, timeoutMs = 15_000) {
+  // Refuse an impossible shared-host relaunch before stopping its old writer.
+  assertCodexLaunchAllowed(session);
   const host = hosts.get(session.id);
   if (host) {
     stop(session.id);
@@ -2364,6 +2382,8 @@ export async function restart(session, timeoutMs = 15_000) {
 
 /** Stop a session entirely (kills the process; viewers get an exit close code). */
 export function stop(id) {
+  if (list().find((s) => s.id === id)?.cli === 'codex' && codexBindings.forSession(id)) throw new ApiError(409, 'codex-shared-stop-unsupported',
+    'This task runs on the shared server. Close the terminal view or use Codex to interrupt the current turn.');
   const host = hosts.get(id);
   if (!host) return;
   stopping.add(id);
