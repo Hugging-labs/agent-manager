@@ -2105,6 +2105,7 @@ export function ensureRunning(session, cols = 120, rows = 34) {
     consumeBreadcrumb(session, host, workdir, true)
       .catch((e) => console.warn(`[${session.cli}] ${session.id}: final breadcrumb read failed (${e && e.message})`));
     hosts.delete(session.id);
+    clearPaneInput(session.id);   // a dead pane holds no input line
     host.inputRequired.close();
     stopping.delete(session.id);
     if (host.gridTimer) { clearTimeout(host.gridTimer); host.gridTimer = null; }
@@ -2169,7 +2170,9 @@ export function attach(session, cols, rows) {
     // Input and terminal-query responses are accepted from one emulator only.
     write: (d, { terminalReply = false } = {}) => {
       if (host.controller !== sub) return;
-      if (!terminalReply) host.inputRequired.observeInput();
+      // A terminal query answered by the emulator is not someone typing, and
+      // must not look like text left on the input line.
+      if (!terminalReply) { host.inputRequired.observeInput(); notePaneInput(host.id, d); }
       try { host.pty.write(d); } catch {}
     },
     // Every viewer remembers what it can display, but only the current
@@ -2210,10 +2213,111 @@ export function attach(session, cols, rows) {
   };
 }
 
+/**
+ * What the operator has typed into a pane and NOT submitted.
+ *
+ * AM writes a prompt into a TUI by typing it and pressing Enter. It never
+ * clears the composer first — deliberately, because clearing would destroy
+ * whatever the operator had typed there. The cost was that the agent received
+ * the two glued together as one prompt (#165): `how are we going on the ` +
+ * the message sent from the reader, submitted as a single line.
+ *
+ * Detecting "the composer is not empty" by reading the screen means knowing
+ * where each TUI draws its composer, and they all differ. But AM does not need
+ * to find the composer: it knows WHAT was typed, because every keystroke
+ * reaches the PTY through this process. So the ledger below remembers it, and
+ * the grid is used only to confirm the text is still on screen.
+ *
+ * The ledger alone would be wrong on its own — a TUI consumes keys that never
+ * become composer text (menu navigation, `y` at a permission prompt), and the
+ * agent can clear its own composer without AM seeing. That is what the grid
+ * check settles: if what was typed is no longer visible, the TUI consumed it
+ * and the ledger is dropped.
+ */
+const paneInput = new Map();   // session id -> text believed to be on the input line
+const PANE_INPUT_MAX = 2000;   // a composer, not a document
+const PANE_INPUT_TAIL = 48;    // how much of it to look for on screen
+
+/** Follow keystrokes well enough to know what is sitting on the input line. */
+function notePaneInput(id, data) {
+  // Escape sequences are arrow keys, mouse reports and the like. They are not
+  // text and they are not a submit, so they are skipped rather than counted —
+  // the grid check is what catches a composer they moved out from under us.
+  const typed = String(data == null ? '' : data)
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/\x1bO?./g, '');
+  let pending = paneInput.get(id) || '';
+  for (const ch of typed) {
+    const code = ch.codePointAt(0);
+    if (ch === '\r' || ch === '\n') pending = '';              // submitted
+    else if (code === 0x7f || code === 0x08) pending = pending.slice(0, -1);
+    else if (code === 0x15 || code === 0x03) pending = '';       // ctrl-U / ctrl-C
+    else if (code >= 0x20) pending += ch;
+  }
+  if (pending.length > PANE_INPUT_MAX) pending = pending.slice(-PANE_INPUT_MAX);
+  if (pending) paneInput.set(id, pending); else paneInput.delete(id);
+}
+
+/** Forget the line: it was submitted, or the pane is gone. */
+function clearPaneInput(id) { paneInput.delete(id); }
+
+/**
+ * Text the operator left on this session's input line, or null.
+ *
+ * Confirmed against the grid we already hold, so a stale ledger does not block
+ * a send. Two places count as "still on the line": before the cursor on the
+ * cursor's own row, and at the END of any visible row — a composer row ends
+ * with what is being typed into it.
+ *
+ * Measured on all eight CLIs (shell, Claude, Codex, Gemini, opencode, Hermes,
+ * OpenClaw, fx), the cursor row alone is enough once the TUI has settled. The
+ * row-end test is for the states in between: while Hermes was still painting it
+ * reported a cursor nowhere near the composer it had already drawn, and Claude
+ * showed a placeholder on the cursor row before the keystrokes landed. A prompt
+ * can arrive in exactly those moments, so the cheaper second test stays.
+ */
+export function inputLineHolds(snapshot, pending) {
+  const text = String(pending || '').trim();
+  if (!text) return false;
+  const lines = (snapshot && snapshot.visibleLines) || [];
+  const tail = text.slice(-PANE_INPUT_TAIL);
+  const cursorLine = lines.find((line) => line.row === snapshot.cursorRow);
+  if (cursorLine && cursorLine.text.slice(0, snapshot.cursorCol).includes(tail)) return true;
+  // Three characters before trusting a row ending: a one- or two-key tail
+  // matches somewhere on a busy screen too easily, and refusing a send on that
+  // would be its own bug.
+  return tail.length >= 3 && lines.some((line) => line.text.trimEnd().endsWith(tail));
+}
+
+export function unsubmittedInput(id) {
+  const pending = (paneInput.get(id) || '').trim();
+  if (!pending) return null;
+  const host = hosts.get(id);
+  if (!host) { clearPaneInput(id); return null; }   // nothing running to merge into
+  let snap;
+  // Unreadable grid: say nothing rather than block the send. The ledger alone
+  // is not evidence enough to refuse on.
+  try { snap = host.vt.snapshot({ includeCells: false }); } catch { return null; }
+  if (!inputLineHolds(snap, pending)) { clearPaneInput(id); return null; }
+  return pending;
+}
+
+/** Test seams: the ledger is internal, and its rules are worth pinning. */
+export const __notePaneInputForTest = notePaneInput;
+export const __paneInputForTest = (id) => paneInput.get(id) || '';
+
 /** Type a line into the session's terminal (works with no browser attached). */
 export async function sendInput(id, text, { confirmEcho = false } = {}) {
   const host = hosts.get(id);
   if (!host || stopping.has(id)) throw new ApiError(409, 'input-not-ready', 'session is not running');
+  // Typing a prompt onto a line that already holds something submits both as
+  // one message. Clearing the line first would destroy what the operator
+  // typed, so the send stops here instead and says what is in the way.
+  const waiting = unsubmittedInput(id);
+  if (waiting) {
+    const shown = waiting.length > 60 ? `${waiting.slice(0, 60)}…` : waiting;
+    throw new ApiError(409, 'input-line-busy',
+      `this session's terminal has unsent text on its input line (${JSON.stringify(shown)}), and sending now would submit both as one message. Send or clear that line in the terminal, then try again.`);
+  }
   host.inputRequired.observeInput();
   // Multi-line prompts go in as a bracketed paste so the CLI's composer treats
   // the inner newlines as soft line breaks instead of submitting early.
@@ -2258,6 +2362,7 @@ export async function sendInput(id, text, { confirmEcho = false } = {}) {
   }
   await new Promise((r) => setTimeout(r, 300));
   host.pty.write('\r');
+  clearPaneInput(id);   // our own Enter emptied it
 }
 
 /** Insert text into a running terminal's composer without submitting it. */
@@ -2267,6 +2372,7 @@ export function pasteInput(id, text) {
   const value = String(text || '');
   if (!value) return;
   host.inputRequired.observeInput();
+  notePaneInput(id, value);
   const payload = value.includes('\n') ? `\x1b[200~${value}\x1b[201~` : value;
   host.pty.write(payload);
 }
