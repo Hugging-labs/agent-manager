@@ -659,7 +659,7 @@ mark.cx-hit.on { background: var(--accent); color: var(--panel); }
 /* The container is the reader's column, not each turn: a container is a
    stacking context, and one per turn would put the preview under the next. */
 .cxv-col { container-type: inline-size; }
-.cx-meta.dx-meta { align-items: flex-start; position: relative; }
+.cx-meta.dx-meta { align-items: flex-start; }
 .cx-meta.dx-meta > .cx-fold, .cx-meta.dx-meta > .cx-n, .cx-meta.dx-meta > .cx-time, .cx-meta.dx-meta > .cx-model { line-height: 22px; }
 .cx-meta.dx-meta > .spacer { display: none; }
 .dx-strip { flex: 1 1 0; min-width: 0; display: flex; flex-wrap: wrap; gap: 3px; align-items: center; }
@@ -676,7 +676,13 @@ mark.cx-hit.on { background: var(--accent); color: var(--panel); }
 .dx-logo.gone .cli-logo { opacity: 0.45; filter: grayscale(1); }
 
 /* the preview: this turn's latest prompt to the session and the turn it started */
-.dx-pop { position: absolute; left: 0; top: calc(100% + 4px); z-index: 30; width: min(440px, 100%); }
+/* An overlay on document.body, placed in viewport coordinates against its
+   icon (Dispatches.tsx, Floating): it must take no part in the reader's
+   scrolling layout, or opening it near the bottom moves the history. */
+.dx-pop { position: fixed; z-index: 900; overflow: hidden; border-radius: var(--r-lg); box-shadow: 0 8px 28px rgb(0 0 0 / 0.18); }
+.dx-pop > .dx-card { box-shadow: none; }
+.dx-pop.capped { overflow-y: auto; overscroll-behavior: contain; }
+.dx-pop > .dx-card { min-height: 0; }
 .dx-card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-lg); padding: 10px 12px;
   box-shadow: 0 8px 28px rgb(0 0 0 / 0.18); font-family: var(--font-sans); font-size: 13px; color: var(--text);
   white-space: normal; text-align: left; }
@@ -705,11 +711,9 @@ mark.cx-hit.on { background: var(--accent); color: var(--panel); }
 .dx-grab { width: 36px; height: 4px; border-radius: 2px; background: var(--border-strong); margin: 2px auto 4px; }
 
 /* the step: the call that launched or prompted, in place of its Bash line */
-.dx-row { position: relative; }
 .dx-row > .cs-head { cursor: default; align-items: center; }
 .dx-row > .cs-head:hover { background: none; }
 .dx-chips { display: flex; flex-wrap: wrap; gap: 3px 10px; min-width: 0; }
 .dx-chip { display: inline-flex; align-items: center; gap: 5px; background: none; border: none; padding: 1px 4px 1px 1px;
   border-radius: var(--r-sm); font: inherit; font-size: 0.96em; color: var(--text); cursor: pointer; }
 .dx-chip:hover, .dx-chip.on { background: color-mix(in srgb, var(--border) 55%, transparent); }
-.dx-row .dx-pop { left: 1.2em; }

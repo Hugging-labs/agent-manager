@@ -13,7 +13,8 @@ import { createPortal } from 'react-dom';
 import StateLogo from '../StateLogo';
 import { renderMarkdown } from '../../lib/markdown';
 import { fmtClock, fmtDur, fmtTok, oneLine } from './exchanges';
-import { openSession, ordered, type DispatchResult, type PeerIcon } from '../../lib/dispatches';
+import { openSession, type Dispatch, type DispatchResult } from '../../lib/dispatches';
+import { iconsOf, ordered, placeCard, viewport, type PeerIcon } from '../../lib/dispatchView';
 
 const ENVELOPE = /^(?:\s*\[message from [^\]]*\]\s*)+/;
 const plainPrompt = (t: string) => oneLine(t.replace(ENVELOPE, '').replace(/^#+\s*/gm, '').replace(/\*\*|`/g, ''), 280);
@@ -69,13 +70,15 @@ function Preview({ p }: { p: PeerIcon }) {
 /**
  * Hover and tap, shared by the strip and the step row. A mouse previews on
  * enter and opens on click; a touch previews on the first tap. The card stays
- * while the pointer is on it, so its button can be reached.
+ * while the pointer is on it, so its button can be reached. `anchor` is the
+ * icon the preview belongs to — the overlay is placed against it.
  */
+type Open = { key: string; sheet: boolean; anchor: HTMLElement };
 function usePreview() {
-  const [open, setOpen] = useState<{ key: string; sheet: boolean } | null>(null);
+  const [open, setOpen] = useState<Open | null>(null);
   const timer = useRef<number>();
   const lastPointer = useRef<string>('mouse');
-  const cancel = () => window.clearTimeout(timer.current);
+  const cancel = () => { window.clearTimeout(timer.current); timer.current = undefined; };
   const close = () => { cancel(); setOpen(null); };
   useEffect(() => {
     if (!open) return;
@@ -83,37 +86,127 @@ function usePreview() {
     window.addEventListener('keydown', key);
     return () => window.removeEventListener('keydown', key);
   }, [open]);
+  // A hover card closes when the pointer is over neither its icon nor the
+  // card, decided from where the pointer IS on every move — not from
+  // enter/leave pairs. Those were unreliable twice over: the card is in a
+  // portal, where React reckons "inside" by the React tree, and an icon
+  // re-rendered under a still pointer is never entered, so it is never left.
+  useEffect(() => {
+    if (!open || open.sheet) return;
+    const mine = (t: EventTarget | null) => {
+      const el = t instanceof Element ? t : null;
+      return !!el && (!!el.closest('.dx-pop') || el.closest<HTMLElement>('[data-dx-key]')?.dataset.dxKey === open.key);
+    };
+    const move = (e: PointerEvent) => {
+      if (e.pointerType !== 'mouse') return;
+      if (mine(e.target)) cancel();
+      else if (!timer.current) timer.current = window.setTimeout(() => { timer.current = undefined; setOpen(null); }, 220);
+    };
+    const out = (e: PointerEvent) => { if (!e.relatedTarget && e.pointerType === 'mouse') close(); };   // left the window
+    document.addEventListener('pointermove', move, { passive: true });
+    document.addEventListener('pointerout', out);
+    return () => { document.removeEventListener('pointermove', move); document.removeEventListener('pointerout', out); cancel(); };
+  }, [open]);
   useEffect(() => () => cancel(), []);
   const bind = (p: PeerIcon) => ({
+    'data-dx-key': p.key,
     onPointerDown: (e: React.PointerEvent) => { lastPointer.current = e.pointerType; },
-    onPointerEnter: (e: React.PointerEvent) => { if (e.pointerType === 'mouse') { cancel(); setOpen({ key: p.key, sheet: false }); } },
-    onPointerLeave: (e: React.PointerEvent) => { if (e.pointerType === 'mouse') { cancel(); timer.current = window.setTimeout(() => setOpen(null), 220); } },
+    onPointerEnter: (e: React.PointerEvent<HTMLElement>) => {
+      if (e.pointerType === 'mouse') { cancel(); setOpen({ key: p.key, sheet: false, anchor: e.currentTarget }); }
+    },
     // Keyboard focus previews; the focus a tap or a click gives a button must
     // not, or the tap that follows would read as the second one and navigate.
-    onFocus: (e: React.FocusEvent<HTMLElement>) => { if (e.currentTarget.matches(':focus-visible')) setOpen({ key: p.key, sheet: false }); },
-    onClick: () => {
-      if (lastPointer.current !== 'mouse' && !(open && open.key === p.key)) { setOpen({ key: p.key, sheet: true }); return; }
+    onFocus: (e: React.FocusEvent<HTMLElement>) => {
+      if (e.currentTarget.matches(':focus-visible')) setOpen({ key: p.key, sheet: false, anchor: e.currentTarget });
+    },
+    onClick: (e: React.MouseEvent<HTMLElement>) => {
+      if (lastPointer.current !== 'mouse' && !(open && open.key === p.key)) {
+        setOpen({ key: p.key, sheet: true, anchor: e.currentTarget });
+        return;
+      }
       if (p.exists && p.targetId) openSession(p.targetId);
     },
   });
-  const card = {
-    onPointerEnter: (e: React.PointerEvent) => { if (e.pointerType === 'mouse') cancel(); },
-    onPointerLeave: (e: React.PointerEvent) => { if (e.pointerType === 'mouse') { cancel(); timer.current = window.setTimeout(() => setOpen(null), 220); } },
-  };
-  return { open, close, bind, card };
+  return { open, close, bind };
 }
 
-function Floating({ p, sheet, card, close, style }: {
-  p: PeerIcon; sheet: boolean; close: () => void; style?: CSSProperties;
-  card: { onPointerEnter: (e: React.PointerEvent) => void; onPointerLeave: (e: React.PointerEvent) => void };
+const WIDTH = 440;
+
+/** The reader's own scroller, which an icon can scroll out of. */
+const scrollerOf = (el: HTMLElement) => el.closest('.cxv-body') as HTMLElement | null;
+
+/**
+ * The preview, OUTSIDE the conversation: a fixed layer on document.body.
+ *
+ * It used to be absolutely positioned inside the turn. Near the bottom of the
+ * history that made it part of the scroller's content — it grew scrollHeight,
+ * the reader's follow-to-bottom saw a new bottom and scrolled to it, and the
+ * whole history jumped. Opening a preview must never move the history, so the
+ * card takes no part in the scroller's layout at all; it is placed against the
+ * icon's rect in the viewport instead.
+ *
+ * While it is open it follows its icon: live turns arrive mid-hover, and a card
+ * that vanished every time the reader appended a line could not be read. When
+ * the icon leaves the reader's visible area the card closes — a preview pointing
+ * at nothing is worse than none.
+ */
+function Floating({ p, sheet, anchor, close }: {
+  p: PeerIcon; sheet: boolean; anchor: HTMLElement; close: () => void;
 }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<ReturnType<typeof placeCard> | null>(null);
+  useLayoutEffect(() => {
+    if (sheet) return;
+    let frame = 0;
+    const place = () => {
+      frame = 0;
+      const el = ref.current;
+      if (!el) return;
+      if (!anchor.isConnected) { close(); return; }
+      const r = anchor.getBoundingClientRect();
+      const box = scrollerOf(anchor)?.getBoundingClientRect();
+      if (box && (r.bottom < box.top || r.top > box.bottom)) { close(); return; }
+      // Measured at its natural height; a cap from the last placement must not
+      // decide whether it fits this time.
+      const prev = el.style.maxHeight;
+      el.style.maxHeight = 'none';
+      const natural = { width: Math.min(WIDTH, el.offsetWidth || WIDTH), height: el.scrollHeight };
+      el.style.maxHeight = prev;
+      setPos(placeCard(r, natural, viewport()));
+    };
+    place();
+    const soon = () => { if (!frame) frame = requestAnimationFrame(place); };
+    // capture: the reader scrolls inside its own element, not the window
+    window.addEventListener('scroll', soon, { capture: true, passive: true });
+    window.addEventListener('resize', soon);
+    window.visualViewport?.addEventListener('resize', soon);
+    window.visualViewport?.addEventListener('scroll', soon);
+    const ro = new ResizeObserver(soon);
+    if (ref.current) ro.observe(ref.current);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener('scroll', soon, { capture: true });
+      window.removeEventListener('resize', soon);
+      window.visualViewport?.removeEventListener('resize', soon);
+      window.visualViewport?.removeEventListener('scroll', soon);
+      ro.disconnect();
+    };
+  }, [anchor, sheet, p.key]);
   if (sheet) {
     return createPortal(
       <div className="dx-sheet-wrap" onClick={close}>
         <div className="dx-sheet" onClick={(e) => e.stopPropagation()}><div className="dx-grab" /><Preview p={p} /></div>
       </div>, document.body);
   }
-  return <div className="dx-pop" style={style} {...card}><Preview p={p} /></div>;
+  const style: CSSProperties = pos
+    ? { left: pos.left, top: pos.top, width: pos.width, ...(pos.maxHeight != null ? { maxHeight: pos.maxHeight } : {}) }
+    // first frame: laid out (so it can be measured) but not seen
+    : { left: 0, top: 0, width: WIDTH, visibility: 'hidden' };
+  return createPortal(
+    <div ref={ref} className={`dx-pop${pos ? ` ${pos.side}` : ''}${pos?.maxHeight != null ? ' capped' : ''}`} style={style}
+         onClick={(e) => e.stopPropagation()}>
+      <Preview p={p} />
+    </div>, document.body);
 }
 
 type Pos = HTMLElement & { _l?: number; _t?: number };
@@ -126,8 +219,9 @@ const remember = (el: HTMLElement) => el.querySelectorAll<Pos>('[data-k]').forEa
  * with a small lift on the one that moved — and holds still while a preview
  * is open, so nothing moves under the pointer.
  */
-export function DispatchStrip({ icons }: { icons: PeerIcon[] }) {
-  const { open, close, bind, card } = usePreview();
+export function DispatchStrip({ dispatches }: { dispatches: Dispatch[] }) {
+  const icons = useMemo(() => iconsOf(dispatches), [dispatches]);
+  const { open, close, bind } = usePreview();
   const held = useRef<string[]>([]);
   let order = ordered(icons).map((p) => p.key);
   if (open && held.current.length) {
@@ -184,7 +278,7 @@ export function DispatchStrip({ icons }: { icons: PeerIcon[] }) {
           </button>
         );
       })}
-      {shown ? <Floating p={shown} sheet={open!.sheet} card={card} close={close} /> : null}
+      {shown ? <Floating p={shown} sheet={open!.sheet} anchor={open!.anchor} close={close} /> : null}
     </span>
   );
 }
@@ -194,8 +288,9 @@ export function DispatchStrip({ icons }: { icons: PeerIcon[] }) {
  * the `Bash` line it was. One row per call, so a loop that launched three is
  * one row with three sessions on it.
  */
-export function DispatchRow({ icons, failed, mark }: { icons: PeerIcon[]; failed?: boolean; mark?: ReactNode }) {
-  const { open, close, bind, card } = usePreview();
+export function DispatchRow({ dispatches, failed, mark }: { dispatches: Dispatch[]; failed?: boolean; mark?: ReactNode }) {
+  const icons = useMemo(() => iconsOf(dispatches), [dispatches]);
+  const { open, close, bind } = usePreview();
   const kinds = new Set(icons.flatMap((p) => p.results.map((r) => r.d.kind)));
   const verb = kinds.size > 1 ? 'dispatched' : kinds.has('launch') ? 'launched' : 'prompted';
   const shown = open ? icons.find((p) => p.key === open.key) : undefined;
@@ -212,7 +307,7 @@ export function DispatchRow({ icons, failed, mark }: { icons: PeerIcon[]; failed
           ))}
         </span>
       </div>
-      {shown ? <Floating p={shown} sheet={open!.sheet} card={card} close={close} /> : null}
+      {shown ? <Floating p={shown} sheet={open!.sheet} anchor={open!.anchor} close={close} /> : null}
     </div>
   );
 }

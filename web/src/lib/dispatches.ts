@@ -63,68 +63,6 @@ export function resultOf(d: Dispatch, now = Date.now()): DispatchResult {
   return { d, outcome: 'failed', why: 'never started', x: null, answer: '' };
 }
 
-export type Side = 'running' | 'done' | 'failed';
-const sideOf = (o: Outcome): Side => (o === 'running' || o === 'queued' ? 'running' : o === 'failed' ? 'failed' : 'done');
-
-/** One icon: every dispatch this turn made to one session, rolled up. */
-export interface PeerIcon {
-  key: string;
-  name: string;
-  cli: string;
-  color: string | null;
-  exists: boolean;
-  targetId: string | null;
-  results: DispatchResult[];
-  /** the latest dispatch — what the preview shows */
-  latest: DispatchResult;
-  side: Side;
-  /** for the frame: running animates, queued has not started, the rest are finished */
-  frame: 'working' | 'waiting' | 'stopped';
-  launched: boolean;
-  firstAt: number;
-  endedAt: number;
-}
-
-const endOf = (r: DispatchResult) => (r.x ? r.x.endTs : r.d.at);
-
-export function iconsOf(ds: Dispatch[], now = Date.now()): PeerIcon[] {
-  const by = new Map<string, PeerIcon>();
-  for (const d of ds) {
-    const r = resultOf(d, now);
-    const key = d.target.id || d.target.name || d.id;
-    let p = by.get(key);
-    if (!p) {
-      p = {
-        key, name: d.target.name || key, cli: d.target.cli || 'shell', color: d.target.color, exists: d.target.exists,
-        targetId: d.target.id, results: [], latest: r, side: 'done', frame: 'waiting', launched: false, firstAt: d.at, endedAt: 0,
-      };
-      by.set(key, p);
-    }
-    p.results.push(r);
-    p.latest = r;
-    if (d.kind === 'launch') p.launched = true;
-  }
-  for (const p of by.values()) {
-    const sides = p.results.map((r) => sideOf(r.outcome));
-    p.side = sides.includes('running') ? 'running' : sides.includes('failed') ? 'failed' : 'done';
-    const live = p.results.find((r) => sideOf(r.outcome) === 'running');
-    p.frame = live ? (live.outcome === 'running' ? 'working' : 'stopped') : p.exists ? 'waiting' : 'stopped';
-    p.endedAt = Math.max(...p.results.map(endOf));
-  }
-  return [...by.values()];
-}
-
-/**
- * Running on the left in the order they were reached; finished to their right,
- * the most recently finished nearest the running ones; failed at the very right.
- */
-export function ordered(icons: PeerIcon[]): PeerIcon[] {
-  const run = icons.filter((p) => p.side === 'running').sort((a, b) => a.firstAt - b.firstAt);
-  const done = icons.filter((p) => p.side === 'done').sort((a, b) => b.endedAt - a.endedAt);
-  const bad = icons.filter((p) => p.side === 'failed').sort((a, b) => b.endedAt - a.endedAt);
-  return [...run, ...done, ...bad];
-}
-
 /** A call logged a moment after its tool turn was written still belongs to it. */
 const SKEW_MS = 2_000;
 

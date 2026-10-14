@@ -21,7 +21,7 @@ import { agentSpawnsOf, agentStatus, anyLive, canOpenAgent, capRows, railIsLast,
 import type { AgentSpawn, AgentStatus } from './exchanges';
 import ToolCall from './ToolCall';
 import { useLazyModule } from '../LazyPanel';
-import { dispatchBlocks, iconsOf, type Dispatch } from '../../lib/dispatches';
+import { dispatchBlocks, type Dispatch } from '../../lib/dispatches';
 
 // The dispatched-sessions strip and step row are fetched the first time a turn
 // has any: most conversations dispatch nothing, and the reader ships in the
@@ -497,8 +497,7 @@ export function ExchangeView({
   const isDispatch = placed.byBlock.size ? (b: TraceBlock) => placed.byBlock.has(b) : undefined;
   const stepsBefore = useMemo(() => stepsOf(at == null ? x.steps : x.steps.slice(0, at), isDispatch), [x.steps, at, placed]);
   const stepsAfter = useMemo(() => (at == null ? [] : stepsOf(x.steps.slice(at), isDispatch)), [x.steps, at, placed]);
-  const icons = useMemo(() => iconsOf(dispatches || []), [dispatches]);
-  const looseIcons = useMemo(() => iconsOf(placed.loose), [placed]);
+  const dispatched = dispatches?.length || 0;
   const dispatchUi = useLazyModule(dispatches?.length ? loadDispatchUi : noUi);
   const ui = dispatchUi.kind === 'ready' ? dispatchUi.module : null;
   const steps = useMemo(() => [...stepsBefore, ...stepsAfter], [stepsBefore, stepsAfter]);
@@ -580,7 +579,7 @@ export function ExchangeView({
   const rowByToolUse = new Map(agentRows.map((r) => [r.spawn.toolUseId, r]));
   const renderStep = (s: Step, key: string) => {
     if (s.kind === 'dispatch') {
-      return ui ? <ui.DispatchRow key={key} icons={iconsOf(placed.byBlock.get(s.call) || [])} failed={s.failed} />
+      return ui ? <ui.DispatchRow key={key} dispatches={placed.byBlock.get(s.call) || []} failed={s.failed} />
         : <StepRow key={key} s={{ kind: 'tools', name: 'sessions', count: 1, details: [], failed: s.failed, pending: false, blocks: s.blocks }} q={q} />;
     }
     if (s.kind !== 'agent') return <StepRow key={key} s={s} q={q} />;
@@ -605,8 +604,8 @@ export function ExchangeView({
           "weirdly low". In that state the facts ride on the working line itself,
           so there is one row instead of one and a half. The working line does not
           move: it is the last row either way, at the text column. */}
-      {(summary || spawns.length > 0 || icons.length > 0 || (n != null && !factsOnRunningRow)) && (
-      <div className={`cx-meta mono${icons.length ? ' dx-meta' : ''}`}>
+      {(summary || spawns.length > 0 || dispatched > 0 || (n != null && !factsOnRunningRow)) && (
+      <div className={`cx-meta mono${dispatched ? ' dx-meta' : ''}`}>
         {steps.length > 0 ? (
           <button className={`cx-fold${isOpen ? ' on' : ''}`} onClick={toggle} title={isOpen ? 'Hide the work' : 'Show the work'}>
             <span className="cs-tri">{isOpen ? '▾' : '▸'}</span>
@@ -616,7 +615,7 @@ export function ExchangeView({
         {/* The sessions this turn handed work to: running first, finished to
             their right, failed at the very right. Fills the line up to the
             turn number and wraps inside that room. */}
-        {icons.length > 0 && ui && <ui.DispatchStrip icons={icons} />}
+        {dispatched > 0 && ui && <ui.DispatchStrip dispatches={dispatches!} />}
         {/* Sub-agents sit in this line, where the operator asked for them, but as
             their own control: the fold to their left opens the turn's work, and
             this one opens the list of sub-agents. One button cannot open two
@@ -646,8 +645,8 @@ export function ExchangeView({
       )}
       {/* Dispatches no tool call in this window can be tied to (the call itself
           scrolled out of the loaded window, say) still belong to the turn. */}
-      {isOpen && looseIcons.length > 0 && ui && (
-        <div className="cx-steps"><ui.DispatchRow icons={looseIcons} mark={<span className="cs-tri off">–</span>} /></div>
+      {isOpen && placed.loose.length > 0 && ui && (
+        <div className="cx-steps"><ui.DispatchRow dispatches={placed.loose} mark={<span className="cs-tri off">–</span>} /></div>
       )}
       {/* Mid-task there is no answer — an agent's aside is not a reply — so the
           running line carries the latest thing that happened instead. */}

@@ -19,10 +19,11 @@ import { build } from 'esbuild';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dispatch-'));
-for (const [name, entry] of [['d.mjs', '../src/lib/dispatches.ts'], ['x.mjs', '../src/components/conversation/exchanges.ts']]) {
+for (const [name, entry] of [['d.mjs', '../src/lib/dispatches.ts'], ['v.mjs', '../src/lib/dispatchView.ts'], ['x.mjs', '../src/components/conversation/exchanges.ts']]) {
   await build({ entryPoints: [path.join(HERE, entry)], outfile: path.join(dir, name), format: 'esm', bundle: true, logLevel: 'error' });
 }
-const { resultOf, iconsOf, ordered, byExchange, dispatchBlocks } = await import(pathToFileURL(path.join(dir, 'd.mjs')).href);
+const { resultOf, byExchange, dispatchBlocks } = await import(pathToFileURL(path.join(dir, 'd.mjs')).href);
+const { iconsOf, ordered, placeCard } = await import(pathToFileURL(path.join(dir, 'v.mjs')).href);
 const { splitExchanges, stepsOf } = await import(pathToFileURL(path.join(dir, 'x.mjs')).href);
 
 let failed = 0;
@@ -147,6 +148,33 @@ console.log('\nwhich turn, and which tool call');
   check('a dispatch no call in the window can be tied to comes back loose', () => {
     const p = dispatchBlocks(xs[0].steps.slice(0, 1), [disp({ at: T + 5_000 })]);
     assert.equal(p.loose.length, 1);
+  });
+}
+
+console.log('\nwhere the preview card goes');
+{
+  const vp = { left: 0, top: 0, width: 1100, height: 800 };
+  const card = { width: 440, height: 300 };
+  check('below the icon when it fits', () => {
+    const p = placeCard({ left: 200, top: 100, bottom: 120 }, card, vp);
+    assert.deepEqual([p.side, p.top, p.maxHeight], ['below', 126, null]);
+  });
+  check('above when there is not room below', () => {
+    const p = placeCard({ left: 200, top: 700, bottom: 720 }, card, vp);
+    assert.deepEqual([p.side, p.top + card.height, p.maxHeight], ['above', 694, null]);
+  });
+  check('neither: the roomier side, height capped to it, never past the viewport', () => {
+    const short = { ...vp, height: 360 };
+    const p = placeCard({ left: 200, top: 220, bottom: 240 }, card, short);
+    assert.equal(p.side, 'above');
+    assert.equal(p.top, 8);
+    assert.ok(p.top + p.maxHeight <= 220 - 6, JSON.stringify(p));
+  });
+  check('kept on screen at the right edge and narrowed on a phone', () => {
+    const edge = placeCard({ left: 1050, top: 100, bottom: 120 }, card, vp);
+    assert.equal(edge.left + edge.width, 1100 - 8);
+    const phone = placeCard({ left: 300, top: 100, bottom: 120 }, card, { left: 0, top: 0, width: 390, height: 844 });
+    assert.deepEqual([phone.left, phone.width], [8, 374]);
   });
 }
 
