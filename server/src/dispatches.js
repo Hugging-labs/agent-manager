@@ -33,12 +33,13 @@ const MAYBE = /"method":"POST"/;
 const MAX_INDEX_READ = 256 * 1024 * 1024;
 
 /** Where the index has read to, and what it found. Reset if the log shrinks. */
-const index = { offset: 0, carry: '', rows: [], file: OPERATIONS_FILE };
+const index = { offset: 0, carry: '', rows: [], ids: new Set(), file: OPERATIONS_FILE, pending: null };
 
 export function _resetForTest(file = OPERATIONS_FILE) {
-  index.offset = 0; index.carry = ''; index.rows = []; index.file = file;
+  index.offset = 0; index.carry = ''; index.rows = []; index.ids = new Set(); index.file = file; index.pending = null;
   matches.clear();
 }
+export const _indexSizeForTest = () => index.rows.length;
 
 const textOf = (request) => {
   if (typeof request === 'string') return request;
@@ -64,6 +65,9 @@ export function dispatchOf(op) {
     id: op.id,
     at: Date.parse(op.at) || 0,
     originId: op.origin.id,
+    // The name the manager put in the "[message from <name>:]" envelope it
+    // delivered this prompt in — the sender's session name at the time.
+    originName: op.origin.name || null,
     kind,
     status: op.status,
     ok: !!op.ok,
@@ -76,10 +80,23 @@ export function dispatchOf(op) {
   };
 }
 
-async function refreshIndex() {
+/**
+ * Bring the index up to the end of the log. ONE read at a time: several open
+ * readers poll this route at once, and two refreshes that both started from
+ * the same offset each appended the same rows — duplicated for good, since
+ * nothing ever re-reads them. Concurrent callers share the read in flight, and
+ * rows are kept unique by operation id as well, so neither guard alone is load-
+ * bearing.
+ */
+function refreshIndex() {
+  if (!index.pending) index.pending = readNew().finally(() => { index.pending = null; });
+  return index.pending;
+}
+
+async function readNew() {
   let st;
   try { st = await fsp.stat(index.file); } catch { return; }
-  if (st.size < index.offset) { index.offset = 0; index.carry = ''; index.rows = []; }
+  if (st.size < index.offset) { index.offset = 0; index.carry = ''; index.rows = []; index.ids = new Set(); }
   if (st.size === index.offset) return;
   const from = index.offset === 0 ? Math.max(0, st.size - MAX_INDEX_READ) : index.offset;
   const fh = await fsp.open(index.file, 'r');
@@ -96,7 +113,7 @@ async function refreshIndex() {
       let op;
       try { op = JSON.parse(line); } catch { continue; }
       const d = dispatchOf(op);
-      if (d) index.rows.push(d);
+      if (d && !index.ids.has(d.id)) { index.ids.add(d.id); index.rows.push(d); }
     }
     index.offset = st.size;
   } finally {
@@ -106,9 +123,43 @@ async function refreshIndex() {
 
 // ---------- the peer's turn ----------
 
+// The envelope the manager delivers a peer's prompt in, and the shared-Codex
+// form, which stamps the sending session's id after it (codex-input.js):
+//   [message from alpha:] text
+//   [message from alpha:] [AM source {"amSessionId":"alpha-1",…}]\ntext
+const SENDER = /^\s*\[message from ([^\]]*?):\]\s*(?:\[AM source (\{[^\n]*?\})\]\s*)?/;
+// As the manager writes a name into the envelope (codex-input.js sanitises it
+// this way; index.js writes it as is, and the two agree for ordinary names).
+const cleanName = (s) => String(s || '').replace(/[\x00-\x1f\x7f\[\]]/g, ' ').trim();
+
+/**
+ * Who a prompt in a peer's transcript came from, as its envelope says — or
+ * null when it has none (the operator typed it, or a cron sent it).
+ */
+export function senderOf(text) {
+  const m = SENDER.exec(String(text || ''));
+  if (!m) return null;
+  let sessionId = null;
+  if (m[2]) { try { sessionId = JSON.parse(m[2]).amSessionId || null; } catch { sessionId = null; } }
+  return { name: m[1].trim(), sessionId };
+}
+
+/**
+ * Whether a prompt in the peer's transcript is THIS dispatch's, by who sent it.
+ * The text alone cannot say: two sessions can send a long-lived peer the same
+ * words a second apart, and stripping the envelope before comparing gave one
+ * the other's turn — another session's work shown under this one.
+ */
+const fromOrigin = (text, d) => {
+  const who = senderOf(text);
+  if (!who) return false;
+  if (who.sessionId) return who.sessionId === d.originId;
+  return !d.originName || cleanName(who.name) === cleanName(d.originName);
+};
+
 /** The prompt as compared: no envelope, whitespace collapsed, a prefix. */
 // Repeated: an orchestrator that writes its own envelope gets the manager's too.
-const ENVELOPE = /^(?:\s*\[message from [^\]]*\]\s*)+/;
+const ENVELOPE = /^(?:\s*\[(?:message from [^\]]*|AM source \{[^\n]*?\})\]\s*)+/;
 const norm = (s) => String(s || '').replace(ENVELOPE, '').replace(/\s+/g, ' ').trim();
 const KEY_CHARS = 80;
 const keyOf = (prompt) => norm(prompt).slice(0, KEY_CHARS);
@@ -218,7 +269,7 @@ async function scanFrom(peer, d, cursor, claimed) {
       // it landed; a user message with the same text, if one follows, is where
       // it started a turn of its own.
       const queued = t.role === 'system' && t.event && t.event.type === 'queue' && t.event.operation === 'enqueue';
-      const same = (text) => !!key && norm(text).startsWith(key);
+      const same = (text) => !!key && fromOrigin(text, d) && norm(text).startsWith(key);
       if (!found || found.queued) {
         if (!t.ts || t.ts < d.at - EARLY_SLACK || claimed.has(t.ts)) {
           if (found && opensExchange(t)) return { ...found, ended: true };

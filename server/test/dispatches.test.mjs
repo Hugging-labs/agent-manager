@@ -43,6 +43,7 @@ const sessions = [
   { id: 'canvas-1', name: 'canvas', cli: 'claude', path: 'w', sessionUuid: 'u-canvas' },
   { id: 'sheet-1', name: 'sheet', cli: 'claude', path: 'w', sessionUuid: 'u-sheet' },
   { id: 'design-1', name: 'design', cli: 'claude', path: 'w', sessionUuid: 'u-design' },
+  { id: 'long-1', name: 'long', cli: 'claude', path: 'w', sessionUuid: 'u-long' },
 ];
 fs.writeFileSync(path.join(DATA, 'sessions.json'), JSON.stringify(sessions));
 
@@ -65,6 +66,12 @@ fs.writeFileSync(path.join(DATA, 'operations.jsonl'), [
   op(60, { path: '/api/agents/sheet-1/prompt', text: 'refused one', status: 400, target: { id: 'sheet-1', name: 'sheet', cli: 'claude' } }),
   // not the caller's: the operator, and another agent
   op(70, { origin: 'canvas-1', path: '/api/agents/sheet-1/prompt', text: HEADS, target: { id: 'sheet-1', name: 'sheet', cli: 'claude' } }),
+  // two other sessions send a long-lived peer the SAME words a second apart
+  op(39, { origin: 'bravo-1', path: '/api/agents/long-1/prompt', text: 'Run the suite and report.', target: { id: 'long-1', name: 'long', cli: 'claude' } }),
+  op(40, { origin: 'alpha-1', path: '/api/agents/long-1/prompt', text: 'Run the suite and report.', target: { id: 'long-1', name: 'long', cli: 'claude' } }),
+  // …and again through the shared-Codex envelope, which stamps the sender's id
+  op(61, { origin: 'alpha-1', path: '/api/agents/long-1/prompt', text: 'Second identical ask.', target: { id: 'long-1', name: 'long', cli: 'claude' } }),
+  op(62, { origin: 'bravo-1', path: '/api/agents/long-1/prompt', text: 'Second identical ask.', target: { id: 'long-1', name: 'long', cli: 'claude' } }),
   // not a dispatch
   JSON.stringify({ version: 2, id: 'op-x', at: iso(80), origin: { id: 'boss-1' }, method: 'POST', path: '/api/groups', request: {}, status: 201, ok: true }),
 ].join('\n') + '\n');
@@ -116,9 +123,22 @@ fs.writeFileSync(path.join(PROJECT, 'u-design.jsonl'), [
   said(22, 'Login expired · Please run /login', { isApiErrorMessage: true, error: 'authentication_failed' }),
 ].join('\n') + '\n');
 
+// long: bravo's prompt lands first, alpha's identical one a second later
+const stamp = (id, name) => `[message from ${name}:] [AM source ${JSON.stringify({ amSessionId: id, threadId: 't' })}]\n`;
+fs.writeFileSync(path.join(PROJECT, 'u-long.jsonl'), [
+  user(39.5, '[message from bravo:] Run the suite and report.'),
+  said(40, 'BRAVO WORK: 12 passed.'),
+  user(41, '[message from alpha:] Run the suite and report.'),
+  said(42, 'ALPHA WORK: 14 passed.'),
+  user(62.2, stamp('bravo-1', 'bravo') + 'Second identical ask.'),
+  said(62.5, 'BRAVO AGAIN.'),
+  user(63, stamp('alpha-1', 'alpha') + 'Second identical ask.'),
+  said(63.5, 'ALPHA AGAIN.'),
+].join('\n') + '\n');
+
 const store = await import('../src/sessions.js');
 store.init();
-const { dispatchesOf, offsetBefore, dispatchOf } = await import('../src/dispatches.js');
+const { dispatchesOf, offsetBefore, dispatchOf, senderOf, _resetForTest, _indexSizeForTest } = await import('../src/dispatches.js');
 
 const list = await dispatchesOf('boss-1', { stateOf: () => 'waiting', colorOf: () => '#d97757' });
 const answerOf = (d) => d.exchange.turns.filter((t) => t.role === 'assistant').flatMap((t) => t.blocks).filter((b) => b.type === 'text').map((b) => b.text).join(' ');
@@ -177,6 +197,47 @@ await check('is open while the peer works, ended once it stops', async () => {
   const idle = await dispatchesOf('boss-1', { stateOf: () => 'waiting' });
   assert.equal(idle[2].exchange.ended, true);
 });
+
+console.log('\nmany senders, one peer: the envelope says whose turn it is');
+await check('the same words from two sessions: each gets its own turn, not the other\'s', async () => {
+  const alpha = await dispatchesOf('alpha-1', { stateOf: () => 'waiting' });
+  const bravo = await dispatchesOf('bravo-1', { stateOf: () => 'waiting' });
+  assert.match(answerOf(alpha[0]), /ALPHA WORK/);
+  assert.doesNotMatch(answerOf(alpha[0]), /BRAVO/);
+  assert.match(answerOf(bravo[0]), /BRAVO WORK/);
+  assert.match(alpha[0].exchange.turns[0].blocks[0].text, /^\[message from alpha:\]/);
+});
+await check('the shared-Codex envelope is matched on the stamped session id', async () => {
+  const alpha = await dispatchesOf('alpha-1', { stateOf: () => 'waiting' });
+  const bravo = await dispatchesOf('bravo-1', { stateOf: () => 'waiting' });
+  assert.match(answerOf(alpha[1]), /ALPHA AGAIN/);
+  assert.match(answerOf(bravo[1]), /BRAVO AGAIN/);
+});
+await check('a prompt with no envelope is nobody\'s dispatch', () => {
+  assert.equal(senderOf('Run the suite and report.'), null);
+  assert.deepEqual(senderOf(stamp('alpha-1', 'alpha') + 'x'), { name: 'alpha', sessionId: 'alpha-1' });
+});
+
+console.log('\nthe index, under concurrent readers');
+{
+  const LOG = path.join(TMP, 'concurrent.jsonl');
+  const row = (id, sec) => JSON.stringify({ version: 2, id, at: iso(sec), origin: { id: 'caller-1', name: 'caller' }, method: 'POST',
+    path: '/api/agents/nobody-1/prompt', request: 'hello', status: 200, ok: true, result: {} });
+  fs.writeFileSync(LOG, row('one-operation', 1) + '\n');
+  _resetForTest(LOG);
+  await check('two first reads at once index each operation once', async () => {
+    const [a, b] = await Promise.all([dispatchesOf('caller-1'), dispatchesOf('caller-1'), dispatchesOf('caller-1')]);
+    assert.deepEqual(a.map((d) => d.id), ['one-operation']);
+    assert.deepEqual(b.map((d) => d.id), ['one-operation']);
+    assert.equal(_indexSizeForTest(), 1);
+  });
+  await check('and reads racing an append do too', async () => {
+    fs.appendFileSync(LOG, row('two-operation', 2) + '\n');
+    const all = await Promise.all([dispatchesOf('caller-1'), dispatchesOf('caller-1'), dispatchesOf('caller-1')]);
+    for (const list of all) assert.deepEqual(list.map((d) => d.id), ['one-operation', 'two-operation']);
+    assert.equal(_indexSizeForTest(), 2);
+  });
+}
 
 console.log('\nbisection');
 await check('starts at a line boundary before the prompt, not at the top of the file', async () => {
