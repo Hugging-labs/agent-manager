@@ -3,6 +3,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { codexBindings, configuredEndpoint, contextForThread } from './codex-context.js';
+import { bindingIfKnown } from './codex-launch-policy.js';
 import { observationConfig, ObservationClient } from './codex-shared.js';
 import { ApiError } from './api-errors.js';
 
@@ -12,7 +13,14 @@ const unavailable = () => new ApiError(503, 'codex-reader-unavailable',
 export async function sharedCodexRollout(session, {
   bindings = codexBindings, config, connect = ObservationClient.connect,
 } = {}) {
-  const binding = bindings.forSession(session.id);
+  // Read-only, so it follows the same display policy as the roster and the
+  // session runtime: a bindings file we cannot read answers "not shared"
+  // instead of throwing. This resolver runs BEFORE the ordinary pinned/CWD
+  // rollout paths in share.findRollout, so a raw throw here made
+  // GET /api/trace/:id a sanitized 500 for every Codex session — visible in the
+  // sidebar and not openable. Falling through costs nothing: the legacy paths
+  // only ever find a local rollout, never a shared thread.
+  const binding = bindingIfKnown(session, bindings);
   if (!binding && !session.codexSharedOnly) return undefined; // legacy resolver
   let client, file;
   try {

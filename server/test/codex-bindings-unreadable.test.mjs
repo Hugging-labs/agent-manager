@@ -194,6 +194,16 @@ test('the app still loads, and still lists its Codex sessions', async () => {
     const row = sessions.body.find((s) => s.id === session.id);
     assert.ok(row, 'and in the roster');
     assert.notEqual(row.codexShared, true, 'an unreadable file is not evidence that it is shared');
+
+    // Clicking the row. share.findRollout asks the shared resolver BEFORE the
+    // ordinary pinned/CWD paths, so a throw there made the default request for
+    // every Codex session a sanitized 500: listed in the sidebar, impossible to
+    // open. Falling through, this fixture has no transcript at all, and "no
+    // trace" is the ordinary answer for that.
+    const trace = await get(`/api/trace/${session.id}`);
+    assert.notEqual(trace.status, 500, `the reader could not open it: ${JSON.stringify(trace.body)}`);
+    assert.equal(trace.status, 404, JSON.stringify(trace.body));
+    assert.equal(trace.body.code, 'no-trace');
   } finally {
     if (server.exitCode === null) { const exited = once(server, 'exit'); server.kill('SIGTERM'); await exited; }
     fs.rmSync(root, { recursive: true, force: true });
