@@ -3,14 +3,17 @@
 // Sending a prompt means typing it into the TUI and pressing Enter. Nothing
 // cleared the composer first — deliberately, since clearing destroys whatever
 // the operator typed — so the agent received the two glued together as one
-// message (#165): `how are we going on the ` + the prompt sent from the reader,
-// submitted as a single line. Harmless that time; the same path can glue a
-// half-typed command onto a prompt the agent then acts on.
+// message (#165).
 //
-// Detection does not parse composers. AM knows WHAT was typed, because every
-// keystroke reaches the PTY through this process, and the grid is used only to
-// confirm the text is still on screen. The screens below were captured from the
-// eight real CLIs, typing `half typed thought` and never submitting it.
+// Detection does not try to recognise a composer; the eight CLIs each draw one
+// differently. It recognises a CHANGE in one. The instant before the first
+// keystroke after a submit the line is empty by construction, so the grid then
+// is that pane's picture of "empty", and anything that does not look exactly
+// like it refuses the send. The screens below were captured from the eight real
+// CLIs, typing `half typed thought` and never submitting it.
+//
+// The shell cases drive a real interactive bash, so "did both run" is answered
+// by what actually executed rather than by what the screen appears to show.
 //
 // Run with:  node test/input-line-busy.test.mjs
 import assert from 'node:assert/strict';
@@ -21,11 +24,10 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
-import { inputLineHolds, __notePaneInputForTest as note, __paneInputForTest as pending } from '../src/runner.js';
+import { composerShape, sameComposer } from '../src/runner.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCREENS = JSON.parse(fs.readFileSync(path.join(HERE, 'fixtures/input-lines.json'), 'utf8'));
-const TYPED = 'half typed thought';
 
 let failed = 0;
 const check = (what, fn) => {
@@ -36,76 +38,37 @@ const check = (what, fn) => {
 
 console.log('\n# the real screens of all eight CLIs');
 for (const [harness, states] of Object.entries(SCREENS)) {
-  check(`${harness}: unsent text is seen on the input line`, () => {
-    assert.equal(inputLineHolds(states.typed, TYPED), true);
+  const empty = composerShape(states.empty);
+  const typed = composerShape(states.typed);
+  check(`${harness}: an untouched composer matches its own picture`, () => {
+    assert.equal(sameComposer(empty, composerShape(states.empty)), true);
   });
-  check(`${harness}: an empty input line is not`, () => {
-    assert.equal(inputLineHolds(states.empty, TYPED), false);
-  });
-  check(`${harness}: text that was never typed is not found`, () => {
-    assert.equal(inputLineHolds(states.typed, 'a thought nobody had'), false);
+  check(`${harness}: unsent text does not`, () => {
+    assert.equal(sameComposer(empty, typed), false,
+      `typed composer looks identical to the empty one: ${JSON.stringify(typed)}`);
   });
 }
-// All eight settle with the cursor on their composer row, so the row-end test
-// is for the states in between — a TUI mid-paint reporting a cursor that is not
-// where it has already drawn the composer. Observed on Hermes while booting;
-// pinned here as a constructed snapshot rather than a captured one, because a
-// transient screen is not something a fixture can hold still.
-check('text is still found when the cursor is reported elsewhere', () => {
-  const composer = { cursorRow: 0, cursorCol: 0, visibleLines: [
-    { row: 0, text: '' }, { row: 1, text: 'some output' }, { row: 2, text: `> ${TYPED}` },
-  ] };
-  assert.equal(inputLineHolds(composer, TYPED), true, 'the row-end fallback did not fire');
-  assert.equal(inputLineHolds(composer, 'never typed this'), false);
-});
-// …and that fallback must not fire on a tail too short to mean anything.
-check('a one-key tail is not hunted for across the screen', () => {
-  const busy = { cursorRow: 0, cursorCol: 0, visibleLines: [{ row: 0, text: '' }, { row: 1, text: 'ready' }] };
-  assert.equal(inputLineHolds(busy, 'y'), false);
+check('a composer is compared by its cursor and the text in front of it', () => {
+  const base = composerShape({ cursorRow: 3, cursorCol: 2, visibleLines: [{ row: 3, text: '> ' }] });
+  // Output scrolling the composer to another row is not a change to the line.
+  const moved = composerShape({ cursorRow: 9, cursorCol: 2, visibleLines: [{ row: 9, text: '> ' }] });
+  assert.equal(sameComposer(base, moved), true);
+  // A placeholder drawn AFTER the cursor is not text on the line either.
+  const hint = composerShape({ cursorRow: 3, cursorCol: 2, visibleLines: [{ row: 3, text: '> try typing' }] });
+  assert.equal(sameComposer(base, hint), true);
+  // Anything in front of the cursor is.
+  const typed = composerShape({ cursorRow: 3, cursorCol: 5, visibleLines: [{ row: 3, text: '> abc' }] });
+  assert.equal(sameComposer(base, typed), false);
 });
 
-console.log('\n# what counts as still being on the line');
-const ID = 'ledger-test';
-for (const [what, keys, want] of [
-  ['plain typing accumulates', ['hel', 'lo'], 'hello'],
-  ['Enter submits it', ['hello', '\r'], ''],
-  ['backspace takes it back', ['hello', '\x7f\x7f'], 'hel'],
-  ['ctrl-U clears the line', ['hello', '\x15'], ''],
-  ['ctrl-C clears it too', ['hello', '\x03'], ''],
-  ['arrow keys are not text', ['hi', '\x1b[A\x1b[B\x1b[C'], 'hi'],
-  ['a bracketed paste is text', ['\x1b[200~pasted\x1b[201~'], 'pasted'],
-]) {
-  note(ID, '\r');                       // start from an empty line
-  for (const k of keys) note(ID, k);
-  check(what, () => assert.equal(pending(ID), want));
-}
-note(ID, '\r');
-
-// ---- and the whole path, through the real server ----
-console.log('\n# a prompt sent while the operator has unsent text');
+// ---- and the whole path, through a real server driving a real bash ----
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'input-line-busy-'));
 const DATA_DIR = path.join(root, 'data'); fs.mkdirSync(DATA_DIR, { recursive: true });
 const PUBLIC_DIR = path.join(root, 'public'); fs.mkdirSync(PUBLIC_DIR);
 fs.writeFileSync(path.join(PUBLIC_DIR, 'index.html'), '<html>fixture</html>');
-const RECEIVED = path.join(root, 'received.jsonl'); fs.writeFileSync(RECEIVED, '');
-// A stand-in CLI that records every line it is given, exactly as submitted.
-const recorder = path.join(root, 'recorder.cjs');
-fs.writeFileSync(recorder, `
-const fs = require('node:fs');
-let buf = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', (d) => {
-  buf += d;
-  for (;;) {
-    const i = buf.search(/[\\r\\n]/);
-    if (i < 0) break;
-    const line = buf.slice(0, i); buf = buf.slice(i + 1);
-    if (line.length) fs.appendFileSync(process.env.RECEIVED, JSON.stringify(line) + '\\n');
-  }
-});
-process.stdin.resume();
-setInterval(() => {}, 1 << 30);
-`);
+const OUT = path.join(root, 'ran.txt'); fs.writeFileSync(OUT, '');
+const ran = () => fs.readFileSync(OUT, 'utf8').split('\n').filter(Boolean);
+const runs = (marker) => `echo ${marker} >> ${OUT}`;
 
 const freePort = () => new Promise((resolve) => {
   const srv = net.createServer();
@@ -117,7 +80,7 @@ const { SPACE_ID, AM_DISTRIBUTE_SKILLS, ...BASE } = process.env;
 const backend = spawn('node', ['src/index.js'], {
   cwd: path.join(HERE, '..'), stdio: ['ignore', 'pipe', 'pipe'],
   env: { ...BASE, PORT, DATA_DIR, PUBLIC_DIR, AM_BASHRC: '/nonexistent', SPACE_HOST: '',
-    AM_ALLOW_MISSING_ORIGIN: '1', RECEIVED, AM_TEST_REPAINT_CMD: `${process.execPath} ${recorder}` },
+    AM_ALLOW_MISSING_ORIGIN: '1', AM_TEST_REPAINT_CMD: 'bash --noprofile --norc -i' },
 });
 let logs = '';
 backend.stdout.on('data', (d) => { logs += d; });
@@ -125,83 +88,153 @@ backend.stderr.on('data', (d) => { logs += d; });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const until = async (fn, ms) => {
   const end = Date.now() + ms;
-  while (Date.now() < end) { try { if (await fn()) return true; } catch {} await sleep(250); }
+  while (Date.now() < end) { try { if (await fn()) return true; } catch {} await sleep(200); }
   return false;
 };
 const post = (p, body) => fetch(API + p, { method: 'POST',
   headers: { 'content-type': 'application/json', 'x-am-request': '1' },
   body: body === undefined ? undefined : JSON.stringify(body) });
-const got = () => fs.readFileSync(RECEIVED, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
 
 try {
   if (!await until(() => fetch(`${API}/api/health`).then((r) => r.ok), 60_000)) throw new Error(`server did not start:\n${logs.slice(-1200)}`);
   await post('/api/welcome/seen');
-  const made = await (await post('/api/sessions', { cli: 'test-repaint', name: 'busy-line', path: '.' })).json();
+  const open = async (name, cols = 100) => {
+    const made = await (await post('/api/sessions', { cli: 'test-repaint', name, path: '.' })).json();
+    const ws = new WebSocket(`${API.replace('http', 'ws')}/ws?session=${made.id}&cols=${cols}&rows=30`,
+      { headers: { 'x-am-request': '1' } });
+    await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+    await sleep(2500);
+    return { id: made.id, ws, type: (d) => ws.send(JSON.stringify({ t: 'i', d })) };
+  };
+  const pane = await open('busy-line');
   const peer = await (await post('/api/sessions', { cli: 'test-repaint', name: 'peer', path: '.' })).json();
-  const id = made.id;
-  const ws = new WebSocket(`${API.replace('http', 'ws')}/ws?session=${id}&cols=100&rows=30`,
-    { headers: { 'x-am-request': '1' } });
-  await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
-  await sleep(2500);
 
-  const CLEAN = 'a message with nothing in its way';
-  const before = got().length;
-  const ok = await post(`/api/sessions/${id}/input`, { text: CLEAN });
-  await sleep(1500);
-  check('an empty input line still takes a prompt', () => {
-    assert.equal(ok.status, 200, `POST /input answered ${ok.status}`);
-    assert.deepEqual(got().slice(before), [CLEAN]);
+  console.log('\n# an input line with nothing on it');
+  const clean = await post(`/api/sessions/${pane.id}/input`, { text: runs('CLEAN') });
+  await until(() => ran().includes('CLEAN'), 8000);
+  check('still takes a prompt', () => {
+    assert.equal(clean.status, 200, `POST /input answered ${clean.status}`);
+    assert.deepEqual(ran(), ['CLEAN']);
   });
 
-  const LEFTOVER = 'how are we going on the ';
-  const SENT = "the per line update looks fine to me. what's the status of the login guide?";
-  ws.send(JSON.stringify({ t: 'i', d: LEFTOVER }));
+  console.log('\n# text the operator typed and did not submit');
+  pane.type(runs('THEIRS'));
   await sleep(900);
-  const at = got().length;
-  const refused = await post(`/api/sessions/${id}/input`, { text: SENT });
+  let at = ran().length;
+  const refused = await post(`/api/sessions/${pane.id}/input`, { text: runs('MERGED') });
   const body = await refused.json().catch(() => ({}));
   await sleep(1500);
-  check('a prompt is refused rather than merged', () => {
+  check('is refused rather than merged', () => {
     assert.equal(refused.status, 409, `POST /input answered ${refused.status}`);
-    assert.deepEqual(got().slice(at), [], 'something reached the agent anyway');
+    assert.deepEqual(ran().slice(at), [], 'something executed anyway');
   });
   check('and the refusal says what is in the way', () => {
     const message = String(body.error || body.message || '');
     assert.ok(message.includes('unsent text'), `unhelpful refusal: ${JSON.stringify(message)}`);
-    assert.ok(message.includes('how are we going on the'), 'the refusal does not quote the text');
+    assert.ok(message.includes('THEIRS'), `the refusal does not quote the line: ${JSON.stringify(message)}`);
   });
-  // The point of refusing rather than clearing: their typing is untouched.
-  check('the operator\'s own text is still on the line', () => {
-    assert.deepEqual(got().slice(at), [], 'the half-typed line was submitted or destroyed');
-  });
-
-  // A peer agent hits the same guard, with nobody watching the pane.
-  const peerTry = await fetch(`${API}/api/agents/${id}/prompt?from=${peer.id}`, {
+  const peerTry = await fetch(`${API}/api/agents/${pane.id}/prompt?from=${peer.id}`, {
     method: 'POST', headers: { 'content-type': 'text/plain', 'x-am-request': '1' },
-    body: 'peer asking for a status update' });
+    body: runs('PEER') });
   await sleep(1200);
-  check('an agent prompting a peer is refused the same way', () => {
+  check('a peer agent is refused the same way', () => {
     assert.equal(peerTry.status, 409, `peer prompt answered ${peerTry.status}`);
-    assert.deepEqual(got().slice(at), [], 'a peer prompt was merged into the operator\'s line');
+    assert.deepEqual(ran().slice(at), [], 'a peer prompt merged into the operator\'s line');
+  });
+  pane.type('\r');
+  await until(() => ran().includes('THEIRS'), 8000);
+  const afterTheirs = ran().length;
+  const again = await post(`/api/sessions/${pane.id}/input`, { text: runs('AFTER') });
+  await until(() => ran().includes('AFTER'), 8000);
+  check('once they submit it themselves, both ran separately', () => {
+    assert.equal(again.status, 200, `POST /input answered ${again.status}`);
+    assert.deepEqual(ran().slice(at, afterTheirs), ['THEIRS']);
+    assert.deepEqual(ran().slice(afterTheirs), ['AFTER']);
   });
 
-  // Recovery: the operator submits their own line, and sending works again.
-  ws.send(JSON.stringify({ t: 'i', d: '\r' }));
+  console.log('\n# a keystroke arriving DURING the send');
+  at = ran().length;
+  const racing = post(`/api/sessions/${pane.id}/input`, { text: runs('APISIDE') });
+  await sleep(100);                       // inside the gap before our Enter
+  pane.type(runs('RACER'));
+  const raced = await racing;
+  await until(() => ran().includes('APISIDE'), 8000);
   await sleep(1200);
-  const afterOwn = got().length;
-  const again = await post(`/api/sessions/${id}/input`, { text: SENT });
+  check('does not get submitted by our Enter', () => {
+    assert.equal(raced.status, 200, `POST /input answered ${raced.status}`);
+    assert.deepEqual(ran().slice(at), ['APISIDE'], 'the operator\'s keystrokes were swept into our prompt');
+  });
+  // Held, not dropped: it is still on the line, and submitting it runs it.
+  pane.type('\r');
+  await until(() => ran().includes('RACER'), 8000);
+  check('and is not lost — it lands on a line of its own', () => {
+    assert.deepEqual(ran().slice(at), ['APISIDE', 'RACER']);
+  });
+
+  console.log('\n# a line the operator did not type a character of');
+  at = ran().length;
+  pane.type('\x1b[A');                    // Up: the last command is back on the line
+  await sleep(900);
+  const recalled = await post(`/api/sessions/${pane.id}/input`, { text: runs('AFTERRECALL') });
   await sleep(1500);
-  check('once they submit it themselves, the prompt goes through', () => {
-    assert.equal(again.status, 200, `POST /input answered ${again.status}`);
-    assert.deepEqual(got().slice(afterOwn), [SENT]);
+  check('recalled history is still something on the line', () => {
+    assert.equal(recalled.status, 409, `POST /input answered ${recalled.status}`);
+    assert.deepEqual(ran().slice(at), [], 'a recalled command was merged with the prompt');
   });
-  const theirs = got().slice(at, afterOwn);
-  console.log(`  what the agent got from their own line: ${JSON.stringify(theirs)}`);
-  check('and their own line arrived separately, unmerged', () => {
-    assert.equal(theirs.length, 1, 'their line did not arrive on its own');
-    assert.equal(theirs[0].trim(), LEFTOVER.trim());
+  pane.type('\x15');                      // ctrl-U: the line is genuinely empty now
+  await sleep(900);
+  const afterClear = await post(`/api/sessions/${pane.id}/input`, { text: runs('AFTERCLEAR') });
+  await until(() => ran().includes('AFTERCLEAR'), 8000);
+  check('and clearing it lets the next prompt through', () => {
+    assert.equal(afterClear.status, 200, `POST /input answered ${afterClear.status} after the line was cleared`);
+    assert.deepEqual(ran().slice(at), ['AFTERCLEAR']);
   });
-  ws.close();
+
+  console.log('\n# a narrow terminal, where the line wraps');
+  const narrow = await open('narrow', 30);
+  const long = `echo ${'W'.repeat(60)} >> ${OUT}`;
+  assert.ok(long.length > 60, 'the probe line must be longer than one 30-column row');
+  narrow.type(long);
+  await sleep(900);
+  const atNarrow = ran().length;
+  const wrapped = await post(`/api/sessions/${narrow.id}/input`, { text: runs('WRAPPED') });
+  await sleep(1500);
+  check('a wrapped line is still seen', () => {
+    assert.equal(wrapped.status, 409, `POST /input answered ${wrapped.status} at 30 columns`);
+    assert.deepEqual(ran().slice(atNarrow), [], 'a wrapped line was merged with the prompt');
+  });
+  // Wrapping onto the same column the empty prompt sits at: the cursor is in an
+  // identical position, and only the text in front of it says otherwise.
+  narrow.type('\x15');
+  await sleep(600);
+  const atExact = ran().length;
+  narrow.type('z'.repeat(30));
+  await sleep(900);
+  const sameColumn = await post(`/api/sessions/${narrow.id}/input`, { text: runs('SAMECOL') });
+  await sleep(1500);
+  check('a wrap landing on the same column is still seen', () => {
+    assert.equal(sameColumn.status, 409, `POST /input answered ${sameColumn.status}`);
+    assert.deepEqual(ran().slice(atExact), [], 'a line wrapped to the same column was merged');
+  });
+  narrow.ws.close();
+
+  console.log('\n# a line that only LOOKS busy');
+  // Scrollback ending in the same words is not the composer: this used to
+  // refuse a send against an empty prompt, then tell the operator to clear it.
+  at = ran().length;
+  await post(`/api/sessions/${pane.id}/input`, { text: `echo busyword | tee -a ${OUT}` });
+  await until(() => ran().includes('busyword'), 8000);
+  pane.type('busyword');
+  await sleep(600);
+  pane.type('\x01\x0b');                  // ctrl-A ctrl-K: the operator clears it
+  await sleep(900);
+  const notBusy = await post(`/api/sessions/${pane.id}/input`, { text: runs('NOTBUSY') });
+  await until(() => ran().includes('NOTBUSY'), 8000);
+  check('sends, because the composer is empty', () => {
+    assert.equal(notBusy.status, 200, `POST /input answered ${notBusy.status} against an empty line`);
+    assert.ok(ran().includes('NOTBUSY'), 'the prompt never ran');
+  });
+  pane.ws.close();
 } finally {
   backend.kill('SIGTERM');
   await sleep(1200);

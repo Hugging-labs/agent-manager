@@ -2171,8 +2171,16 @@ export function attach(session, cols, rows) {
     write: (d, { terminalReply = false } = {}) => {
       if (host.controller !== sub) return;
       // A terminal query answered by the emulator is not someone typing, and
-      // must not look like text left on the input line.
-      if (!terminalReply) { host.inputRequired.observeInput(); notePaneInput(host.id, d); }
+      // must not look like text left on the input line. It also must not be
+      // held back: a TUI waiting on a device report would stall.
+      if (terminalReply) { try { host.pty.write(d); } catch {} return; }
+      host.inputRequired.observeInput();
+      // Checking the line, typing the prompt and pressing Enter is one
+      // transaction. A keystroke landing inside it would be submitted by our
+      // own Enter — the same merge, just later. Held, not dropped: it is
+      // replayed after the Enter, where it starts a line of its own.
+      if (host.sending) { host.heldInput.push(d); return; }
+      notePaneInput(host, d);
       try { host.pty.write(d); } catch {}
     },
     // Every viewer remembers what it can display, but only the current
@@ -2214,101 +2222,128 @@ export function attach(session, cols, rows) {
 }
 
 /**
- * What the operator has typed into a pane and NOT submitted.
+ * Is this pane's input line empty?
  *
- * AM writes a prompt into a TUI by typing it and pressing Enter. It never
- * clears the composer first — deliberately, because clearing would destroy
- * whatever the operator had typed there. The cost was that the agent received
- * the two glued together as one prompt (#165): `how are we going on the ` +
- * the message sent from the reader, submitted as a single line.
+ * AM sends a prompt by typing it into the TUI and pressing Enter, and it never
+ * clears the composer first — clearing would destroy whatever the operator had
+ * typed there. So the prompt is glued onto whatever is already on the line and
+ * both are submitted as one message (#165).
  *
- * Detecting "the composer is not empty" by reading the screen means knowing
- * where each TUI draws its composer, and they all differ. But AM does not need
- * to find the composer: it knows WHAT was typed, because every keystroke
- * reaches the PTY through this process. So the ledger below remembers it, and
- * the grid is used only to confirm the text is still on screen.
+ * Knowing the line is empty means reading the composer, and the eight CLIs each
+ * draw one differently: `❯ `, `› `, `┃ `, a shell's arbitrary PS1, a question
+ * from a first-run prompt. None of that can be matched by pattern. But AM does
+ * not have to RECOGNISE a composer, only notice a change in one — and it knows
+ * exactly when to look. The instant before the first keystroke after a submit,
+ * the line is empty by construction, so whatever the grid shows then is this
+ * pane's own picture of "empty".
  *
- * The ledger alone would be wrong on its own — a TUI consumes keys that never
- * become composer text (menu navigation, `y` at a permission prompt), and the
- * agent can clear its own composer without AM seeing. That is what the grid
- * check settles: if what was typed is no longer visible, the TUI consumed it
- * and the ledger is dropped.
+ * So: keep that picture and compare against it. Identical means nothing is on
+ * the line. Anything else means something is — including every case a ledger of
+ * typed characters cannot model, because they all move the cursor or change the
+ * text in front of it: a command recalled with Up, an edit in the middle of a
+ * line, a line long enough to wrap onto another row.
+ *
+ * The comparison is deliberately one-sided. Looking exactly like empty is the
+ * only thing that permits a send; everything else refuses. For a guard whose
+ * job is to stop two messages becoming one, "I could not tell" has to mean no.
  */
-const paneInput = new Map();   // session id -> text believed to be on the input line
-const PANE_INPUT_MAX = 2000;   // a composer, not a document
-const PANE_INPUT_TAIL = 48;    // how much of it to look for on screen
+const lineTouched = new Set();      // panes typed into since their last submit
+const lineEmpty = new Map();        // id -> what an empty line looks like here
 
-/** Follow keystrokes well enough to know what is sitting on the input line. */
-function notePaneInput(id, data) {
-  // Escape sequences are arrow keys, mouse reports and the like. They are not
-  // text and they are not a submit, so they are skipped rather than counted —
-  // the grid check is what catches a composer they moved out from under us.
-  const typed = String(data == null ? '' : data)
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/\x1bO?./g, '');
-  let pending = paneInput.get(id) || '';
-  for (const ch of typed) {
-    const code = ch.codePointAt(0);
-    if (ch === '\r' || ch === '\n') pending = '';              // submitted
-    else if (code === 0x7f || code === 0x08) pending = pending.slice(0, -1);
-    else if (code === 0x15 || code === 0x03) pending = '';       // ctrl-U / ctrl-C
-    else if (code >= 0x20) pending += ch;
-  }
-  if (pending.length > PANE_INPUT_MAX) pending = pending.slice(-PANE_INPUT_MAX);
-  if (pending) paneInput.set(id, pending); else paneInput.delete(id);
+/** The cursor, and the text in front of it. */
+export function composerShape(snapshot) {
+  if (!snapshot) return null;
+  const line = (snapshot.visibleLines || []).find((l) => l.row === snapshot.cursorRow);
+  return {
+    col: snapshot.cursorCol,
+    alt: !!snapshot.isAltScreen,
+    // Not the row number: arriving output scrolls the composer up the screen
+    // without anybody touching what is on it.
+    before: line ? line.text.slice(0, snapshot.cursorCol) : '',
+  };
 }
 
-/** Forget the line: it was submitted, or the pane is gone. */
-function clearPaneInput(id) { paneInput.delete(id); }
+export const sameComposer = (a, b) => !!a && !!b
+  && a.col === b.col && a.alt === b.alt && a.before === b.before;
+
+const shapeNow = (host) => {
+  try { return composerShape(host.vt.snapshot({ includeCells: false })); } catch { return null; }
+};
 
 /**
- * Text the operator left on this session's input line, or null.
- *
- * Confirmed against the grid we already hold, so a stale ledger does not block
- * a send. Two places count as "still on the line": before the cursor on the
- * cursor's own row, and at the END of any visible row — a composer row ends
- * with what is being typed into it.
- *
- * Measured on all eight CLIs (shell, Claude, Codex, Gemini, opencode, Hermes,
- * OpenClaw, fx), the cursor row alone is enough once the TUI has settled. The
- * row-end test is for the states in between: while Hermes was still painting it
- * reported a cursor nowhere near the composer it had already drawn, and Claude
- * showed a placeholder on the cursor row before the keystrokes landed. A prompt
- * can arrive in exactly those moments, so the cheaper second test stays.
+ * Follow the pane's input well enough to know when the line was last empty.
+ * Called with the keystroke still UNWRITTEN, which is what makes the first one
+ * after a submit a reliable photograph of an empty composer.
  */
-export function inputLineHolds(snapshot, pending) {
-  const text = String(pending || '').trim();
-  if (!text) return false;
-  const lines = (snapshot && snapshot.visibleLines) || [];
-  const tail = text.slice(-PANE_INPUT_TAIL);
-  const cursorLine = lines.find((line) => line.row === snapshot.cursorRow);
-  if (cursorLine && cursorLine.text.slice(0, snapshot.cursorCol).includes(tail)) return true;
-  // Three characters before trusting a row ending: a one- or two-key tail
-  // matches somewhere on a busy screen too easily, and refusing a send on that
-  // would be its own bug.
-  return tail.length >= 3 && lines.some((line) => line.text.trimEnd().endsWith(tail));
+function notePaneInput(host, data) {
+  const id = host.id;
+  const text = String(data == null ? '' : data);
+  if (!text) return;
+  if (!lineTouched.has(id)) {
+    const shape = shapeNow(host);
+    if (shape) lineEmpty.set(id, shape); else lineEmpty.delete(id);
+    lineTouched.add(id);
+  }
+  // A submit empties the line again, whoever pressed it — but only if nothing
+  // was typed after it in the same chunk.
+  const lastBreak = Math.max(text.lastIndexOf('\r'), text.lastIndexOf('\n'));
+  if (lastBreak === text.length - 1) lineTouched.delete(id);
 }
 
+/** Forget the line: it was submitted by us, or the pane is gone. */
+function clearPaneInput(id) { lineTouched.delete(id); lineEmpty.delete(id); }
+
+/**
+ * What is in the way of sending, or null when the line is clear.
+ *
+ * A pane nobody has touched since its last submit needs no grid read at all,
+ * which is the overwhelmingly common case and costs nothing.
+ */
 export function unsubmittedInput(id) {
-  const pending = (paneInput.get(id) || '').trim();
-  if (!pending) return null;
   const host = hosts.get(id);
-  if (!host) { clearPaneInput(id); return null; }   // nothing running to merge into
-  let snap;
-  // Unreadable grid: say nothing rather than block the send. The ledger alone
-  // is not evidence enough to refuse on.
-  try { snap = host.vt.snapshot({ includeCells: false }); } catch { return null; }
-  if (!inputLineHolds(snap, pending)) { clearPaneInput(id); return null; }
-  return pending;
+  if (!host) { clearPaneInput(id); return null; }
+  if (!lineTouched.has(id)) return null;
+  const empty = lineEmpty.get(id);
+  const now = shapeNow(host);
+  // No picture to compare against, or no grid to read: refuse. The alternative
+  // is sending blind into a line we have reason to think was typed into.
+  if (!empty || !now) return 'something that could not be read';
+  if (sameComposer(now, empty)) { lineTouched.delete(id); return null; }
+  // Show what is actually on the line rather than what we think was typed: if
+  // the composer still starts the way an empty one does, the rest is theirs.
+  const shown = now.before.startsWith(empty.before)
+    ? now.before.slice(empty.before.length) : now.before.trim();
+  return shown.trim() || 'an edit in progress';
 }
-
-/** Test seams: the ledger is internal, and its rules are worth pinning. */
-export const __notePaneInputForTest = notePaneInput;
-export const __paneInputForTest = (id) => paneInput.get(id) || '';
 
 /** Type a line into the session's terminal (works with no browser attached). */
-export async function sendInput(id, text, { confirmEcho = false } = {}) {
+export async function sendInput(id, text, opts = {}) {
   const host = hosts.get(id);
   if (!host || stopping.has(id)) throw new ApiError(409, 'input-not-ready', 'session is not running');
+  // Sends are serialised per pane: two at once would interleave their text on
+  // one line as surely as a keystroke would.
+  const previous = host.sendChain || Promise.resolve();
+  let done;
+  host.sendChain = new Promise((resolve) => { done = resolve; });
+  try { await previous; } catch {}
+  host.sending = true;
+  host.heldInput = [];
+  try {
+    return await typeAndSubmit(host, id, text, opts);
+  } finally {
+    const held = host.heldInput || [];
+    host.sending = false;
+    host.heldInput = [];
+    // Replay in order, now that the line is ours no longer.
+    for (const chunk of held) {
+      notePaneInput(host, chunk);
+      try { host.pty.write(chunk); } catch {}
+    }
+    done();
+  }
+}
+
+async function typeAndSubmit(host, id, text, { confirmEcho = false } = {}) {
   // Typing a prompt onto a line that already holds something submits both as
   // one message. Clearing the line first would destroy what the operator
   // typed, so the send stops here instead and says what is in the way.
@@ -2372,7 +2407,7 @@ export function pasteInput(id, text) {
   const value = String(text || '');
   if (!value) return;
   host.inputRequired.observeInput();
-  notePaneInput(id, value);
+  notePaneInput(host, value);
   const payload = value.includes('\n') ? `\x1b[200~${value}\x1b[201~` : value;
   host.pty.write(payload);
 }
