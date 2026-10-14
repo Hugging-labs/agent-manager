@@ -564,7 +564,7 @@ body {
   color: var(--accent); font-weight: 700; font-size: 13px; line-height: 1.45; padding: 2px 0;
   margin-top: calc((var(--ov-first-line) - (1.45em + 4px)) / 2);
 }
-.ov-live textarea { flex: 1; min-width: 0; border: none; background: none; font: inherit; font-size: 13px; line-height: 1.45; color: var(--text); outline: none; padding: 2px 0; resize: none; overflow: hidden; max-height: 140px; }
+.ov-live textarea { flex: 1; min-width: 0; border: none; background: none; font: inherit; font-size: 13px; line-height: 1.45; color: var(--text); outline: none; padding: 2px 0; resize: none; overflow-y: auto; overscroll-behavior: contain; max-height: 140px; }
 .ov-live textarea::placeholder { color: var(--muted); opacity: 0.7; }
 .ov-hint { font-size: 10.5px; color: var(--muted); flex: none; }
 /* send button — essential on mobile (no Shift+Enter), handy on desktop */
