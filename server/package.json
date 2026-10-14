@@ -19,7 +19,7 @@
     "test": "node test/queued-prompts.test.mjs && node ../scripts/run-suites.mjs"
   },
   "engines": {
-    "node": ">=20.19"
+    "node": ">=24.16"
   },
   "dependencies": {
     "@coder/libghostty-vt-node": "0.1.0-beta.0",
