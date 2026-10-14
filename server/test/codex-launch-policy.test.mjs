@@ -33,8 +33,14 @@ test('both host flags forbid unbound launch even without a daemon; reject before
     } finally {delete process.env[key];}
   }
 });
+// `codexMigration` is what prepareCodexMigration writes next to codexSharedOnly,
+// and it is what tells this session apart from an imported reference whose
+// binding failed — that one is told to finish its import, not to migrate a
+// conversation it never had. Both stay blocked; they are told different things.
 test('incomplete migration stays blocked when shared flags are removed',()=>{
- assert.throws(()=>assertCodexLaunchAllowed({...session,codexSharedOnly:true},unbound),{code:'codex-migration-required'});
+ const migrating={...session,codexSharedOnly:true,codexMigration:{phase:'prepared',threadId:session.codexSessionId,key:'k'}};
+ assert.throws(()=>assertCodexLaunchAllowed(migrating,unbound),{code:'codex-migration-required'});
+ assert.throws(()=>assertCodexLaunchAllowed({...session,codexSharedOnly:true},unbound),{code:'codex-import-incomplete'});
 });
 test('Reader exposes same-thread migration without claiming a running TUI stopped or modifying history',async()=>{
  process.env.AM_CODEX_BINDINGS_PILOT='1';

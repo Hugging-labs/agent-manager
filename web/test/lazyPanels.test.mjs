@@ -84,7 +84,19 @@ try {
     // every panel still in its own chunk and no marker in the entry — the growth
     // is the unread, reader-history, refresh, admission and lock code that
     // belongs in the entry. Raised with the same headroom.
-    assert.ok(entry.length <= 760 * 1024, `entry chunk is ${(entry.length / 1024).toFixed(0)} kB, over the 760 kB budget`);
+    // Shared Codex (#160, 2026-10-14): 765.6 kB measured, over the 760 budget.
+    // Attributed from the entry's own sourcemap, against the commit before it:
+    //   +2.6 lib/durableIntent.ts   +2.4 TerminalPane.tsx
+    //   +1.6 InputRequiredNotice    +1.5 lib/readerStore.ts
+    //   +0.9 api.ts  +0.7 ConversationView.tsx  +0.6 lib/terminalScrollAnchor.ts
+    // No panel grew back in: CodexSharedSessions is in the SettingsView chunk,
+    // and every marker check below still passes. Most of it is general logic in
+    // modules the entry must carry — TerminalPane's scroll anchoring is a fix
+    // for every CLI, not for Codex — so the only lazy-able part is ~3 kB, and
+    // the one piece worth moving sits on the send path. Raised to 775, a
+    // deliberately tighter headroom than the two raises above, so the next
+    // eager import still trips this.
+    assert.ok(entry.length <= 775 * 1024, `entry chunk is ${(entry.length / 1024).toFixed(0)} kB, over the 775 kB budget`);
     // One literal only that panel's module contains — a dynamic import that
     // merely wraps an unchanged graph would leave these in the entry.
     for (const [panel, marker] of [
