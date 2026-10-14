@@ -63,6 +63,7 @@ export function createValidator({ cliExists, sessionExists, groupExists }) {
       number(Number(q[key]), key, min, max);
     };
     if (route === '/api/operations') queryNumber('limit', 1, 1000);
+    if (route.endsWith('/dispatches')) queryNumber('since', 0);
     if (route === '/api/usage') {
       optional(q, 'provider', oneOf, ['', 'claude', 'codex', 'opencode', 'hermes', 'openclaw', 'gemini']);
       optional(q, 'debug', oneOf, ['0', '1']);

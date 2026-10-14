@@ -1205,6 +1205,7 @@ export async function traceLocation(s) {
 //   ts?: number,                          // epoch ms
 //   model?: string,
 //   usage?: { in, out, cacheRead },
+//   error?: string,                       // claude: the request failed (`authentication_failed`, …)
 //   blocks: Block[],
 // }
 // Block =
@@ -1468,6 +1469,10 @@ async function normalizeClaude(file, out, range, allowSubagent = false) {
       msg = { role: j.type, ts, blocks: [] };
       if (range?.reader && id) msg.messageId = `claude:${id}`;
       if (j.type === 'assistant') {
+        // A turn the harness wrote for itself because the request failed
+        // ("Login expired · Please run /login"). Its text reads like an answer;
+        // this is what says it is not one.
+        if (j.isApiErrorMessage) msg.error = String(j.error || 'api_error');
         if (m.model) { msg.model = m.model; out.model = m.model; }
         const u = m.usage;
         if (u) {
