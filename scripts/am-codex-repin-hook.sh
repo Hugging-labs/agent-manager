@@ -34,7 +34,14 @@ while [ "$p" -gt 1 ] 2>/dev/null && [ "$hops" -lt 64 ]; do
         parent_rest=${parent_stat##*) }
         parent_rest=${parent_rest#* }
         grandparent=${parent_rest%% *}
-        if [ "$parent_comm" = "node" ] && [ "$grandparent" = "$AM_PANE_PID" ]; then trusted=1; fi
+        # Node 24 names its main thread, so /proc reports `MainThread` here
+        # rather than `node`. Same launcher process; matching only `node`
+        # rejected every breadcrumb from this layout on the shipped runtime.
+        case "$parent_comm" in
+          node | MainThread)
+            if [ "$grandparent" = "$AM_PANE_PID" ]; then trusted=1; fi
+            ;;
+        esac
       fi
       codex_pid=$p
       break

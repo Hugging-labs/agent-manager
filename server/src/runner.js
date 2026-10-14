@@ -1266,6 +1266,13 @@ export function pidIsPaneRootOrDirectChild(pid, root,
 // must retain bash, so there the npm launcher is the direct child and native
 // Codex is the grandchild. Accept that one known `node` launcher layer. A
 // nested Codex has a tool shell above its launcher and cannot pass this check.
+//
+// Node 24 — the version this ships on — names its main thread, so /proc reports
+// the launcher's comm as `MainThread`, not `node`. Both spellings are the same
+// process; matching only `node` silently rejected every breadcrumb from the
+// retained-shell layout on the runtime we actually run.
+const NODE_LAUNCHER_COMMS = new Set(['node', 'MainThread']);
+
 export function codexProcessPidTrusted(codexPid, root,
   readStat = (p) => fs.readFileSync(`/proc/${p}/stat`, 'utf8')) {
   for (let p = codexPid, hops = 0; Number.isInteger(p) && p > 1 && hops < 64; hops++) {
@@ -1274,7 +1281,7 @@ export function codexProcessPidTrusted(codexPid, root,
     if (identity.comm.startsWith('codex')) {
       if (p === root || identity.ppid === root) return true;
       const launcher = procIdentity(identity.ppid, readStat);
-      return launcher?.comm === 'node' && launcher.ppid === root;
+      return !!launcher && NODE_LAUNCHER_COMMS.has(launcher.comm) && launcher.ppid === root;
     }
     p = identity.ppid;
   }

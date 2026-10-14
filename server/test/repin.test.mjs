@@ -209,6 +209,15 @@ check('nested Claude rejected', runner.pidIsPaneRootOrDirectChild(102, 100, read
 check('top native Codex accepted', runner.codexProcessPidTrusted(110, 100, readStat), true);
 proc.set(100, '100 (node) S 99 0 0');
 check('Codex behind retained launch shell accepted', runner.codexProcessPidTrusted(110, 99, readStat), true);
+// What /proc actually reports on Node 24, which names its main thread. The
+// hook and this verdict both matched only `node`, so every breadcrumb from this
+// layout was rejected on the runtime we ship.
+proc.set(100, '100 (MainThread) S 99 0 0');
+check('…and when the launcher reports its thread name', runner.codexProcessPidTrusted(110, 99, readStat), true);
+// Still one layer, and still only a Node launcher: a shell above it is nested.
+proc.set(100, '100 (sh) S 99 0 0');
+check('but a shell in that position is still rejected', runner.codexProcessPidTrusted(110, 99, readStat), false);
+proc.set(100, '100 (node) S 99 0 0');
 check('nested native Codex rejected', runner.codexProcessPidTrusted(210, 100, readStat), false);
 check('gone Codex pid rejected', runner.codexProcessPidTrusted(999, 100, readStat), false);
 

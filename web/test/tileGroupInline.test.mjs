@@ -48,6 +48,8 @@ fs.writeFileSync(stub, `
   export const getSubAgents = () => Promise.resolve({ supported: true, agents: [] });
   export const getSubAgentWindow = () => new Promise(() => {});
   export const getSubAgentSummary = () => new Promise(() => {});
+  // The input-required notice answers a permission request from the tile.
+  export const answerSessionRequest = () => new Promise(() => {});
 `);
 
 await build({
