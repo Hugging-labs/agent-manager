@@ -19,7 +19,7 @@ import { LOCKED_EVENT, createLockTracker, type LockAnnouncement } from './lib/lo
 import BackupBanner from './components/BackupBanner';
 import OverviewSearchBox from './components/OverviewSearchBox';
 import Welcome from './components/Welcome';
-import { configuredCount } from './components/WelcomeSetup';
+import { configuredCount, keepOffering } from './components/WelcomeSetup';
 import * as api from './api';
 import { pinnedSessionIds } from './lib/pinned';
 import { quietSessionIds } from './lib/idleWindow';
@@ -463,7 +463,7 @@ export default function App() {
     // flag is only written once an agent actually works, and until then this
     // opens again on the next load. Within a load it stays closed, so it
     // cannot nag.
-    if (configuredCount(clis) === 0) return;
+    if (keepOffering(clis)) return;
     setInfo((i) => (i ? { ...i, welcomeSeen: true } : i));
     api.dismissWelcome().catch(() => {});
   };

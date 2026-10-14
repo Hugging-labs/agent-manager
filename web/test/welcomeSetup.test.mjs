@@ -35,15 +35,16 @@ await build({
   stdin: { resolveDir: web, loader: 'tsx', contents: `
     import React from 'react'; import { createRoot } from 'react-dom/client';
     import Welcome from './src/components/Welcome';
-    import { configuredCount, setupCandidates } from './src/components/WelcomeSetup';
+    import { configuredCount, setupCandidates, keepOffering } from './src/components/WelcomeSetup';
     window.configuredCount = configuredCount;
     window.setupCandidates = setupCandidates;
+    window.keepOffering = keepOffering;
     window.started = [];
     window.render = (s) => {
       document.getElementById('root').innerHTML = '';
       createRoot(document.getElementById('root')).render(React.createElement(Welcome, {
         onClose: () => { window.closed = true; },
-        clis: s.clis, spaceId: s.spaceId ?? 'you/am',
+        clis: s.clis, spaceId: s.spaceId === null ? null : (s.spaceId ?? 'you/am'),
         presentSecrets: s.secrets || [], bucketUnverified: !!s.unverified,
         onStartSession: (c) => window.started.push(c),
       }));
@@ -106,7 +107,7 @@ try {
     assert.ok(!/Open a Gemini CLI session/.test(fresh), 'offered a session it cannot sign in from');
   });
   await check('the shared explanation is said once, not once per agent', () =>
-    assert.equal((fresh.match(/because a Space has no browser of its own/g) || []).length, 1));
+    assert.equal((fresh.match(/has no browser of its own/g) || []).length, 1));
 
   const href = await page.locator('a.setup-go').first().getAttribute('href');
   await check(' deep-links to this Space\'s settings', () =>
@@ -155,6 +156,49 @@ try {
   await check('the tour is one click forward from setup', async () =>
     assert.match(await text(), /Welcome to Agent Manager/));
 
+  console.log('\noutside a Space (no SPACE_ID): a local or self-hosted install');
+  // Both of these shipped broken. With no CLIs the card rendered an empty list
+  // under "pick an agent", and because nothing was configured the dismissal was
+  // never recorded, so it reopened on every load offering nothing. With CLIs
+  // installed every action was gated on spaceId, so a local operator saw seven
+  // rows and no buttons at all.
+  const LOCAL = (available, ready = false) => CATALOG(ready ? ['claude'] : [])
+    .map((c) => ({ ...c, available }));
+
+  await mount({ clis: LOCAL(false), spaceId: null });
+  const bare = await text();
+  await check('with no CLIs installed it says how to install them', () => {
+    assert.match(bare, /No agent CLIs are installed yet/);
+    assert.match(bare, /install-local-clis\.sh/);
+  });
+  await check('and does not ask them to pick from an empty list', () =>
+    assert.ok(!/Pick an agent/.test(bare), 'offered a choice with nothing to choose'));
+
+  await mount({ clis: LOCAL(true), spaceId: null });
+  const localReady = await text();
+  const localActions = await page.$$eval('.setup-go', (e) => e.length);
+  await check('with CLIs installed every row still has an action', () =>
+    assert.equal(localActions, 3, `expected one action per agent, got ${localActions}`));
+  await check('the sign-in route is not gated on being a Space', () =>
+    assert.match(localActions > 0 ? localReady : '', /Open a Claude Code session/));
+  await check('and the key route is the environment, not a Space secret', () => {
+    assert.match(localReady, /Set it in the environment Agent Manager runs in/);
+    assert.ok(!/Space secret|restarts the Space/.test(localReady), 'offered Space secrets locally');
+  });
+  await check('nothing claims a Space when there is not one', () =>
+    assert.ok(!/a Space has no browser/.test(localReady), 'told a local operator about Spaces'));
+
+  // The Space path must be untouched by all of that.
+  await mount({ clis: CATALOG([]), spaceId: 'you/am' });
+  const spaced = await text();
+  await check('a Space still gets the secret deep-link and its restart warning', () => {
+    assert.match(spaced, /Add it as a Space secret/);
+    assert.match(spaced, /restarts the Space/);
+  });
+  const spaceHref = await page.locator('a.setup-go').first().getAttribute('href');
+  await check('and the link still points at that Space', () =>
+    assert.equal(spaceHref, 'https://huggingface.co/spaces/you/am/settings'));
+
   console.log('\nthe rule that decides whether it reappears');
   const counts = await page.evaluate(() => ({
     none: window.configuredCount([
@@ -173,6 +217,24 @@ try {
   await check('a shell does not count as a configured agent', () => assert.equal(counts.none, 0));
   await check('one working agent does', () => assert.equal(counts.one, 1));
   await check('an agent missing from the image is not offered', () => assert.equal(counts.missingBinary, 0));
+
+  // The trap: with nothing installed there is nothing to come back for, so
+  // closing it has to stick. Dismissal is only withheld while the card can
+  // still do something about the state it is complaining about.
+  const offering = await page.evaluate(() => ({
+    nothingInstalled: window.keepOffering([{ id: 'claude', available: false, ready: false, secrets: ['A'], signIn: { note: null } }]),
+    installedUnconfigured: window.keepOffering([{ id: 'claude', available: true, ready: false, secrets: ['A'], signIn: { note: null } }]),
+    oneWorking: window.keepOffering([
+      { id: 'claude', available: true, ready: true, secrets: ['A'], signIn: { note: null } },
+      { id: 'codex', available: true, ready: false, secrets: ['B'], signIn: { note: null } },
+    ]),
+  }));
+  await check('closing it sticks when nothing is installed to configure', () =>
+    assert.equal(offering.nothingInstalled, false));
+  await check('but it returns while an installed agent is unconfigured', () =>
+    assert.equal(offering.installedUnconfigured, true));
+  await check('and stops returning once one agent works', () =>
+    assert.equal(offering.oneWorking, false));
 
   console.log('\nicons and commands, by size');
   // Every glyph in icons.tsx is <svg viewBox> with NO width/height, so its size

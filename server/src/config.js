@@ -170,7 +170,7 @@ const setupHint = (...keys) =>
 // obvious. Keep it to a sentence, or leave it out.
 const IN_SESSION_SIGN_IN = {
   claude: { note: null },
-  codex: { note: 'Choose "Sign in with Device Code" — the ChatGPT option needs a browser redirect a Space cannot receive.' },
+  codex: { note: 'Choose "Sign in with Device Code" — the ChatGPT option redirects to localhost on the machine the agent runs on.' },
 };
 
 export const PASSIVE_CLIS = ['files', 'trace'];

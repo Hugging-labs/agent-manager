@@ -609,11 +609,30 @@ export default function SettingsView({
             {cuErr && <div className="s-warn">{cuErr}</div>}
             {cu && (
               <div className="s-help cu-foot">
-                Updates install into <span className="mono">{cu.prefix || 'the npm prefix'}</span>, which is container
-                disk and is wiped on every Space restart. To keep them, put this line
-                in <span className="mono">{cu.installScript}</span> — it runs on every boot, and costs that time on
-                every start:
-                <code className="cu-snip">{cu.persistSnippet}</code>
+                {info?.spaceId ? (
+                  <>
+                    Updates install into <span className="mono">{cu.prefix || 'the npm prefix'}</span>, which is container
+                    disk and is wiped on every Space restart. To keep them, put this line
+                    in <span className="mono">{cu.installScript}</span> — it runs on every boot, and costs that time on
+                    every start:
+                    <code className="cu-snip">{cu.persistSnippet}</code>
+                  </>
+                ) : (
+                  // Not a Space: the prefix is ordinary disk, nothing wipes it on
+                  // restart, and install.sh-on-boot is a Space mechanism. Saying
+                  // otherwise sends a local operator to fix a problem they do not
+                  // have — and `prefix` being null here is itself worth flagging,
+                  // because an unset NPM_CONFIG_PREFIX means npm writes wherever
+                  // it defaults to, which may be root-owned.
+                  <>
+                    Updates install into{' '}
+                    <span className="mono">{cu.prefix || 'npm\u2019s default global prefix'}</span> and persist like any
+                    other global npm install.{!cu.prefix && (
+                      <> Set <span className="mono">NPM_CONFIG_PREFIX</span> to a directory this
+                      process owns, or <span className="mono">npm install -g</span> may need root.</>
+                    )} Restart Agent Manager to pick up a new version.
+                  </>
+                )}
               </div>
             )}
 
