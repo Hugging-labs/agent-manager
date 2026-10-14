@@ -807,7 +807,16 @@ export default function TerminalPane({
         restoring = false;
         term.write(d, () => {
           if (resetState?.anchor) {
-            restoreTerminalAnchor(term, resetState.anchor);
+            const anchor = resetState.anchor;
+            restoreTerminalAnchor(term, anchor);
+            // …and again once the renderer has sized the viewport element.
+            // This callback fires when the snapshot has been PARSED, which is
+            // before the element grows to fit it. Scrolling a viewport that is
+            // still the old height is undone the moment it does grow — the
+            // element keeps scrollTop 0 and xterm follows it back to the top.
+            // On a phone that is the keyboard opening and throwing away the
+            // whole scrollback.
+            const sub = term.onRender(() => { sub.dispose(); restoreTerminalAnchor(term, anchor); });
           }
           viewportAnchor = null;
           schedulePreview();
