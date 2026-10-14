@@ -127,17 +127,20 @@ try {
   // Reset socket observations: the following cases deliberately exercise Reader only.
   await p.evaluate(()=>{window.sockets=[];});
 
-  // Reopening a saved task is an explicit separate action and carries the verified key.
+  // Opening the active Reader reconnects once with the verified key, without replaying input.
   await p.evaluate(()=>window.fixture.mount({id:'recovery',shared:true,recoveryKey:'saved-settings',sharedBusy:true}));
   const recoverySends=await p.evaluate(()=>window.sharedSends.length);
-  await p.getByRole('button',{name:'Reconnect task',exact:true}).click();
   await p.waitForFunction(()=>window.reconnections.length===1);
   assert.deepEqual(await p.evaluate(()=>window.reconnections[0]),{id:'recovery',recoveryKey:'saved-settings'});
   assert.equal(await p.getByRole('button',{name:'Reconnect task',exact:true}).isDisabled(),true);
   assert.equal(await p.evaluate(()=>window.sharedSends.length),recoverySends);
   await p.evaluate(()=>window.fixture.change({recoveryKey:'changed-settings',rejectReconnect:true}));
-  await p.getByRole('button',{name:'Reconnect task',exact:true}).click();
   await p.getByRole('alert').filter({hasText:'Saved task changed'}).waitFor();
+  assert.equal(await p.evaluate(()=>window.reconnections.length),2,'a new verified key permits one fresh automatic attempt');
+  // A failed attempt stays visible and can be retried explicitly.
+  await p.getByRole('button',{name:'Reconnect task',exact:true}).click();
+  await p.waitForFunction(()=>window.reconnections.length===3);
+  assert.equal(await p.evaluate(()=>window.sharedSends.length),recoverySends);
   await p.evaluate(()=>window.fixture.change({recoveryKey:null}));
   assert.equal(await p.getByRole('button',{name:'Reconnect task',exact:true}).count(),0);
 
@@ -238,7 +241,11 @@ try {
   await p.setViewportSize({ width: 1000, height: 700 });
   await p.evaluate(() => window.fixture.mount({ id: 'anchored', count: 500, from: 200, incremental: true }));
   await p.getByText('Question 499', { exact: true }).waitFor();
-  await p.evaluate(() => { const el=document.querySelector('.cxv-body'); el.scrollTop=el.scrollHeight*0.4; });
+  // Wait for the cold layout before expressing real manual-scroll intent.
+  await p.waitForFunction(() => !document.querySelector('.cxv-preparing'));
+  await p.locator('.cxv-body').hover();
+  await p.mouse.wheel(0, -1200);
+  await p.getByRole('button', { name: '↓ Latest', exact: true }).waitFor();
   await p.waitForTimeout(250);
   const anchor = () => p.evaluate(() => {
     const el=document.querySelector('.cxv-body'), top=el.getBoundingClientRect().top;
