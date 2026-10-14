@@ -29,12 +29,25 @@ while [ "$p" -gt 1 ] 2>/dev/null && [ "$hops" -lt 64 ]; do
         trusted=1
       else
         parent_stat=$(cat "/proc/$ppid/stat" 2>/dev/null) || parent_stat=
-        parent_comm=${parent_stat#*(}
-        parent_comm=${parent_comm%)*}
         parent_rest=${parent_stat##*) }
         parent_rest=${parent_rest#* }
         grandparent=${parent_rest%% *}
-        if [ "$parent_comm" = "node" ] && [ "$grandparent" = "$AM_PANE_PID" ]; then trusted=1; fi
+        # Which process that layer is, by its EXECUTABLE. /proc/<pid>/comm is a
+        # label a process writes for itself, so matching it let any program
+        # rename itself and stand in for the npm launcher. Node 24 also reports
+        # `MainThread` there rather than `node`, so the name is useless in both
+        # directions. AM_NODE_EXE is the server's own interpreter, passed into
+        # the pane; without it, fall back to the executable's name, and note
+        # that the server re-checks this against its own /proc read before
+        # acting on anything written here.
+        if [ "$grandparent" = "$AM_PANE_PID" ]; then
+          parent_exe=$(readlink -f "/proc/$ppid/exe" 2>/dev/null)
+          if [ -n "$AM_NODE_EXE" ]; then
+            [ "$parent_exe" = "$AM_NODE_EXE" ] && trusted=1
+          else
+            case "$parent_exe" in */node) trusted=1 ;; esac
+          fi
+        fi
       fi
       codex_pid=$p
       break
