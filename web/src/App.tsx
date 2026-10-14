@@ -28,6 +28,7 @@ import { applyAck, furtherMark, retireLocal, type ReadMark } from './lib/unread'
 const ACK_CHUNK = 100;
 import type { Cli, GridSpec, MoveTarget, OverviewChip, OverviewSort, Session, Tree } from './types';
 import { onPaneMode, readPaneMode, writePaneMode } from './lib/paneMode';
+import { OPEN_SESSION_EVENT } from './lib/openSession';
 import { hiddenSessionIds } from './lib/overviewHidden';
 import { paneOwnsBack } from './lib/mobileBack';
 import { isPassive, isRemote, isShareable } from './types';
@@ -979,6 +980,22 @@ export default function App() {
     }
     if (isMobile) setMobileStage(true);
   };
+
+  // A dispatched session's icon in the reader asks for its session this way,
+  // from deep inside the conversation, without a callback threaded through
+  // every pane. (The icon has already pointed the reading position at the end.)
+  const openRef = useRef(openSession);
+  openRef.current = openSession;
+  useEffect(() => {
+    const on = (e: Event) => {
+      const id = (e as CustomEvent<{ id?: string }>).detail?.id;
+      if (!id || !tree.sessions.some((x) => x.id === id)) return;
+      const g = tree.groups.find((x) => x.sessionIds.includes(id));
+      openRef.current(id, g?.id);
+    };
+    window.addEventListener(OPEN_SESSION_EVENT, on);
+    return () => window.removeEventListener(OPEN_SESSION_EVENT, on);
+  }, [tree]);
   const activate = (ref: string) => {
     setActiveRef(ref);
     setPage(0);

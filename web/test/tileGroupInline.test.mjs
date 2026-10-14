@@ -46,6 +46,7 @@ fs.writeFileSync(stub, `
   export const previewFile = () => new Promise(() => {});
   // the reader's sub-agent strip imports these; no tile here opens one
   export const getSubAgents = () => Promise.resolve({ supported: true, agents: [] });
+  export const getDispatches = () => Promise.resolve({ dispatches: [] });
   export const getSubAgentWindow = () => new Promise(() => {});
   export const getSubAgentSummary = () => new Promise(() => {});
 `);

@@ -147,6 +147,7 @@ await build({
       export const getSubAgentWindow=(i,a,...r)=>window.fixtureApi.window(a,...r);
       export const getSubAgentSummary=()=>window.fixtureApi.summary();
       export const getSubAgents=()=>Promise.resolve({agents:[]});
+      export const getDispatches=()=>Promise.resolve({dispatches:[]});
       export const sendInput=(id,text)=>{window.sends.push({id,text});return Promise.resolve({});};
     ` }));
   } }],

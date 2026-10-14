@@ -9,7 +9,7 @@
 // and the tinted prompt bar, and everything else lines up in one column.
 import { useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import type { SubAgentEntry, TraceTurn } from '../../api';
+import type { SubAgentEntry, TraceBlock, TraceTurn } from '../../api';
 import { getSubAgentWindow, getSubAgentSummary } from '../../api';
 import { useTraceWindows, type TraceSource } from '../../lib/traceWindows';
 import { useVirtualRows } from './useVirtualRows';
@@ -20,6 +20,16 @@ import type { Exchange, Step } from './exchanges';
 import { agentSpawnsOf, agentStatus, anyLive, canOpenAgent, capRows, railIsLast, fmtClock, fmtDur, fmtTok, oneLine, proseOf, splitExchanges, stepSummary, stepText, stepsOf } from './exchanges';
 import type { AgentSpawn, AgentStatus } from './exchanges';
 import ToolCall from './ToolCall';
+import { useLazyModule } from '../LazyPanel';
+import { dispatchBlocks, type Dispatch } from '../../lib/dispatches';
+
+// The dispatched-sessions strip and step row are fetched the first time a turn
+// has any: most conversations dispatch nothing, and the reader ships in the
+// entry chunk, which has a size budget (test/lazyPanels.test.mjs).
+const loadDispatchUi = () => import('./Dispatches');
+// Stands in while a turn has no dispatches, so the hook is called every render
+// without fetching anything.
+const noUi = () => new Promise<typeof import('./Dispatches')>(() => {});
 
 const blocksOf = (t: TraceTurn | TraceTurn[] | null) =>
   (Array.isArray(t) ? t : [t]).flatMap((x) => x?.blocks || []);
@@ -185,6 +195,7 @@ function nowDoing(s?: Step): string {
   // "working · sub-agent Rework the Scene 1 intro" — what the pane last did was
   // start something, and saying so is more use than naming the tool.
   if (s.kind === 'agent') return oneLine(`sub-agent ${s.description}`, 70);
+  if (s.kind === 'dispatch') return 'handing work to another session';
   return oneLine(s.text, 70);
 }
 
@@ -426,7 +437,7 @@ function LiveAgents({ rows, sessionId, live, rosterKnown, roster, ancestors }: {
 }
 
 export function ExchangeView({
-  x, n, total, open, onToggle, running, dim, q, baseModel, turns, sessionId, live, roster, ancestors, answerRef,
+  x, n, total, open, onToggle, running, dim, q, baseModel, turns, sessionId, live, roster, ancestors, answerRef, dispatches,
 }: {
   x: Exchange;
   /** Attached to the ANSWER, not the exchange: the unread cursor is cleared by
@@ -466,6 +477,12 @@ export function ExchangeView({
    * counted as its own child.
    */
   ancestors?: string[];
+  /**
+   * The sessions THIS turn launched or prompted through the manager's API
+   * (lib/dispatches.ts) — peers, not sub-agents. Drawn as icons on the summary
+   * line, and as the step that made the call when the work is open.
+   */
+  dispatches?: Dispatch[];
 }) {
   const [selfOpen, setSelfOpen] = useState(false);
   const toggle = onToggle ?? (() => setSelfOpen((o) => !o));
@@ -475,8 +492,14 @@ export function ExchangeView({
   // things it did, before and after saying it, and collapsing them into one
   // `Read ×2` row would erase exactly the sequence this is here to keep.
   const at = x.answerAt;
-  const stepsBefore = useMemo(() => stepsOf(at == null ? x.steps : x.steps.slice(0, at)), [x.steps, at]);
-  const stepsAfter = useMemo(() => (at == null ? [] : stepsOf(x.steps.slice(at))), [x.steps, at]);
+  // Which tool call made which dispatch, so that call becomes its own step.
+  const placed = useMemo(() => dispatchBlocks(x.steps, dispatches || []), [x.steps, dispatches]);
+  const isDispatch = placed.byBlock.size ? (b: TraceBlock) => placed.byBlock.has(b) : undefined;
+  const stepsBefore = useMemo(() => stepsOf(at == null ? x.steps : x.steps.slice(0, at), isDispatch), [x.steps, at, placed]);
+  const stepsAfter = useMemo(() => (at == null ? [] : stepsOf(x.steps.slice(at), isDispatch)), [x.steps, at, placed]);
+  const dispatched = dispatches?.length || 0;
+  const dispatchUi = useLazyModule(dispatches?.length ? loadDispatchUi : noUi);
+  const ui = dispatchUi.kind === 'ready' ? dispatchUi.module : null;
   const steps = useMemo(() => [...stepsBefore, ...stepsAfter], [stepsBefore, stepsAfter]);
   // A turn whose match is buried in the work unfolds it, or the search would
   // report a hit with nothing on screen to look at.
@@ -555,6 +578,10 @@ export function ExchangeView({
   // places. Everything else is the step rail as it was.
   const rowByToolUse = new Map(agentRows.map((r) => [r.spawn.toolUseId, r]));
   const renderStep = (s: Step, key: string) => {
+    if (s.kind === 'dispatch') {
+      return ui ? <ui.DispatchRow key={key} dispatches={placed.byBlock.get(s.call) || []} failed={s.failed} />
+        : <StepRow key={key} s={{ kind: 'tools', name: 'sessions', count: 1, details: [], failed: s.failed, pending: false, blocks: s.blocks }} q={q} />;
+    }
     if (s.kind !== 'agent') return <StepRow key={key} s={s} q={q} />;
     const r = rowByToolUse.get(s.toolUseId);
     return (
@@ -577,14 +604,18 @@ export function ExchangeView({
           "weirdly low". In that state the facts ride on the working line itself,
           so there is one row instead of one and a half. The working line does not
           move: it is the last row either way, at the text column. */}
-      {(summary || spawns.length > 0 || (n != null && !factsOnRunningRow)) && (
-      <div className="cx-meta mono">
+      {(summary || spawns.length > 0 || dispatched > 0 || (n != null && !factsOnRunningRow)) && (
+      <div className={`cx-meta mono${dispatched ? ' dx-meta' : ''}`}>
         {steps.length > 0 ? (
           <button className={`cx-fold${isOpen ? ' on' : ''}`} onClick={toggle} title={isOpen ? 'Hide the work' : 'Show the work'}>
             <span className="cs-tri">{isOpen ? '▾' : '▸'}</span>
             {summary}
           </button>
         ) : <span className="cx-fold flat">{summary}</span>}
+        {/* The sessions this turn handed work to: running first, finished to
+            their right, failed at the very right. Fills the line up to the
+            turn number and wraps inside that room. */}
+        {dispatched > 0 && ui && <ui.DispatchStrip dispatches={dispatches!} />}
         {/* Sub-agents sit in this line, where the operator asked for them, but as
             their own control: the fold to their left opens the turn's work, and
             this one opens the list of sub-agents. One button cannot open two
@@ -611,6 +642,11 @@ export function ExchangeView({
       ) : null}
       {isOpen && stepsAfter.length > 0 && (
         <div className="cx-steps">{stepsAfter.map((s, i) => renderStep(s, `a${i}`))}</div>
+      )}
+      {/* Dispatches no tool call in this window can be tied to (the call itself
+          scrolled out of the loaded window, say) still belong to the turn. */}
+      {isOpen && placed.loose.length > 0 && ui && (
+        <div className="cx-steps"><ui.DispatchRow dispatches={placed.loose} mark={<span className="cs-tri off">–</span>} /></div>
       )}
       {/* Mid-task there is no answer — an agent's aside is not a reply — so the
           running line carries the latest thing that happened instead. */}

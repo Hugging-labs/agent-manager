@@ -649,3 +649,78 @@ mark.cx-hit.on { background: var(--accent); color: var(--panel); }
      conversation's own type size, or they sit a couple of pixels high of it. */
   .ov-composer.cxv-composer { --ov-first-line: calc(1.45 * 16px + 4px); }
 }
+
+/* ---------- dispatched sessions: peers this turn handed work to ---------- */
+/* One CLI logo per session, in the StateLogo frame the rest of the app uses
+   for agent state: running animates, finished is the ordinary frame, and a
+   failure the records prove is the same frame in --danger. No new mark.
+   The strip fills the summary line up to the turn number and wraps inside that
+   room; on a narrow pane it takes a line of its own. */
+/* The container is the reader's column, not each turn: a container is a
+   stacking context, and one per turn would put the preview under the next. */
+.cxv-col { container-type: inline-size; }
+.cx-meta.dx-meta { align-items: flex-start; }
+.cx-meta.dx-meta > .cx-fold, .cx-meta.dx-meta > .cx-n, .cx-meta.dx-meta > .cx-time, .cx-meta.dx-meta > .cx-model { line-height: 22px; }
+.cx-meta.dx-meta > .spacer { display: none; }
+.dx-strip { flex: 1 1 0; min-width: 0; display: flex; flex-wrap: wrap; gap: 3px; align-items: center; }
+@container (max-width: 440px) {
+  /* the summary keeps its one line (ellipsized, as always); only the icons wrap */
+  .cx-meta.dx-meta { flex-wrap: wrap; }
+  .cx-meta.dx-meta > .cx-fold { flex: 1 1 0; min-width: 0; }
+  .dx-strip { order: 10; flex: 1 0 100%; gap: 2px; }
+}
+.dx-icon { background: none; border: none; padding: 1px; margin: 0; border-radius: var(--r-sm); cursor: pointer; display: inline-flex; }
+.dx-icon:hover, .dx-icon.on { background: color-mix(in srgb, var(--border) 55%, transparent); }
+.dx-logo { display: inline-flex; flex: none; }
+.dx-logo.bad .state-logo { color: var(--danger); }
+.dx-logo.gone .cli-logo { opacity: 0.45; filter: grayscale(1); }
+
+/* the preview: this turn's latest prompt to the session and the turn it started */
+/* An overlay on document.body, placed in viewport coordinates against its
+   icon (Dispatches.tsx, Floating): it must take no part in the reader's
+   scrolling layout, or opening it near the bottom moves the history. */
+.dx-pop { position: fixed; z-index: 900; overflow: hidden; border-radius: var(--r-lg); box-shadow: 0 8px 28px rgb(0 0 0 / 0.18); }
+.dx-pop > .dx-card { box-shadow: none; }
+.dx-pop.capped { overflow-y: auto; overscroll-behavior: contain; }
+.dx-pop > .dx-card { min-height: 0; }
+.dx-card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-lg); padding: 10px 12px;
+  box-shadow: 0 8px 28px rgb(0 0 0 / 0.18); font-family: var(--font-sans); font-size: 13px; color: var(--text);
+  white-space: normal; text-align: left; }
+.dx-card-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.dx-card-name { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dx-word { margin-left: auto; flex: none; font-family: var(--font-mono); font-size: 0.85em; color: var(--muted); white-space: nowrap; }
+.dx-word.running { color: var(--accent); }
+.dx-word.failed { color: var(--danger); }
+.dx-card-sub { font-size: 11px; color: var(--muted); margin: 3px 0 6px; }
+.dx-nested { padding-left: 1.23em; font-size: 12.5px; }
+.dx-clamp { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
+.dx-answer .markdown { max-height: 9.5em; overflow: hidden;
+  -webkit-mask-image: linear-gradient(#000 70%, transparent); mask-image: linear-gradient(#000 70%, transparent); }
+.dx-none { font-size: 0.88em; color: var(--muted); }
+.dx-card-foot { display: flex; justify-content: flex-end; margin-top: 8px; }
+.dx-open { background: var(--accent); color: var(--accent-fg); border: none; border-radius: var(--r-md); padding: 5px 11px;
+  font-size: 12px; cursor: pointer; }
+.dx-open:disabled { opacity: 0.45; cursor: default; }
+
+/* touch: the first tap shows the preview as a sheet */
+/* the backdrop dims and lets every gesture through; Dispatches.tsx closes the
+   sheet on a touch outside it (and a drag there scrolls the history) */
+.dx-sheet-wrap { position: fixed; inset: 0; z-index: 1000; background: rgb(0 0 0 / 0.28); display: flex; align-items: flex-end; pointer-events: none; }
+.dx-sheet-wrap > .dx-sheet { pointer-events: auto; }
+/* 60%, not more: some history stays in view above it, to read and to drag */
+.dx-sheet { width: 100%; max-height: 60vh; max-height: 60dvh; overflow: auto; overscroll-behavior: contain; background: var(--panel); border-radius: 14px 14px 0 0;
+  padding: 6px 4px calc(14px + env(safe-area-inset-bottom)); box-shadow: 0 -8px 30px rgb(0 0 0 / 0.25); }
+.dx-sheet .dx-card { border: none; box-shadow: none; }
+.dx-sheet .dx-open { padding: 9px 16px; font-size: 13px; }
+.dx-grab { width: 36px; height: 4px; border-radius: 2px; background: var(--border-strong); margin: 2px auto 4px; }
+
+/* the step: the call that launched or prompted, in place of its Bash line */
+.dx-row > .cs-head { cursor: default; align-items: center; }
+.dx-row > .cs-head:hover { background: none; }
+.dx-chips { display: flex; flex-wrap: wrap; gap: 3px 10px; min-width: 0; }
+.dx-chip { display: inline-flex; align-items: center; gap: 5px; background: none; border: none; padding: 1px 4px 1px 1px;
+  border-radius: var(--r-sm); font: inherit; font-size: 0.96em; color: var(--text); cursor: pointer; }
+.dx-chip:hover, .dx-chip.on { background: color-mix(in srgb, var(--border) 55%, transparent); }
+/* capped, the card scrolls; its one action stays in reach at the bottom edge */
+.dx-pop.capped .dx-card-foot { position: sticky; bottom: -10px; margin: 8px -12px -10px; padding: 8px 12px 10px;
+  background: var(--panel); border-top: 1px solid var(--border); }

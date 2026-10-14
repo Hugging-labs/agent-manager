@@ -83,6 +83,7 @@ await build({
       export const reconnectSession=(...args)=>window.fixtureApi.reconnect(...args);
       export const interruptSession=(...args)=>window.fixtureApi.interrupt(...args);
       export const sendInput=(...args)=>window.fixtureApi.send(...args);
+      export const getDispatches=()=>Promise.resolve({dispatches:[]});
     ` }));
   } }],
 });

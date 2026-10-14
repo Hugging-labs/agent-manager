@@ -60,6 +60,7 @@ import {
 import * as runstate from './runstate.js';
 import { installSlowFsProbe } from './slowfs.js';
 import { operationMiddleware, readOperations } from './operations.js';
+import { dispatchesOf } from './dispatches.js';
 import { findByName, filterAgentsByGroup, normalizeName } from './agent-list.js';
 import { fileLinkRoots, fileLinksRouter } from './file-links.js';
 import { ApiError, apiRoutes, apiNotFound, apiErrorHandler, errorEnvelope, pipeResponse } from './api-errors.js';
@@ -1143,6 +1144,22 @@ api.get('/api/agents/:id/subagents/:agentId', async (req, res) => {
     }
     throw e;
   }
+});
+
+// The peer sessions this session launched or prompted through this API, each
+// with the turn its prompt started over there (see dispatches.js). The reader
+// draws them on the turn that made the call. `since` (epoch ms) bounds it to
+// the turns the reader has loaded.
+api.get('/api/agents/:id/dispatches', async (req, res) => {
+  const s = store.get(req.params.id);
+  if (!s) return res.status(404).json({ error: 'not found' });
+  const info = agentInfo();
+  const dispatches = await dispatchesOf(s.id, {
+    since: Number(req.query.since) || 0,
+    stateOf: (peer) => deriveState(peer, info.get(peer.id)),
+    colorOf: (cli) => (cli && cliById(cli)?.color) || null,
+  });
+  res.json({ id: s.id, dispatches });
 });
 
 // Block until the target reaches one of `state` — so a coordinating agent makes
