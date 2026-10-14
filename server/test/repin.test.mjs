@@ -206,20 +206,38 @@ const readStat = (pid) => {
 check('pane root accepted', runner.pidIsPaneRootOrDirectChild(100, 100, readStat), true);
 check('direct Claude child accepted', runner.pidIsPaneRootOrDirectChild(101, 100, readStat), true);
 check('nested Claude rejected', runner.pidIsPaneRootOrDirectChild(102, 100, readStat), false);
-check('top native Codex accepted', runner.codexProcessPidTrusted(110, 100, readStat), true);
+// The launcher is identified by its EXECUTABLE. `comm` is a label a process
+// writes for itself — `printf MainThread > /proc/self/comm` is all it takes —
+// so it says nothing about what is running, in either direction: Node 24 names
+// its main thread `MainThread`, and a shell can claim the same name.
+const NODE = process.execPath;
+const exe = new Map([[100, NODE], [200, NODE]]);
+const readExe = (pid) => {
+  if (!exe.has(pid)) throw new Error('gone');
+  return exe.get(pid);
+};
+const trusted = (pid, root) => runner.codexProcessPidTrusted(pid, root, readStat, readExe);
+
+check('top native Codex accepted', trusted(110, 100), true);
 proc.set(100, '100 (node) S 99 0 0');
-check('Codex behind retained launch shell accepted', runner.codexProcessPidTrusted(110, 99, readStat), true);
-// What /proc actually reports on Node 24, which names its main thread. The
-// hook and this verdict both matched only `node`, so every breadcrumb from this
-// layout was rejected on the runtime we ship.
+check('Codex behind retained launch shell accepted', trusted(110, 99), true);
+// What /proc reports for that same launcher on Node 24. Rejecting it here is
+// what made every breadcrumb from this layout fail on the runtime we ship.
 proc.set(100, '100 (MainThread) S 99 0 0');
-check('…and when the launcher reports its thread name', runner.codexProcessPidTrusted(110, 99, readStat), true);
-// Still one layer, and still only a Node launcher: a shell above it is nested.
+check('…and when it reports its thread name instead', trusted(110, 99), true);
+// The attack the name allowed: a shell that renames itself to the name the
+// check was looking for. Its executable is still a shell.
+exe.set(100, '/usr/bin/bash');
+check('a renamed shell in that position is rejected', trusted(110, 99), false);
 proc.set(100, '100 (sh) S 99 0 0');
-check('but a shell in that position is still rejected', runner.codexProcessPidTrusted(110, 99, readStat), false);
+check('and so is one that does not bother renaming itself', trusted(110, 99), false);
+// A launcher whose executable cannot be read is not a launcher we know.
+exe.delete(100);
+check('an unreadable executable is rejected', trusted(110, 99), false);
+exe.set(100, NODE);
 proc.set(100, '100 (node) S 99 0 0');
-check('nested native Codex rejected', runner.codexProcessPidTrusted(210, 100, readStat), false);
-check('gone Codex pid rejected', runner.codexProcessPidTrusted(999, 100, readStat), false);
+check('nested native Codex rejected', trusted(210, 100), false);
+check('gone Codex pid rejected', trusted(999, 100), false);
 
 console.log('\nhook scripts preserve the pane and launch identity');
 const scripts = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'scripts');
@@ -263,6 +281,37 @@ written = JSON.parse(fs.readFileSync(path.join(REPIN, 's1.codex.json'), 'utf8'))
 check('Codex hook writes run id', written.runId, RUN);
 check('Codex hook writes exact session id', written.payload.session_id, CODEX_ID);
 check('Codex hook records its live agent process', Number.isInteger(written.codexPid), true);
+
+// The same attack, against the hook rather than the server's verdict: a shell
+// in the launcher's position that renames itself to the name the check used to
+// look for. Its executable is still a shell, so no breadcrumb is written.
+const fakeLauncher = path.join(TMP, 'fake-launcher.sh');
+fs.writeFileSync(fakeLauncher, [
+  'printf MainThread > /proc/self/comm',
+  '"$1" -c "sh \'$2\'"',
+].join('\n'));
+hook = spawnSync(paneShim, ['-c',
+  `export AM_PANE_PID=$$; bash '${fakeLauncher}' '${codexShim}' '${path.join(scripts, 'am-codex-repin-hook.sh')}'`], {
+  input: JSON.stringify(codexCrumb.payload),
+  env: { ...process.env, AM_ID: 's2', AM_RUN_ID: RUN, AM_CLI: 'codex' },
+});
+check('renamed shell launcher exits cleanly', hook.status, 0);
+check('and writes no breadcrumb', fs.existsSync(path.join(REPIN, 's2.codex.json')), false);
+
+// In the Space the server passes its own interpreter in, and the hook compares
+// against that rather than guessing from the executable's name.
+for (const [id, nodeExe, want] of [
+  ['s3', process.execPath, true],
+  ['s4', '/usr/bin/bash', false],
+]) {
+  hook = spawnSync(paneShim, ['-c',
+    `export AM_PANE_PID=$$; node '${codexLauncher}' '${codexShim}' '${path.join(scripts, 'am-codex-repin-hook.sh')}'`], {
+    input: JSON.stringify(codexCrumb.payload),
+    env: { ...process.env, AM_ID: id, AM_RUN_ID: RUN, AM_CLI: 'codex', AM_NODE_EXE: nodeExe },
+  });
+  check(`AM_NODE_EXE=${nodeExe === process.execPath ? 'the server\'s node' : 'something else'} ${want ? 'writes' : 'does not write'}`,
+    fs.existsSync(path.join(REPIN, `${id}.codex.json`)), want);
+}
 
 // ---------- the pane root: the fact every breadcrumb is trusted against ----------
 // paneRootPid used to shell out to `tmux list-panes`. The libghostty migration

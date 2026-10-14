@@ -1267,21 +1267,37 @@ export function pidIsPaneRootOrDirectChild(pid, root,
 // Codex is the grandchild. Accept that one known `node` launcher layer. A
 // nested Codex has a tool shell above its launcher and cannot pass this check.
 //
-// Node 24 — the version this ships on — names its main thread, so /proc reports
-// the launcher's comm as `MainThread`, not `node`. Both spellings are the same
-// process; matching only `node` silently rejected every breadcrumb from the
-// retained-shell layout on the runtime we actually run.
-const NODE_LAUNCHER_COMMS = new Set(['node', 'MainThread']);
+// Which process that layer is gets decided by its executable, below: Node 24
+// names its main thread, so /proc reports a node process's comm as
+// `MainThread`, and matching the name rejected every breadcrumb from this
+// layout on the runtime we ship — then accepted anything willing to adopt the
+// name. The executable answers both.
+// What the launcher IS, not what it calls itself. `/proc/<pid>/comm` is a label
+// the process writes for itself — any program can `printf MainThread >
+// /proc/self/comm` — so matching it let a renamed shell stand in for the npm
+// launcher and write a breadcrumb that moves a session's durable pin. The
+// executable behind the pid cannot be rewritten that way.
+let canonicalNode = null;
+const nodeExecutable = () => {
+  if (canonicalNode === null) {
+    try { canonicalNode = fs.realpathSync(process.execPath); } catch { canonicalNode = process.execPath; }
+  }
+  return canonicalNode;
+};
+const isNodeProcess = (pid, readExe) => {
+  try { return readExe(pid) === nodeExecutable(); } catch { return false; }
+};
 
 export function codexProcessPidTrusted(codexPid, root,
-  readStat = (p) => fs.readFileSync(`/proc/${p}/stat`, 'utf8')) {
+  readStat = (p) => fs.readFileSync(`/proc/${p}/stat`, 'utf8'),
+  readExe = (p) => fs.realpathSync(`/proc/${p}/exe`)) {
   for (let p = codexPid, hops = 0; Number.isInteger(p) && p > 1 && hops < 64; hops++) {
     const identity = procIdentity(p, readStat);
     if (!identity) return false;
     if (identity.comm.startsWith('codex')) {
       if (p === root || identity.ppid === root) return true;
       const launcher = procIdentity(identity.ppid, readStat);
-      return !!launcher && NODE_LAUNCHER_COMMS.has(launcher.comm) && launcher.ppid === root;
+      return !!launcher && launcher.ppid === root && isNodeProcess(identity.ppid, readExe);
     }
     p = identity.ppid;
   }
@@ -2011,6 +2027,9 @@ export function ensureRunning(session, cols = 120, rows = 34) {
     AM_ID: session.id,
     AM_RUN_ID: runId,
     AM_CLI: session.cli,
+    // The server's own interpreter, for the repin hook's launcher check. The
+    // hook runs inside the pane and has no other way to name it.
+    AM_NODE_EXE: nodeExecutable(),
     AM_USER,
     AM_ROOT: WORKSPACES_DIR, // prompt shows $PWD relative to this
     // The port the agent API answers on. PORT is configurable, so a session
