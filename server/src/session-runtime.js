@@ -1,10 +1,14 @@
-import { codexLaunchBlock } from './codex-launch-policy.js';
+import { codexLaunchBlock, bindingIfKnown } from './codex-launch-policy.js';
 // Select execution behind AM's existing HTTP contracts. Views never select a
 // transport; bindings remain the only authority for choosing the shared task.
 import { liveView, requestView } from './codex-view.js';
 export class SessionRuntime {
   constructor({codex,bindings}) {this.codex=codex;this.bindings=bindings;this.states=new Map();this.checks=new Map();}
-  shared(session) {return session.cli==='codex'&&!!(session.codexSharedOnly||this.bindings.forSession(session.id));}
+  // Display only, so an unreadable bindings file answers "not shared" instead
+  // of throwing: this is on the path of /api/tree and /api/sessions, and a
+  // sidebar that cannot load is worse than a row missing a shared badge. The
+  // launch path reads the file for itself and refuses there.
+  shared(session) {return session.cli==='codex'&&!!(session.codexSharedOnly||bindingIfKnown(session,this.bindings));}
   async refresh(session) {
     if(!this.shared(session))return null;
     if(this.checks.has(session.id))return this.checks.get(session.id);
@@ -21,7 +25,11 @@ export class SessionRuntime {
     return ({working:'working', idle:'waiting', 'needs-input':'waiting', unloaded:'stopped'})[current?.status] || 'unknown';
   }
   presentation(session) {
-    const block = codexLaunchBlock(session, this.bindings);
+    // Same reason: the roster is built from this. A file we cannot read leaves
+    // the row undecorated; attempting to launch still produces the refusal that
+    // names the file.
+    let block;
+    try { block = codexLaunchBlock(session, this.bindings); } catch { return null; }
     if (block) return {codexMigrationRequired:block};
     if(!this.shared(session))return null;
     const current=this.states.get(session.id);

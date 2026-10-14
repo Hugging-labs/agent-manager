@@ -1,5 +1,4 @@
-import { assertCodexLaunchAllowed } from './codex-launch-policy.js';
-import { codexBindings, contextError } from './codex-context.js';
+import { assertCodexLaunchAllowed, boundOrUnknown, sharedBinding, bindingIfKnown } from './codex-launch-policy.js';
 import { fileURLToPath } from 'node:url';
 import { ApiError } from './api-errors.js';
 import os from 'node:os';
@@ -883,7 +882,7 @@ async function tryCaptureCodexId(sessionId, workdir, sinceMs, stillOurs = () => 
     // folderIsShared refuses to guess at. Writing on the strength of the
     // pre-walk answer lets a disposed chain overwrite a correct pin or claim a
     // sibling's rollout. Same re-check the claude re-pin does before its write.
-    if (!stillOurs() || codexBindings.forSession(sessionId) || folderIsShared(sessionId, workdir, 'codex')) return false;
+    if (!stillOurs() || boundOrUnknown(sessionId) || folderIsShared(sessionId, workdir, 'codex')) return false;
     if (pinned) console.warn(`[codex] re-pinning ${sessionId}: ${pinned} -> ${m[1]} (conversation was replaced)`);
     update(sessionId, { codexSessionId: m[1], codexRollout: c.p });
     return true;
@@ -957,7 +956,7 @@ function scheduleCodexCapture(session, workdir) {
     if (!checkedStale) {
       checkedStale = true;
       const live = list().find((s) => s.id === session.id);
-      if (live && live.codexSessionId && await pinIsStale(live) && stillOurs() && !codexBindings.forSession(session.id)) {
+      if (live && live.codexSessionId && await pinIsStale(live) && stillOurs() && !boundOrUnknown(session)) {
         update(session.id, { codexSessionId: undefined, codexRollout: undefined });
       }
     }
@@ -1446,7 +1445,7 @@ function exactPinFacts(session, host, workdir, pinField) {
 // or database row is newest: the reported id is the lookup key, and local state
 // is used only to validate that exact key before persisting it.
 async function applyBreadcrumb(session, host, workdir, crumb) {
-  if (session.cli === 'codex' && codexBindings.forSession(session.id)) return { repin: null, why: 'shared binding' };
+  if (session.cli === 'codex' && boundOrUnknown(session)) return { repin: null, why: 'shared binding' };
   let facts;
   let patch;
   if (session.cli === 'claude') {
@@ -1806,8 +1805,7 @@ export function commandFor(session) {
   const cli = cliById(session.cli) || cliById('shell');
   if (cli.id === 'shell') return bashLaunch;
   if (cli.id === 'codex') {
-    let binding;
-    try { binding = codexBindings.forSession(session.id); } catch (error) { throw contextError(error); }
+    const binding = sharedBinding(session);
     if (!binding && session.codexSharedOnly) throw new ApiError(409, 'codex-import-incomplete', 'Finish adding this shared task before opening its terminal. No standalone session was started.');
     if (binding) {
       const helper = fileURLToPath(new URL('../../scripts/am-codex-context.mjs', import.meta.url));
@@ -1985,7 +1983,7 @@ export function ensureRunning(session, cols = 120, rows = 34) {
   // with no prompt. The cache behind it is refreshed in the background hours
   // after boot, so it is checked per launch rather than once, as a
   // compare-and-set. See first-run.js.
-  if (session.cli === 'codex' && !codexBindings.forSession(session.id)) {
+  if (session.cli === 'codex' && !boundOrUnknown(session)) {
     trustCodexWorkspace(realWork);
     dismissCodexUpdatePrompt(cliVersion('codex'));
   }
@@ -2160,8 +2158,8 @@ export function ensureRunning(session, cols = 120, rows = 34) {
   if (!session.everStarted) update(session.id, {
     everStarted: true, pendingPrompt: undefined, pendingImagePaths: undefined,
   });
-  if (session.cli !== 'codex' || !codexBindings.forSession(session.id)) scheduleBreadcrumbCapture(session, workdir);
-  if (session.cli === 'codex' && !codexBindings.forSession(session.id)) scheduleCodexCapture(session, workdir);
+  if (session.cli !== 'codex' || !boundOrUnknown(session)) scheduleBreadcrumbCapture(session, workdir);
+  if (session.cli === 'codex' && !boundOrUnknown(session)) scheduleCodexCapture(session, workdir);
   if (session.cli === 'opencode') scheduleOpencodeCapture(session, workdir);
   if (session.cli === 'fx') scheduleFxCapture(session, workdir);
   if (session.cli === 'claude') scheduleClaudeCapture(session, workdir);
@@ -2561,7 +2559,8 @@ export async function restart(session, timeoutMs = 15_000) {
 
 /** Stop a session entirely (kills the process; viewers get an exit close code). */
 export function stop(id) {
-  if (list().find((s) => s.id === id)?.cli === 'codex' && codexBindings.forSession(id)) throw new ApiError(409, 'codex-shared-stop-unsupported',
+  const stopTarget = list().find((s) => s.id === id);
+  if (stopTarget?.cli === 'codex' && bindingIfKnown(stopTarget)) throw new ApiError(409, 'codex-shared-stop-unsupported',
     'This task runs on the shared server. Close the terminal view or use Codex to interrupt the current turn.');
   const host = hosts.get(id);
   if (!host) return;

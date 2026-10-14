@@ -2893,7 +2893,11 @@ api.get('/api/folders', (req, res) => {
 
 function sessionsWithState() {
   const info = agentInfo();
-  const shared = new Set(codexBindings.read().map((binding) => binding.amSessionId));
+  // The roster must render with a damaged bindings file: without this, one bad
+  // byte makes /api/tree and /api/sessions 500 and the sidebar never loads.
+  let bound = [];
+  try { bound = codexBindings.read(); } catch { bound = []; }
+  const shared = new Set(bound.map((binding) => binding.amSessionId));
   return store.list().map((s) => {
     const state = deriveState(s, info.get(s.id));
     const runtime = sessionRuntime.presentation(s);
