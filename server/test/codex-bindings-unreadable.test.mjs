@@ -7,19 +7,28 @@
 // named neither the file nor the repair.
 //
 // It cannot simply fail open. A binding written while the pilot was on outlives
-// the flag: switching it off does not delete the file, and letting such a
-// session start a standalone TUI would put a second writer on a thread the
-// shared server owns. What makes the distinction safe is that every record is
-// written by bindExistingThread, which refuses unless the session's own
-// `codexSessionId` already equals the thread — so a Codex session with no
-// verified thread pin provably has no usable binding, and an unreadable file
-// says nothing about it.
+// the flag, and sessions.json and codex-bindings.json are separate durable
+// files that are not restored together — so the session ROW is not evidence
+// either: a partial restore can leave a row with no thread pin beside a record
+// that still binds it.
+//
+// The evidence that holds is the COMMAND. Only a resume can attach to an
+// existing conversation (`resume <id>`, or `resume --last`, which scopes to the
+// cwd and can land on a bound thread). A session that has never started, with
+// no pin and no rollout, gets a fresh `codex` — which cannot become a second
+// writer whatever the file says. So: refuse what could resume, allow what
+// cannot.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import http from 'node:http';
 import test from 'node:test';
+import { once } from 'node:events';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { REQUEST_HEADERS } from '../src/request-admission.js';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'am-bindings-unreadable-'));
 process.env.DATA_DIR = dir;
@@ -28,9 +37,10 @@ delete process.env.AM_CODEX_SHARED_CREATE;
 fs.mkdirSync(path.join(dir, 'workspaces', 'w'), { recursive: true });
 const FILE = path.join(dir, 'codex-bindings.json');
 
-const { assertCodexLaunchAllowed, boundOrUnknown, bindingCouldExist } = await import('../src/codex-launch-policy.js');
+const { assertCodexLaunchAllowed, boundOrUnknown, unsafeWithoutBindings } = await import('../src/codex-launch-policy.js');
 const { CodexBindings, endpointIdentity } = await import('../src/codex-bindings.js');
 const { commandFor } = await import('../src/runner.js');
+const { SessionRuntime } = await import('../src/session-runtime.js');
 
 const THREAD = '11111111-1111-4111-8111-111111111111';
 const codex = (extra = {}) => ({ id: `s-${crypto.randomBytes(4).toString('hex')}`, cli: 'codex',
@@ -47,29 +57,41 @@ test('with no bindings file, an ordinary Codex session launches', () => {
   assert.equal(refusal(codex({ codexSessionId: THREAD })), null);
 });
 
-test('an unreadable bindings file does not hold an unbindable Codex session hostage', () => {
+test('an unreadable bindings file still lets a fresh Codex conversation start', () => {
   corrupt();
-  // No verified thread pin: bindExistingThread could never have bound it, so
-  // the file has nothing to say about this session.
-  assert.equal(bindingCouldExist(codex()), false);
-  assert.equal(refusal(codex()), null, 'an ordinary Codex session still opens');
-  assert.equal(refusal({ ...codex(), cli: 'claude' }), null, 'and other agents were never affected');
+  // Never started, no pin, no rollout: commandFor can only give it a new
+  // conversation, which is not a second writer on anything.
+  const fresh = codex({ everStarted: false });
+  assert.equal(unsafeWithoutBindings(fresh), false);
+  assert.equal(refusal(fresh), null, 'a new Codex session still opens');
+  assert.doesNotMatch(commandFor(fresh), /resume/, 'and what it opens is a fresh conversation');
+  assert.equal(refusal({ ...codex(), cli: 'claude' }), null, 'other agents were never affected');
 });
 
-test('an unreadable bindings file still refuses anything that could be bound', () => {
+test('an unreadable bindings file refuses every launch that could resume', () => {
   corrupt();
-  // The case that must not fail open: the pilot WAS on, this session was bound
-  // by its pin, the flag is off again, and the file no longer parses.
-  const pinned = codex({ codexSessionId: THREAD });
-  assert.equal(bindingCouldExist(pinned), true);
-  const byPin = refusal(pinned);
-  assert.equal(byPin?.code, 'codex-bindings-unreadable');
+  for (const [what, session] of [
+    // The restore case: sessions.json came back from an older copy without the
+    // pin, codex-bindings.json did not. The row says "unbound"; it is not
+    // evidence. `resume --last` scopes to the cwd and can land on the bound
+    // thread, so this must refuse even though the row looks clean.
+    ['a started session whose row lost its pin', codex({ everStarted: true })],
+    ['a pinned session', codex({ codexSessionId: THREAD })],
+    ['a session with a rollout on disk', codex({ codexRollout: '/tmp/rollout.jsonl' })],
+  ]) {
+    assert.equal(unsafeWithoutBindings(session), true, what);
+    assert.equal(refusal(session)?.code, 'codex-bindings-unreadable', what);
+  }
+});
+
+test('an unreadable bindings file refuses an import reference and a shared host', () => {
+  corrupt();
+  const imported = codex({ codexSharedOnly: true });
+  const byImport = refusal(imported);
+  assert.equal(byImport?.code, 'codex-bindings-unreadable');
   // 409, not 503: errorEnvelope replaces every 5xx body, so a 503 could not
   // tell the operator what to repair however it was worded.
-  assert.equal(byPin?.statusCode, 409);
-
-  const imported = codex({ codexSharedOnly: true });
-  assert.equal(refusal(imported)?.code, 'codex-bindings-unreadable');
+  assert.equal(byImport?.statusCode, 409);
 
   process.env.AM_CODEX_BINDINGS_PILOT = '1';
   try { assert.equal(refusal(codex())?.code, 'codex-bindings-unreadable', 'with the pilot on, nothing is assumed'); }
@@ -81,7 +103,7 @@ test('the refusal names the file and what repairing it costs', () => {
   const error = refusal(codex({ codexSessionId: THREAD }));
   assert.match(error.message, /codex-bindings\.json/);
   assert.match(error.message, /remove it to unbind every shared task/);
-  assert.match(error.message, /will not start a standalone one/);
+  assert.match(error.message, /will not resume one that could become a second writer/);
   // The file name survives errorEnvelope's 5xx/4xx filtering; an absolute path
   // would not, which is why it goes to the log instead.
   assert.deepEqual(error.data?.details, [{ field: 'path', message: 'codex-bindings.json' }]);
@@ -110,6 +132,72 @@ test('a real binding still keeps its session off the standalone launch path', ()
   const command = commandFor(session);
   assert.match(command, /am-codex-context\.mjs/, 'a bound session launches through the shared client');
   assert.doesNotMatch(command, /exec codex/, 'never a standalone writer');
+});
+
+test('the runtime answers "not shared" rather than throwing, for every caller', () => {
+  corrupt();
+  const bindings = new CodexBindings(FILE);
+  const runtime = new SessionRuntime({ bindings, codex: { status() { throw new Error('must not connect'); } } });
+  // shared() is on the prompt, coordination and trace paths too, not only the
+  // roster — presentation()'s own guard would otherwise hide this.
+  assert.equal(runtime.shared(codex()), false);
+  assert.equal(runtime.shared(codex({ codexSharedOnly: true })), true, 'the session row still counts');
+  assert.equal(runtime.presentation(codex()), null);
+});
+
+// The whole app, booted against the bad file. The helpers above are called
+// directly, so they cannot see this: /api/tree is the sidebar's bootstrap and
+// it reads the bindings file for the whole roster before any per-session
+// policy runs. One malformed byte used to make it a sanitized 500, which left
+// the operator unable to see the session at all — let alone reach the refusal
+// that tells them which file to repair.
+test('the app still loads, and still lists its Codex sessions', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'am-bindings-http-'));
+  const home = path.join(root, 'home');
+  const data = path.join(root, 'data');
+  fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(path.join(data, 'workspaces', 'w'), { recursive: true });
+  const session = { id: 'ordinary-codex', name: 'codex-1', cli: 'codex', path: 'w',
+    sessionUuid: crypto.randomUUID(), everStarted: true, createdAt: new Date().toISOString() };
+  fs.writeFileSync(path.join(data, 'sessions.json'), JSON.stringify([session], null, 2));
+  fs.writeFileSync(path.join(data, 'codex-bindings.json'), '{"version":1,"bindings":[');
+
+  const reserve = http.createServer();
+  await new Promise((r) => reserve.listen(0, '127.0.0.1', r));
+  const port = reserve.address().port;
+  await new Promise((r) => reserve.close(r));
+  const origin = `http://127.0.0.1:${port}`;
+  // cwd, not the runner's: `node --test server/test/...` runs from the repo root.
+  const serverDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const server = spawn(process.execPath, ['src/index.js'], { cwd: serverDir, stdio: ['ignore', 'ignore', 'ignore'], env: {
+    PATH: process.env.PATH, HOME: home, DATA_DIR: data, PORT: String(port),
+    CLAUDE_CONFIG_DIR: path.join(home, '.claude'), CODEX_HOME: path.join(home, '.codex'),
+    XDG_CONFIG_HOME: path.join(home, '.config'), AM_REPIN_DIR: path.join(root, 'repin'),
+    AM_INPUT_REQUIRED_DIR: path.join(root, 'input-required'), AM_BASHRC: '/nonexistent',
+  } });
+  try {
+    for (let n = 0; ; n++) {
+      if (await fetch(`${origin}/api/health`).then((r) => r.ok).catch(() => false)) break;
+      assert.ok(n < 150 && server.exitCode === null, 'isolated backend started');
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    const get = async (route) => {
+      const res = await fetch(origin + route, { headers: REQUEST_HEADERS });
+      return { status: res.status, body: await res.json().catch(() => null) };
+    };
+    const tree = await get('/api/tree');
+    assert.equal(tree.status, 200, `the sidebar bootstrap: ${JSON.stringify(tree.body)}`);
+    assert.ok(tree.body.sessions.some((s) => s.id === session.id), 'the Codex session is in the tree');
+
+    const sessions = await get('/api/sessions');
+    assert.equal(sessions.status, 200, JSON.stringify(sessions.body));
+    const row = sessions.body.find((s) => s.id === session.id);
+    assert.ok(row, 'and in the roster');
+    assert.notEqual(row.codexShared, true, 'an unreadable file is not evidence that it is shared');
+  } finally {
+    if (server.exitCode === null) { const exited = once(server, 'exit'); server.kill('SIGTERM'); await exited; }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test.after(() => fs.rmSync(dir, { recursive: true, force: true }));

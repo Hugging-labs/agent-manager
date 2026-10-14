@@ -8,20 +8,40 @@ import { CodexBindingError, validThreadId } from './codex-bindings.js';
 export const sharedCodexMode = () => process.env.AM_CODEX_BINDINGS_PILOT === '1'
   || process.env.AM_CODEX_SHARED_CREATE === '1';
 
-// Could this session have a binding at all?
+// What a Codex session may do when we cannot read the bindings file.
 //
-// A record is only ever written by bindExistingThread — the single caller of
-// CodexBindings.bind — which refuses unless the session's own `codexSessionId`
-// already equals the thread being bound, and contextForThread re-checks that
-// equality on every read. So a Codex session with no verified thread pin has no
-// usable binding whatever the file says.
+// An earlier version of this answered "no binding can exist" from the session
+// row having no verified thread pin. That was wrong: sessions.json and
+// codex-bindings.json are separate durable files and are not restored
+// together, so a partial bucket restore (or a hand edit) can leave a row with
+// no pin beside a record that still binds it.
 //
-// `codexSharedOnly` and the pilot flags are kept in the answer deliberately. A
-// binding written while the pilot was on OUTLIVES the flag: turning it off does
-// not delete the file, and such a session necessarily carries the pin it was
-// bound by, so the `validThreadId` test below is what refuses it.
-export function bindingCouldExist(session) {
-  return session.codexSharedOnly === true || sharedCodexMode() || validThreadId(session.codexSessionId);
+// The usable evidence is not the row, it is the COMMAND. Per runner.commandFor,
+// a Codex launch can attach to an existing conversation three ways: a pinned
+// `resume <id>` when the rollout file is present, `resume --last`, which scopes
+// to the working directory and can therefore land on a bound thread that is the
+// newest rollout there, and nothing else. A session that has never started, has
+// no pin and no rollout gets `exec codex` — a NEW conversation, which cannot
+// become a second writer on a thread the shared server owns, whatever the
+// unreadable file says.
+//
+// So refuse what could resume and allow what cannot. `codexSharedOnly` and the
+// pilot flags stay in the refusal: an imported reference has an import to
+// finish, and a shared host has no business starting standalone terminals.
+const couldResume = (session) => session.everStarted === true
+  || !!session.codexSessionId || !!session.codexRollout;
+
+export function unsafeWithoutBindings(session) {
+  return session.codexSharedOnly === true || sharedCodexMode() || couldResume(session);
+}
+
+/**
+ * The binding if one can be read, null if there is none OR the file cannot be
+ * read. Never throws. Only for callers whose answer cannot start a writer:
+ * display, and stopping a pane.
+ */
+export function bindingIfKnown(session, bindings = codexBindings) {
+  try { return bindings.forSession(session?.id) || null; } catch { return null; }
 }
 
 // A bindings file we cannot read is not a bare 503.
@@ -40,7 +60,7 @@ function bindingsUnreadable(bindings, cause) {
   console.warn(`[codex] ${bindings.file} could not be read (${reason}); refusing standalone Codex launches that may be bound`);
   return new ApiError(409, 'codex-bindings-unreadable',
     'codex-bindings.json could not be read, so AM cannot tell whether this Codex session is bound to a shared thread '
-    + 'and will not start a standalone one that could write to a thread the shared server owns. '
+    + 'and will not resume one that could become a second writer on a thread the shared server owns. '
     + 'Repair that file, or remove it to unbind every shared task (each can then be added again), and retry. '
     + 'Agents other than Codex are unaffected.',
     { reason, details: [{ field: 'path', message: 'codex-bindings.json' }] });
@@ -56,7 +76,7 @@ function bindingsUnreadable(bindings, cause) {
 export function sharedBinding(session, bindings = codexBindings) {
   try { return bindings.forSession(session.id); }
   catch (error) {
-    if (bindingCouldExist(session)) throw bindingsUnreadable(bindings, error);
+    if (unsafeWithoutBindings(session)) throw bindingsUnreadable(bindings, error);
     return null;
   }
 }

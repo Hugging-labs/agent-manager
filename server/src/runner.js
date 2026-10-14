@@ -1,4 +1,4 @@
-import { assertCodexLaunchAllowed, boundOrUnknown, sharedBinding } from './codex-launch-policy.js';
+import { assertCodexLaunchAllowed, boundOrUnknown, sharedBinding, bindingIfKnown } from './codex-launch-policy.js';
 import { fileURLToPath } from 'node:url';
 import { ApiError } from './api-errors.js';
 import os from 'node:os';
@@ -2381,7 +2381,7 @@ export async function restart(session, timeoutMs = 15_000) {
 /** Stop a session entirely (kills the process; viewers get an exit close code). */
 export function stop(id) {
   const stopTarget = list().find((s) => s.id === id);
-  if (stopTarget?.cli === 'codex' && sharedBinding(stopTarget)) throw new ApiError(409, 'codex-shared-stop-unsupported',
+  if (stopTarget?.cli === 'codex' && bindingIfKnown(stopTarget)) throw new ApiError(409, 'codex-shared-stop-unsupported',
     'This task runs on the shared server. Close the terminal view or use Codex to interrupt the current turn.');
   const host = hosts.get(id);
   if (!host) return;
