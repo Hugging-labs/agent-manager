@@ -11,6 +11,11 @@ image), Python, and a C/C++ toolchain for the native terminal dependencies.
 Claude Code needs Node 22+ and OpenClaw refuses to install below 24.16, so an
 older Node fails partway through installing the CLIs rather than up front.
 
+```bash
+git clone https://github.com/huggingface/agent-manager.git
+cd agent-manager
+```
+
 The Dockerfile installs the coding CLIs for a Space; `npm ci` does not. A shell
 session works without any of them, but for a real local deployment install them
 explicitly:
@@ -27,13 +32,8 @@ required and a failure stops the run; Gemini, opencode and OpenClaw are
 best-effort, exactly as in the container image, and anything that does not
 install is listed at the end and shown as unavailable in the app. Put that
 prefix's `bin` on the server's `PATH` and restart — availability is read once at
-startup. The app's first-run window says all of this too, and links the script
-when it finds no CLIs installed.
-
-```bash
-git clone https://github.com/huggingface/agent-manager.git
-cd agent-manager
-```
+startup. With no CLIs installed the app's first-run window shows this same
+command to copy, and points back here.
 
 Start the backend from the repository root:
 

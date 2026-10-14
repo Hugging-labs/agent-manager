@@ -141,7 +141,8 @@ export default function WelcomeSetup({
           <p className="setup-note">
             Put that prefix's <span className="mono">bin</span> on the server's{' '}
             <span className="mono">PATH</span> and restart it — availability is read once at
-            startup. See <b>Local installation</b> in the README for the whole list.
+            startup. <b>Run the source locally</b> in{' '}
+            <span className="mono">docs/development.md</span> has the whole list.
           </p>
         </div>
       )}

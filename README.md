@@ -40,8 +40,8 @@ terminal, and pick up from another device while your Space stays running.
   upload documents or screenshots, and keep a shell beside your agents.
 - **Give agents shared context.** Manage reusable skills in one place and let
   agents discover, message, and wait for other sessions through the local API.
-- **Keep the agents current.** Update each CLI from **Settings → Agents** without
-  rebuilding the Space.
+- **Keep the agents current.** Update each CLI from **Settings → General →
+  Agents** without rebuilding the Space.
 - **Check usage and schedule work.** See token usage, estimated costs, and
   available quota information; schedule prompts and enable device notifications.
   Available usage details vary by provider.
@@ -68,7 +68,7 @@ keeps your files, logins, and conversation history across restarts.
 3. Once the Space is running, open the app. The **first-run window** lists the
    agents in your image, shows which are ready, and walks you through connecting
    one — either by opening a session and following its sign-in, or by adding an
-   API key as a Space secret. Reopen it any time from **Settings**.
+   API key as a Space secret. Reopen it from **Settings → General → Show guide**.
 
    For **Codex**, choose **Sign in with Device Code** in the session. Its
    ChatGPT option redirects to `localhost` on the machine the agent runs on,
