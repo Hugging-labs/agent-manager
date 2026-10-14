@@ -196,7 +196,7 @@ Logging in interactively inside a terminal works too — credentials are written
 ## Local development
 
 ```bash
-# backend (needs node >= 20.19 for libghostty-vt; only the Shell CLI works offline)
+# backend (needs Node 24.16+, matching the container image; only the Shell CLI works offline)
 cd server && npm install && npm run dev
 
 # frontend (proxies /api and /ws to the backend on :7860)
@@ -213,6 +213,8 @@ run when the backend is launched directly by Node or systemd:
 # Or install only selected CLIs:
 ./scripts/install-local-clis.sh opencode codex
 ```
+
+Use Node 24.16 or later, the same major version as the container image. Claude Code needs Node 22+, and OpenClaw refuses to install below 24.16, so an older Node fails partway through rather than up front.
 
 The script installs into `${NPM_CONFIG_PREFIX:-$HOME/.local}`. Claude and Codex
 are required and a failure stops the run; Gemini, opencode and OpenClaw are
