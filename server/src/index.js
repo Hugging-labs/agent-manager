@@ -18,10 +18,11 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import { createRequestPolicy, requestAdmission, terminalUpgrade, REQUEST_HEADERS } from './request-admission.js';
 import {
-  PORT, PUBLIC_DIR, DATA_DIR, WORKSPACES_DIR, SKILLS_DIR, STATE_DIR,
+  PORT, BIND_HOST, INTERNAL_HOST, PUBLIC_DIR, DATA_DIR, WORKSPACES_DIR, SKILLS_DIR, STATE_DIR,
   ensureDirs, cliCatalog, cliById, slugify, workspacePath, refreshVersions, PASSIVE_CLIS, isRemote,
 } from './config.js';
 import { createSkillsService, skillTargetDirs } from './skills.js';
+import { cliUpdateStatus, startCliUpdate, configureCliUpdate } from './cli-update.js';
 import * as remote from './remote.js';
 import * as store from './sessions.js';
 import * as groups from './groups.js';
@@ -34,7 +35,7 @@ import * as crons from './crons.js';
 import { ensureClaudeDialogDefaults, trustWorkspacesRoot } from './first-run.js';
 import {
   attach, agentInfo, deriveState, stop, stopAll, ensureRunning, sendInput, pasteInput, isRunning,
-  waitForInputReady, capturePane, ghosttyReady, ghosttyError,
+  waitForInputReady, capturePane, ghosttyReady, ghosttyError, startedAt, restart as restartSession,
   installClaudeRepinHook, installOpencodeRepinPlugin,
 } from './runner.js';
 
@@ -70,7 +71,7 @@ import { fileWriteError, receiveWorkspaceFile, replaceWorkspaceText } from './sa
 // frozen event loop here, and nothing else in the stack can see it. See slowfs.js.
 installSlowFsProbe();
 
-const requestPolicy = createRequestPolicy();
+const requestPolicy = createRequestPolicy(process.env, INTERNAL_HOST);
 ensureDirs();
 refreshVersions();
 store.init();
@@ -144,7 +145,10 @@ function ensureClaudeStatusline() {
     let s = {};
     try { s = JSON.parse(fs.readFileSync(p, 'utf8')); } catch {}
     const script = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'claude-statusline.mjs');
-    s.statusLine = { type: 'command', command: `node ${script}`, padding: 0 };
+    // Quoted: a checkout whose path contains a space would otherwise split into
+    // extra arguments and the statusline command would never run.
+    const quoted = `'${script.replace(/'/g, `'\\''`)}'`;
+    s.statusLine = { type: 'command', command: `node ${quoted}`, padding: 0 };
     fs.writeFileSync(p, JSON.stringify(s, null, 2));
   } catch {}
 }
@@ -516,6 +520,61 @@ api.get('/api/codex/client-target', async (req, res) => {
     res.set('Cache-Control', 'no-store').json({ ...context, socket: endpoint.socket, codexHome: endpoint.home });
   } catch (error) { throw contextError(error); }
   finally { client?.close(); }
+});
+
+// Install the latest CLIs in place. Behind the same admission as every other
+// mutating route (app.use(requestAdmission) above), so it is not reachable from
+// a file preview or an untrusted page.
+//
+// The update restarts the panes running the CLI it replaced — a running process
+// keeps the binary it was exec'd with, so without that the button changes
+// nothing the operator can see. That is announced before the install, with the
+// panes named and their state shown, and it is the operator's call: a `waiting`
+// pane costs nothing, a `working` one loses what it was mid-way through.
+configureCliUpdate({
+  panes: (cli) => {
+    const info = agentInfo();
+    return store.list()
+      .filter((s) => s.cli === cli && isRunning(s.id))
+      .map((s) => ({ id: s.id, name: s.name, state: deriveState(s, info.get(s.id)) }));
+  },
+  restart: async (id) => {
+    const s = store.get(id);
+    if (!s) throw new Error('the session no longer exists');
+    await restartSession(s);
+  },
+});
+
+// Panes still on a replaced binary: one we could not restart, or one that was
+// opened while the install was in flight. Normally empty — it is here so a
+// failed restart cannot pass for a finished update.
+function staleAfterUpdate(status) {
+  const info = agentInfo();
+  return status.items.flatMap((item) => {
+    if (status.runningId === item.id) return [];
+    if (!item.installedAt || (item.state !== 'updated' && item.state !== 'installed')) return [];
+    return store.list()
+      .filter((s) => s.cli === item.id && isRunning(s.id) && (startedAt(s.id) || 0) < item.installedAt)
+      .map((s) => ({ id: s.id, name: s.name, cli: s.cli, state: deriveState(s, info.get(s.id)) }));
+  });
+}
+
+const cliUpdateView = () => {
+  const status = cliUpdateStatus();
+  return { ...status, stale: staleAfterUpdate(status) };
+};
+
+api.get('/api/clis/update', (_req, res) => res.json(cliUpdateView()));
+
+api.post('/api/clis/update', (req, res) => {
+  const id = String((req.body || {}).id || '');
+  const refused = startCliUpdate(id);
+  if (refused === 'not-updatable') {
+    return res.status(400).json({ error: `'${id}' is not a CLI this box installs through npm — see GET /api/clis/update` });
+  }
+  // One at a time: two `npm install -g` into the same prefix corrupt it.
+  if (refused) return res.status(409).json({ error: 'a CLI update is already running' });
+  res.json(cliUpdateView());
 });
 
 api.get('/api/usage', async (req, res) => res.json(await buildUsage(req.query.debug === '1', req.query.provider || null)));
@@ -1940,7 +1999,7 @@ its headers before resuming, without automatically replaying an uncertain write.
 - You can see them, watch them, and talk to them — see the next section.
 
 ## Working with the other agents
-The manager exposes a small HTTP API on \`localhost:\${AM_PORT:-${PORT}}\`. You are \`$AM_ID\`
+The manager exposes a small HTTP API on \`\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}\`. You are \`$AM_ID\`
 (\`$AM_NAME\` is your display name). Every call that changes something takes
 \`?from=$AM_ID\` so the other agent, and the operator reading the log later, can
 tell who asked. The manager durably records these operations and their outcomes,
@@ -1952,7 +2011,7 @@ deleting a source does not delete its audit copy, and older records were not rew
 To reconstruct recent manager operations (newest first):
 
 \`\`\`sh
-curl -s -H 'X-AM-Request: 1' "http://localhost:\${AM_PORT:-${PORT}}/api/operations?limit=100" | jq .operations
+curl -s -H 'X-AM-Request: 1' "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/operations?limit=100" | jq .operations
 \`\`\`
 
 ### Resolve the identity of a shared Codex thread
@@ -1977,7 +2036,7 @@ is required because the Space clock is UTC. Create one with your own id so the
 operation log records who asked:
 
 \`\`\`sh
-curl -sS -H 'X-AM-Request: 1' --fail -X POST "http://localhost:\${AM_PORT:-${PORT}}/api/crons?from=$AM_ID" \\
+curl -sS -H 'X-AM-Request: 1' --fail -X POST "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/crons?from=$AM_ID" \\
   -H 'content-type: application/json' -d '{
     "name":"weekday issue triage",
     "agent":{"name":"triage","cli":"claude"},
@@ -1985,7 +2044,7 @@ curl -sS -H 'X-AM-Request: 1' --fail -X POST "http://localhost:\${AM_PORT:-${POR
     "schedule":{"cron":"0 9 * * 1-5","tz":"Europe/Zurich"},
     "runOnRestart":true
   }'
-curl -s -H 'X-AM-Request: 1' "http://localhost:\${AM_PORT:-${PORT}}/api/crons" | jq .crons
+curl -s -H 'X-AM-Request: 1' "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/crons" | jq .crons
 \`\`\`
 
 Use \`POST /api/crons/$ID/run?from=$AM_ID\` to run now,
@@ -2010,11 +2069,11 @@ OpenClaw expose tokens and estimated model cost; they have no single quota
 because sessions may use different providers:
 
 \`\`\`sh
-curl -s -H 'X-AM-Request: 1' "http://localhost:\${AM_PORT:-${PORT}}/api/usage?provider=claude" | jq .providers.claude
-curl -s -H 'X-AM-Request: 1' "http://localhost:\${AM_PORT:-${PORT}}/api/usage?provider=codex" | jq .providers.codex
-curl -s -H 'X-AM-Request: 1' "http://localhost:\${AM_PORT:-${PORT}}/api/usage?provider=opencode" | jq .providers.opencode
-curl -s -H 'X-AM-Request: 1' "http://localhost:\${AM_PORT:-${PORT}}/api/usage?provider=hermes" | jq .providers.hermes
-curl -s -H 'X-AM-Request: 1' "http://localhost:\${AM_PORT:-${PORT}}/api/usage?provider=openclaw" | jq .providers.openclaw
+curl -s -H 'X-AM-Request: 1' "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/usage?provider=claude" | jq .providers.claude
+curl -s -H 'X-AM-Request: 1' "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/usage?provider=codex" | jq .providers.codex
+curl -s -H 'X-AM-Request: 1' "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/usage?provider=opencode" | jq .providers.opencode
+curl -s -H 'X-AM-Request: 1' "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/usage?provider=hermes" | jq .providers.hermes
+curl -s -H 'X-AM-Request: 1' "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/usage?provider=openclaw" | jq .providers.openclaw
 \`\`\`
 
 These values reflect local calls made from this Space, as of each harness's
@@ -2023,7 +2082,7 @@ read-only call, so it does not take \`?from=\`.
 
 ### See who is here
 \`\`\`sh
-curl -s -H 'X-AM-Request: 1' "http://localhost:\${AM_PORT:-${PORT}}/api/agents?from=$AM_ID" | jq .
+curl -s -H 'X-AM-Request: 1' "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/agents?from=$AM_ID" | jq .
 \`\`\`
 Each entry carries \`id\`, \`name\`, \`cli\`, \`state\`, \`workdir\`, \`sharesFolderWith\`,
 a one-line \`lastPrompt\`/\`lastAnswer\`, \`recentFiles\`, and \`trace\` — the path to
@@ -2058,8 +2117,8 @@ Read \`state\` before you do anything:
 
 ### Watch instead of asking
 \`\`\`sh
-curl -s -H 'X-AM-Request: 1' "http://localhost:\${AM_PORT:-${PORT}}/api/agents/$ID/tail?lines=120" | jq -r .text
-curl -s -H 'X-AM-Request: 1' "http://localhost:\${AM_PORT:-${PORT}}/api/agents/$ID/wait?timeout=300&settle=15&from=$AM_ID"
+curl -s -H 'X-AM-Request: 1' "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/agents/$ID/tail?lines=120" | jq -r .text
+curl -s -H 'X-AM-Request: 1' "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/agents/$ID/wait?timeout=300&settle=15&from=$AM_ID"
 \`\`\`
 \`tail\` returns that agent's screen and scrollback — exactly what a human would
 see in its pane. \`wait\` BLOCKS until the agent has held one of \`state\`
@@ -2083,22 +2142,24 @@ background (Claude Code: \`run_in_background\`), so you stay free meanwhile and
 are woken once, when the peer is genuinely finished.
 
 \`\`\`sh
-( until curl -s -H 'X-AM-Request: 1' "http://localhost:\${AM_PORT:-${PORT}}/api/agents/$ID/wait?timeout=300&settle=15&from=$AM_ID" \\
+( until curl -s -H 'X-AM-Request: 1' "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/agents/$ID/wait?timeout=300&settle=15&from=$AM_ID" \\
         > /tmp/wait-$ID.json \\
      && jq -e '.matched or .state == "gone" or has("error")' /tmp/wait-$ID.json >/dev/null
   do sleep 2; done ) >/dev/null 2>&1 &
 \`\`\`
 When that exits, \`/tmp/wait-$ID.json\` holds the last answer: \`matched: true\`
-is finished, \`"state":"gone"\` means the session was deleted, \`error\` means the
-id is wrong. Read the file — do not start polling \`/api/agents\` instead. (The
+means it stopped, \`"state":"gone"\` means the session was deleted, \`error\` means
+the id is wrong. Read the file — do not start polling \`/api/agents\` instead. (The
 \`sleep 2\` costs nothing when \`wait\` is doing its job, and keeps the loop from
 spinning if the manager is briefly unreachable; it is inside the background
 subshell, so nothing of yours is blocked by it.)
 
-**This is the main pattern.** If you hand work to another agent, YOU watch it
-with \`tail\`/\`wait\` — start that loop as soon as you have its id. It does not
-have to report back, you must not sit in a loop asking it whether it's done, and
-never wait with \`sleep\`: long foreground sleeps can destabilize a session.
+\`matched\` means the agent STOPPED, not that it succeeded — a CLI that rejects
+its own flags fails in a second and lands back at its input box, which from the
+outside is indistinguishable from finished. Read \`tail\` afterwards and judge the
+work, not the state. The peer does not have to report back, you must not sit in a
+loop asking whether it's done, and never wait with \`sleep\`: long foreground
+sleeps can destabilize a session.
 
 ### Send an agent a prompt
 Send the text as the request **body** so quoting and newlines never bite you.
@@ -2107,12 +2168,18 @@ exact body for retries. Shared Codex destinations require \`X-AM-Message-Id\`
 (or \`requestId\` in a JSON body). Do not regenerate the UUID after a timeout:
 \`\`\`sh
 AM_MESSAGE_ID=$(node -e 'process.stdout.write(require("node:crypto").randomUUID())')
-curl -s -H 'X-AM-Request: 1' -X POST "http://localhost:\${AM_PORT:-${PORT}}/api/agents/$ID/prompt?from=$AM_ID" \\
+curl -s -H 'X-AM-Request: 1' -X POST "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/agents/$ID/prompt?from=$AM_ID" \\
   -H "X-AM-Message-Id: $AM_MESSAGE_ID" \\
   -H 'content-type: text/plain' --data-binary @- <<'EOF'
 Please run the test suite in your folder and fix whatever fails.
 EOF
 \`\`\`
+**A task you hand over is still yours.** Dispatching and watching are one step:
+start the background \`wait\` loop from **Watch instead of asking** with the id you
+just prompted, then \`tail\` it and act on what it actually produced. Your turn is
+not finished when the prompt is sent — it is finished when you have the result.
+Never report work as done that you only delegated.
+
 It arrives prefixed with \`[message from $AM_NAME:]\`. A shared Codex destination
 also receives the exact AM source ID and native thread ID when available, through
 its native input queue. Known busy destinations refuse delivery. If another
@@ -2149,7 +2216,7 @@ with source attribution. A missing ID is refused. An uncertain creation must
 be inspected, never repeated with a new ID. This does not fork the history.
 
 \`\`\`sh
-curl -s -H 'X-AM-Request: 1' -X POST "http://localhost:\${AM_PORT:-${PORT}}/api/agents?cli=claude&name=reviewer&from=$AM_ID" \\
+curl -s -H 'X-AM-Request: 1' -X POST "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/agents?cli=claude&name=reviewer&from=$AM_ID" \\
   -H 'content-type: text/plain' --data-binary @- <<'EOF'
 Review the diff in /data/workspaces/api and report anything that would break in production.
 EOF
@@ -2163,10 +2230,10 @@ to leave it ungrouped. The prompt is required — it starts working on it
 immediately. Spawn one agent for one clearly separable job; several agents in
 one folder is fine, but this Space is a small CPU box, so don't build a fleet.
 
-The response carries the new agent's \`id\`. Capture it and start the background
-\`wait\` loop from **Watch instead of asking** right then: launching is the
-moment you choose how you will find out it finished, and nothing else will tell
-you.
+The response carries the new agent's \`id\`. A launch carries a prompt, so it is a
+dispatch and the rule under **Send an agent a prompt** applies: capture the id,
+start the background \`wait\` loop right then — nothing else will tell you it
+finished — and read its screen before you call the job done.
 
 **Into a NEW group** — e.g. "start four agents in a group called taskforce".
 \`group=\` only ever selects a group that already exists; an unknown name is
@@ -2174,14 +2241,15 @@ refused rather than created, so a typo can't quietly fragment the sidebar. Make
 the group first, then spawn into it:
 
 \`\`\`sh
-GID=$(curl -sS -H 'X-AM-Request: 1' --fail -X POST "http://localhost:\${AM_PORT:-${PORT}}/api/groups?from=$AM_ID" \\
+GID=$(curl -sS -H 'X-AM-Request: 1' --fail -X POST "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/groups?from=$AM_ID" \\
   -H 'content-type: application/json' -d '{"name":"taskforce"}' | jq -r .id)
 
-curl -sS -H 'X-AM-Request: 1' --fail -X POST "http://localhost:\${AM_PORT:-${PORT}}/api/agents?cli=claude&group=$GID&from=$AM_ID" \\
+curl -sS -H 'X-AM-Request: 1' --fail -X POST "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/agents?cli=claude&group=$GID&from=$AM_ID" \\
   -H 'content-type: text/plain' --data-binary 'Draft the migration plan.'
 \`\`\`
 
-Spawn them one at a time, each with its own prompt, reusing \`$GID\`. Prefer the
+Spawn them one at a time, each with its own prompt, reusing \`$GID\`, arming each
+one's watch as you go: four dispatches are four results to read. Prefer the
 returned id over the name here: nothing stops two groups sharing a name, and
 \`group=<name>\` takes the first match. Group creation changes manager state, so
 it carries \`?from=$AM_ID\` like every other mutating agent call; this preserves
@@ -2189,7 +2257,7 @@ the origin for the operation log.
 
 ### Stop an agent
 \`\`\`sh
-curl -s -H 'X-AM-Request: 1' -X POST "http://localhost:\${AM_PORT:-${PORT}}/api/agents/$ID/stop?from=$AM_ID"
+curl -s -H 'X-AM-Request: 1' -X POST "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/agents/$ID/stop?from=$AM_ID"
 \`\`\`
 **Only when the operator asked you to.** It kills that agent's CLI mid-thought.
 Files and conversation survive, and a later prompt resumes it, but work in
@@ -2201,7 +2269,7 @@ a GPU box — not in this container. They appear in the roster like anyone else 
 you message them the same way:
 
 \`\`\`sh
-curl -s -H 'X-AM-Request: 1' -X POST "http://localhost:\${AM_PORT:-${PORT}}/api/agents/$ID/prompt?from=$AM_ID" \\
+curl -s -H 'X-AM-Request: 1' -X POST "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/agents/$ID/prompt?from=$AM_ID" \\
   -H 'content-type: text/plain' --data-binary 'can you check the tokenizer?'
 \`\`\`
 
@@ -2221,7 +2289,9 @@ What is different about them:
 - **You cannot spawn one.** Creating one requires a human to paste its connect
   prompt onto another machine.
 - Replies can be slow in a way that is normal: the agent is on someone's laptop,
-  which sleeps, drops off wifi, and closes lids. Ask once and move on.
+  which sleeps, drops off wifi, and closes lids. Ask once rather than nagging —
+  but a task handed to one is still yours: its answer lands in that folder, and
+  you have no result until you have read it there.
 
 ## Shared skills
 - Reusable skills live in \`/data/workspaces/skills/\`. Create and publish them through the Skills editor or \`/api/skills\`: POST creates only; GET returns the revision required by PUT/DELETE in \`If-Match\`. If you edit a source through Files or on disk, review its current contents in Skills and explicitly Save to publish it. Startup leaves unreviewed source edits and independently modified installations untouched. This \`environment.md\` is generated from the Space configuration and read-only; put your own instructions in a separate skill. Read skills for project conventions and recurring tasks.
@@ -2266,7 +2336,7 @@ operator explicitly asked for it in their prompt (e.g. "notify me when the
 tests pass") — send exactly ONE message when that condition is met:
 
 \`\`\`sh
-curl -s -H 'X-AM-Request: 1' -X POST "http://localhost:\${AM_PORT:-${PORT}}/api/notify?from=$AM_ID" \\
+curl -s -H 'X-AM-Request: 1' -X POST "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/notify?from=$AM_ID" \\
   -H 'content-type: application/json' \\
   -d "{\\"title\\":\\"$AM_NAME\\",\\"body\\":\\"<one-line outcome>\\"}"
 \`\`\`
@@ -2279,7 +2349,7 @@ For DELAYED notifications ("notify me in 10 minutes"), do not block on a long
 immediately (long-running foreground execs can destabilize some sessions):
 
 \`\`\`sh
-(sleep 600 && curl -s -H 'X-AM-Request: 1' -X POST "http://localhost:\${AM_PORT:-${PORT}}/api/notify?from=$AM_ID" \\
+(sleep 600 && curl -s -H 'X-AM-Request: 1' -X POST "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/notify?from=$AM_ID" \\
   -H 'content-type: application/json' \\
   -d "{\\"title\\":\\"$AM_NAME\\",\\"body\\":\\"reminder\\"}") >/dev/null 2>&1 &
 \`\`\`
@@ -3643,7 +3713,7 @@ server.on('error', (e) => {
   // (Seen on Spaces dev mode: it restarts the app in the same container while
   // the previous, healthy node still holds the port.)
   if (e && e.syscall === 'listen') {
-    console.error(`[fatal] cannot listen on :${PORT} — something else is probably already bound to it. Exiting 1.`);
+    console.error(`[fatal] cannot listen on ${BIND_HOST}:${PORT} — something else is probably already bound to it. Exiting 1.`);
     process.exit(1);
   }
 });
@@ -3807,15 +3877,15 @@ setTimeout(() => {
   });
 }, 8000);
 
-server.listen(PORT, process.env.AM_BIND_HOST || undefined, () => {
-  console.log(`Agent Manager :${PORT}  engine=libghostty${ghosttyReady() ? '' : ' (UNAVAILABLE)'}  data=${DATA_DIR}`);
+server.listen(PORT, BIND_HOST, () => {
+  console.log(`Agent Manager ${BIND_HOST}:${PORT}  engine=libghostty${ghosttyReady() ? '' : ' (UNAVAILABLE)'}  data=${DATA_DIR}`);
   console.log('⚠  No authentication: this app trusts whoever can reach it.');
   console.log('   Keep this Space PRIVATE — a public instance gives anyone a shell + your logged-in agents.');
   // Scheduled fires use the public cron-run route too. That keeps one execution
   // path and gives the operations log a first-class `cron:<id>` origin instead
   // of inventing a session that does not exist.
   crons.startScheduler(async (id, trigger) => {
-    const response = await fetch(`http://127.0.0.1:${PORT}/api/crons/${encodeURIComponent(id)}/run?trigger=${trigger}`, {
+    const response = await fetch(`http://${INTERNAL_HOST}:${PORT}/api/crons/${encodeURIComponent(id)}/run?trigger=${trigger}`, {
       method: 'POST', headers: { ...REQUEST_HEADERS, 'x-am-origin': `cron:${id}` },
     });
     if (!response.ok) {

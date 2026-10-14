@@ -3,6 +3,7 @@
 // Configuration is administrator-owned, separate from the thread environment.
 import fs from 'node:fs';
 import os from 'node:os';
+import { isIP } from 'node:net';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -13,7 +14,9 @@ export function readConfig(file) {
 }
 export function localOrigin(baseUrl) {
   const url = new URL(baseUrl);
-  if (url.protocol !== 'http:' || !['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname)
+  const loopback = ['[::1]', 'localhost'].includes(url.hostname)
+    || (isIP(url.hostname) === 4 && url.hostname.startsWith('127.'));
+  if (url.protocol !== 'http:' || !loopback
       || url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
     throw new Error('Configure a local AM HTTP origin in baseUrl.');
   }

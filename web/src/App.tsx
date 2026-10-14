@@ -19,6 +19,7 @@ import { LOCKED_EVENT, createLockTracker, type LockAnnouncement } from './lib/lo
 import BackupBanner from './components/BackupBanner';
 import OverviewSearchBox from './components/OverviewSearchBox';
 import Welcome from './components/Welcome';
+import { configuredCount, keepOffering } from './components/WelcomeSetup';
 import * as api from './api';
 import { pinnedSessionIds } from './lib/pinned';
 import { quietSessionIds } from './lib/idleWindow';
@@ -116,6 +117,11 @@ const writeStored = (k: string, v: string | null) => {
 
 export default function App() {
   const [clis, setClis] = useState<Cli[]>([]);
+  // Re-read after anything that can change a CLI's version or availability —
+  // today, Settings installing the latest ones in place. Without this the
+  // Agents list goes on showing the version that was there at page load, right
+  // next to a report saying it was replaced.
+  const refreshClis = useCallback(() => { api.getClis().then(setClis).catch(() => {}); }, []);
   const [tree, setTree] = useState<Tree>({ order: [], groups: [], sessions: [], hidden: [] });
   // Restored from the last visit, then re-validated against the tree once it
   // loads (the agent may be long gone). focusedId comes back too, so a group
@@ -436,12 +442,28 @@ export default function App() {
   // Fires once so dismissing it during a demo doesn't make it re-pop.
   const welcomeBoot = useRef(false);
   useEffect(() => {
-    if (!info || welcomeBoot.current) return;
+    // Wait for the catalog too: whether anything is configured decides both
+    // whether this opens and which step it opens on.
+    if (!info || !clis.length || welcomeBoot.current) return;
     welcomeBoot.current = true;
-    if (!info.locked && (info.welcomeSeen === false || info.demoMode)) setShowWelcome(true);
-  }, [info]);
+    if (info.locked) return;
+    // "Seen once" is the right rule for a tour and the wrong one for setup. An
+    // operator who dismisses this before configuring anything would otherwise
+    // have no way back except finding it in Settings, so it returns on each
+    // load until at least one agent works. It still opens only once per load,
+    // so dismissing it does not make it re-pop while they are working.
+    if (info.welcomeSeen === false || info.demoMode) setShowWelcome(true);
+  }, [info, clis]);
   const dismissWelcome = () => {
     setShowWelcome(false);
+    // "Seen once" is the right rule for a tour and the wrong one for setup.
+    // Closing it with nothing configured is not a decision to never see it
+    // again — there is no working agent yet, so there is nothing else to do
+    // here — and recording it would leave no way back but Settings. So the
+    // flag is only written once an agent actually works, and until then this
+    // opens again on the next load. Within a load it stays closed, so it
+    // cannot nag.
+    if (keepOffering(clis)) return;
     setInfo((i) => (i ? { ...i, welcomeSeen: true } : i));
     api.dismissWelcome().catch(() => {});
   };
@@ -489,7 +511,7 @@ export default function App() {
   };
 
   useEffect(() => {
-    api.getClis().then(setClis).catch(() => {});
+    refreshClis();
     const manager = createLatestRefresh(
       (signal) => api.getTree(signal),
       (next) => { setTree(next); setTreeLoaded(true); },
@@ -1214,6 +1236,7 @@ export default function App() {
             theme={theme}
             onToggleTheme={toggleTheme}
             clis={clis}
+            onClisChanged={refreshClis}
             info={info}
             onShowWelcome={openWelcome}
             onOpenSharedTrace={openSharedTrace}
@@ -1228,7 +1251,20 @@ export default function App() {
         along — but the history it keeps still shows the displacement happening. */}
     {VV_DEBUG && <Suspense fallback={null}><ViewportDebug /></Suspense>}
     <div className={`app${settingsOpen ? ' app-suspended' : ''}${isMobile ? (mobileStage ? ' m-stage' : ' m-home') : ''}`}>
-      {showWelcome && <Welcome onClose={dismissWelcome} />}
+      {showWelcome && (
+        <Welcome
+          onClose={dismissWelcome}
+          clis={clis}
+          spaceId={info?.spaceId ?? null}
+          presentSecrets={info?.secrets || []}
+          bucketUnverified={!!info?.bucketUnverified}
+          onStartSession={(cli) => {
+            dismissWelcome();
+            const label = cliMap[cli]?.label || cli;
+            newSession(label, cli, lastPath).catch(() => {});
+          }}
+        />
+      )}
       {toast && <div className="toast mono" role="alert">{toast}</div>}
       {/* A settings save that failed after its panel was closed. The panel's own
           flag says it while it is open, so this is the case the panel cannot

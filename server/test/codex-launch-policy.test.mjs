@@ -8,7 +8,7 @@ process.env.DATA_DIR=root;
 delete process.env.AM_CODEX_BINDINGS_PILOT;
 delete process.env.AM_CODEX_SHARED_CREATE;
 const {codexLaunchBlock,assertCodexLaunchAllowed,assertLegacyCodexCreationAllowed}=await import('../src/codex-launch-policy.js');
-const {commandFor,ensureRunning}=await import('../src/runner.js');
+const {commandFor,ensureRunning,restart}=await import('../src/runner.js');
 const {SessionRuntime}=await import('../src/session-runtime.js');
 const unbound={forSession:()=>null};
 const bound={forSession:()=>({threadId:'11111111-1111-4111-8111-111111111111'})};
@@ -51,4 +51,10 @@ test('Reader exposes same-thread migration without claiming a running TUI stoppe
   assert.equal(codexLaunchBlock({...session,codexSessionId:null},unbound).previewUrl,null);
   assert.throws(()=>codexLaunchBlock(session,{forSession(){throw Error('unavailable')}}));
  }finally{delete process.env.AM_CODEX_BINDINGS_PILOT;}
+});
+
+test('CLI update restart refuses legacy Codex before stopping or relaunching', async () => {
+  process.env.AM_CODEX_BINDINGS_PILOT='1';
+  try { await assert.rejects(restart(session), {code:'codex-migration-required'}); }
+  finally { delete process.env.AM_CODEX_BINDINGS_PILOT; }
 });

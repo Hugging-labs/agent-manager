@@ -1,10 +1,22 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
+import type { Cli } from '../types';
 import { AmMark, PlusGlyph, PulseGlyph, KeyGlyph, GridGlyph, BellGlyph, LockGlyph } from './icons';
 import WelcomeDiagram from './WelcomeDiagram';
+import WelcomeSetup, { configuredCount } from './WelcomeSetup';
 
-// First-run welcome: one scrollable card covering the things a newcomer can't
-// guess. Shown once per Space (server-flagged) and reopenable from Settings.
+// First-run welcome, in two steps inside ONE card.
+//
+// Setup comes first and the tour second, rather than beside it as a second
+// modal. A new operator's first question is not what the product does, it is
+// how to make one agent answer them — and the tour already promises help with
+// login ("it walks you through login on first launch") that it does not give.
+// Setup is the missing half of a story the tour starts, so it belongs in the
+// same window, ahead of it.
+//
+// Which step opens is a question about this Space, not about this person: with
+// nothing configured there is nothing a tour can usefully describe, so setup
+// opens. Once an agent works, the tour opens as before.
 const ITEMS: { icon: ReactNode; title: string; body: ReactNode }[] = [
   {
     icon: <PulseGlyph />,
@@ -38,9 +50,19 @@ const ITEMS: { icon: ReactNode; title: string; body: ReactNode }[] = [
   },
 ];
 
-export default function Welcome({ onClose }: { onClose: () => void }) {
+export default function Welcome({
+  onClose, clis, spaceId, presentSecrets, bucketUnverified, onStartSession,
+}: {
+  onClose: () => void;
+  clis: Cli[];
+  spaceId: string | null;
+  presentSecrets: string[];
+  bucketUnverified: boolean;
+  onStartSession: (cli: string) => void;
+}) {
   const cardRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
+  const [step, setStep] = useState<'setup' | 'tour'>(() => (configuredCount(clis) ? 'tour' : 'setup'));
   // Accessible dialog: focus into it on open, close on Escape, and trap Tab so
   // focus can't wander to the (invisible) page behind the modal.
   useEffect(() => {
@@ -60,6 +82,14 @@ export default function Welcome({ onClose }: { onClose: () => void }) {
   return (
     <div className="welcome-backdrop" onClick={onClose}>
       <div className="welcome-card" role="dialog" aria-modal="true" aria-labelledby="welcome-title" ref={cardRef} onClick={(e) => e.stopPropagation()}>
+        {step === 'setup' ? (
+          <WelcomeSetup
+            clis={clis} spaceId={spaceId} presentSecrets={presentSecrets}
+            bucketUnverified={bucketUnverified}
+            onStartSession={onStartSession} onTour={() => setStep('tour')} onClose={onClose}
+          />
+        ) : (
+        <>
         <div className="welcome-head">
           <span className="welcome-mark"><AmMark /></span>
           <div>
@@ -80,9 +110,12 @@ export default function Welcome({ onClose }: { onClose: () => void }) {
           ))}
         </div>
         <div className="welcome-foot">
+          <button className="btn-ghost" onClick={() => setStep('setup')}>← Set up agents</button>
           <span className="welcome-reopen mono">reopen anytime from Settings</span>
           <button className="btn-primary" ref={closeRef} onClick={onClose}>Get started</button>
         </div>
+        </>
+        )}
       </div>
     </div>
   );

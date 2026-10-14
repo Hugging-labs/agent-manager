@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import { remoteState, setPaused } from './remote.js';
 import { fxSessionForPid } from './fx-process.js';
-import { cliById, cliVersion, isRemote, PORT, STATE_DIR, WORKSPACES_DIR } from './config.js';
+import { cliById, cliVersion, isRemote, INTERNAL_HOST, PORT, STATE_DIR, WORKSPACES_DIR } from './config.js';
 import { update, list } from './sessions.js';
 import { captureOpencodeSession, opencodeSessionExists, opencodeSessionInfo, readTrace,
   captureFxSession } from './traces.js';
@@ -45,12 +45,27 @@ const TERM_ENV = {
   LANG: process.env.LANG || 'C.UTF-8',
 };
 
+// Resolve app-owned helpers from the checkout rather than assuming the Docker
+// layout. In the image this is /app/scripts; in a local install it is the
+// repository's scripts directory.
+const APP_SCRIPTS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'scripts');
+const appScript = (name) => path.join(APP_SCRIPTS_DIR, name);
+
+// Single-quote a value for a shell command line. Hoisted from further down so
+// the bash launch below can use it as well.
+const shq = (t) => `'${String(t).replace(/'/g, `'\\''`)}'`;
 const BASHRC = process.env.AM_BASHRC || '/app/session.bashrc';
 const AM_USER = process.env.SPACE_AUTHOR_NAME || process.env.AM_USER || os.userInfo().username || 'user';
 
 // Interactive bash that loads our prompt rcfile (bash ignores a missing rcfile,
 // so this is safe in local dev where /app/session.bashrc doesn't exist).
-const bashLaunch = `exec bash --rcfile ${BASHRC} -i`;
+// Quoted: AM_BASHRC can point into a checkout whose path contains a space, and
+// an unquoted one splits into extra arguments and the shell exits 127.
+const bashLaunch = `exec bash --rcfile ${shq(BASHRC)} -i`;
+// Exposed for the local-install regression: this command reaches a shell only
+// through a PTY, so unquoted-path breakage is otherwise invisible until a Shell
+// pane exits 127.
+export const __bashLaunchForTest = bashLaunch;
 
 // ---------- session hosts (what replaced tmux) ----------
 //
@@ -135,6 +150,15 @@ export function isRunning(id) {
 
 export function ghosttyReady() {
   return !!ghostty;
+}
+
+/**
+ * When this session's process was exec'd, or null if nothing is running.
+ * A CLI keeps the binary it was launched with, so this is what says whether a
+ * pane predates an upgrade.
+ */
+export function startedAt(id) {
+  return hosts.get(id)?.startedAt ?? null;
 }
 
 /** Sample the grid's rendered text and record when it last changed. */
@@ -1324,8 +1348,8 @@ export async function codexRolloutForId(id) {
 // would be a terrible trade), and every failure is non-fatal: without the
 // hook the watcher simply keeps today's behaviour.
 export function installClaudeRepinHook(
-  hookCmd = '/app/scripts/am-repin-hook.sh',
-  inputRequiredCmd = '/app/scripts/am-input-required-hook.sh',
+  hookCmd = shq(appScript('am-repin-hook.sh')),
+  inputRequiredCmd = shq(appScript('am-input-required-hook.sh')),
 ) {
   const dir = process.env.CLAUDE_CONFIG_DIR;
   if (!dir) return false;
@@ -1389,7 +1413,7 @@ export function installClaudeRepinHook(
 // plugins and opencode.json settings remain untouched. This config directory
 // can be on the Space's FUSE bucket, whose rename semantics are unreliable;
 // install before launching OpenCode and write the app-owned file directly.
-export function installOpencodeRepinPlugin(source = '/app/scripts/am-opencode-repin.js') {
+export function installOpencodeRepinPlugin(source = appScript('am-opencode-repin.js')) {
   const base = process.env.OPENCODE_CONFIG_DIR
     || path.join(process.env.XDG_CONFIG_HOME || path.join(process.env.HOME || os.homedir(), '.config'), 'opencode');
   const dir = path.join(base, 'plugins');
@@ -1768,9 +1792,6 @@ function scheduleFxCapture(session, workdir) {
   fxCapturing.set(session.id, t0);
 }
 
-// Single-quote a string for embedding in an `sh -lc` command line.
-const shq = (t) => `'${String(t).replace(/'/g, `'\\''`)}'`;
-
 // Conversation ids reach the launch line unquoted, and this one comes back out
 // of a database rather than from us (Claude's uuid we mint ourselves). Shape-check
 // it so nothing but an opencode session id can ever be interpolated.
@@ -1792,7 +1813,7 @@ export function commandFor(session) {
       const helper = fileURLToPath(new URL('../../scripts/am-codex-context.mjs', import.meta.url));
       // The child verifies endpoint/home/thread via AM before exec. No --last,
       // rollout-existence fallback, prompt replay or standalone writer.
-      return `exec ${shq(process.execPath)} ${shq(helper)} --base-url ${shq(`http://127.0.0.1:${PORT}`)} tui ${shq(session.id)}`;
+      return `exec ${shq(process.execPath)} ${shq(helper)} --base-url ${shq(`http://${INTERNAL_HOST}:${PORT}`)} tui ${shq(session.id)}`;
     }
   }
   // Quickstart: a prompt queued at creation rides the FIRST launch command
@@ -1989,6 +2010,9 @@ export function ensureRunning(session, cols = 120, rows = 34) {
     // must be able to READ it rather than trust a number baked into a doc when
     // that doc was generated.
     AM_PORT: String(PORT),
+    // Same reason, for the address: BIND_HOST is configurable too, and once it
+    // names one interface the manager stops answering on localhost.
+    AM_HOST: INTERNAL_HOST,
   };
   const term = pty.spawn('bash', ['-lc', full], {
     name: 'xterm-256color', cols, rows, cwd: workdir, env,
@@ -2321,6 +2345,39 @@ export function capturePane(id, lines = 80) {
   // Trailing blank rows are padding, not content: a short screen should not
   // arrive as 50 lines of nothing.
   return [...history, ...visible].join('\n').replace(/\s+$/, '');
+}
+
+/**
+ * Stop a session and bring it straight back up.
+ *
+ * Why not stop() + ensureRunning(): stop() only sends the kill. The host stays
+ * in `hosts` until the PTY's exit event fires, so an immediate ensureRunning()
+ * sees a live session and returns false — the pane would stay down. Wait for
+ * the exit this launch owns, then start. A process that will not die inside the
+ * window is reported, not worked around: the caller said it would restart this
+ * pane, and silently leaving it running makes that a lie.
+ *
+ * The new process resumes the session's pinned conversation like any other
+ * launch (claude --resume / codex resume …), so the transcript survives. What
+ * does not survive is whatever the agent was in the middle of.
+ */
+export async function restart(session, timeoutMs = 15_000) {
+  // Refuse an impossible shared-host relaunch before stopping its old writer.
+  assertCodexLaunchAllowed(session);
+  const host = hosts.get(session.id);
+  if (host) {
+    stop(session.id);
+    let timer;
+    await Promise.race([
+      host.exitPromise,
+      new Promise((resolve) => { timer = setTimeout(resolve, timeoutMs); }),
+    ]);
+    clearTimeout(timer);
+    if (hosts.has(session.id)) {
+      throw new Error(`did not exit within ${Math.round(timeoutMs / 1000)}s — still running the old binary`);
+    }
+  }
+  ensureRunning(session);
 }
 
 /** Stop a session entirely (kills the process; viewers get an exit close code). */

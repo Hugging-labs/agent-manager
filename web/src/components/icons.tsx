@@ -3,7 +3,7 @@ import type { ReactNode } from 'react';
 // Shared minimal stroke glyphs (inherit currentColor, scale to their box).
 // One pen for the whole UI: 16px grid, 1.2 stroke, round joins.
 const G = ({ className, children }: { className?: string; children: ReactNode }) => (
-  <svg className={className} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" strokeLinecap="round">
+  <svg className={className} width="1em" height="1em" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" strokeLinecap="round">
     {children}
   </svg>
 );
@@ -211,6 +211,19 @@ export const RefreshGlyph = ({ className }: { className?: string }) => (
         than an arrow. */}
     <path d="M13.2 8A5.2 5.2 0 1 1 8 2.8" />
     <path d="M5.8 0.9L8 2.8 5.9 4.9" />
+  </G>
+);
+
+// "Not updatable here": the refresh arc with a slash through it. Deliberately
+// NOT an (i) — the row already ends with one of those for missing credentials,
+// and two info icons on one line meaning different things is worse than none.
+// Same glyph as the update control, struck out, so the column reads as one
+// question: can this row be updated in place?
+export const RefreshOffGlyph = ({ className }: { className?: string }) => (
+  <G className={className}>
+    <path d="M13.2 8A5.2 5.2 0 1 1 8 2.8" />
+    <path d="M5.8 0.9L8 2.8 5.9 4.9" />
+    <path d="M2.6 2.6l10.8 10.8" />
   </G>
 );
 

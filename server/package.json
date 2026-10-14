@@ -19,7 +19,7 @@
     "test": "node test/queued-prompts.test.mjs && node ../scripts/run-suites.mjs"
   },
   "engines": {
-    "node": ">=20.19"
+    "node": ">=24.16"
   },
   "dependencies": {
     "@coder/libghostty-vt-node": "0.1.0-beta.0",
@@ -33,5 +33,10 @@
   "devDependencies": {
     "@xterm/headless": "^6.0.0",
     "playwright": "^1.62.1"
+  },
+  "allowScripts": {
+    "node-pty@1.1.0": true,
+    "@coder/libghostty-vt-node@0.1.0-beta.0": true,
+    "fsevents@2.3.2": false
   }
 }

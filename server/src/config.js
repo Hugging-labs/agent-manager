@@ -4,6 +4,29 @@ import fs from 'node:fs';
 import { execSync, execFile } from 'node:child_process';
 
 export const PORT = parseInt(process.env.PORT || '7860', 10);
+export function resolveBindHost(env = process.env) {
+  // Keep the shared-host setting compatible with the local-install name.
+  return env.BIND_HOST || env.AM_BIND_HOST || '127.0.0.1';
+}
+export const BIND_HOST = resolveBindHost();
+
+// Where the server can be reached from inside this machine.
+//
+// `server.listen(PORT, BIND_HOST)` binds ONE address unless that address is a
+// wildcard, so once an operator sets BIND_HOST to a specific interface —
+// exactly the reverse-proxy setup this supports — 127.0.0.1 stops answering.
+// Anything that calls the manager's own HTTP API from inside the process or
+// from an agent has to use this instead of a hardcoded loopback.
+export function resolveInternalHost(env = process.env) {
+  const bind = resolveBindHost(env);
+  return bind === '0.0.0.0' || bind === '::' ? '127.0.0.1' : bind;
+}
+/** The same host, safe to drop into a URL: a bare IPv6 literal needs brackets. */
+export function internalHostForUrl(env = process.env) {
+  const host = resolveInternalHost(env);
+  return host.includes(':') ? `[${host}]` : host;
+}
+export const INTERNAL_HOST = internalHostForUrl();
 export const DATA_DIR = process.env.DATA_DIR || path.resolve(process.cwd(), 'data');
 // Host-chosen root, never supplied by a request. Lets an isolated manager attach
 // existing projects without moving them or sharing production AM state.
@@ -42,9 +65,8 @@ export function refreshVersions() {
     if (!c.bin || versionCache.has(c.id) || !commandExists(c.bin)) continue;
     execFile(c.bin, ['--version'], { timeout: 30000 }, (err, stdout = '') => {
       if (err) return;
-      const s = String(stdout);
-      const m = s.match(/\d+\.\d+\.\d+[\w.-]*/);
-      versionCache.set(c.id, m ? m[0] : s.trim().split('\n')[0].slice(0, 40));
+      const v = parseVersion(stdout);
+      if (v) versionCache.set(c.id, v);
     });
   }
 }
@@ -52,6 +74,63 @@ export function refreshVersions() {
 /** The installed version of one CLI, once the boot-time pass has answered. */
 export function cliVersion(id) {
   return versionCache.get(id) || null;
+}
+
+const parseVersion = (stdout) => {
+  const s = String(stdout);
+  const m = s.match(/\d+\.\d+\.\d+[\w.-]*/);
+  return m ? m[0] : (s.trim().split('\n')[0].slice(0, 40) || null);
+};
+
+/**
+ * Ask one CLI its version RIGHT NOW and write the answer into the cache.
+ *
+ * refreshVersions() is a boot-time best-effort that never re-asks a CLI it has
+ * an answer for — correct while nothing changes under it, wrong the moment the
+ * updater replaces a binary. The updater calls this before and after each
+ * install, so the catalog (and the Agents list) reports the new version on the
+ * next poll instead of the one from boot.
+ */
+export function probeVersion(id) {
+  const c = cliById(id);
+  if (!c || !c.bin) return Promise.resolve(null);
+  forgetCommandExists(c.bin);
+  if (!commandExists(c.bin)) { versionCache.delete(id); return Promise.resolve(null); }
+  return new Promise((resolve) => {
+    execFile(c.bin, ['--version'], { timeout: 30000 }, (err, stdout = '') => {
+      const v = err ? null : parseVersion(stdout);
+      if (v) versionCache.set(id, v); else versionCache.delete(id);
+      resolve(v);
+    });
+  });
+}
+
+/** Drop the memoized `command -v` answer — an install can make it stale. */
+export function forgetCommandExists(cmd) {
+  cmdExistsCache.delete(cmd);
+}
+
+// CLIs the updater refuses to touch even though they have a binary: the shell
+// is the image's, and the repaint fixture is a test prop.
+const NEVER_UPDATED = new Set(['shell', 'test-repaint']);
+
+/**
+ * What an "update the CLIs" run would do, derived from the registry so a CLI
+ * added later lands in one of the two lists without touching this code:
+ *  - `targets`  : has an `npm` package — the updater installs @latest
+ *  - `excluded` : an agent CLI that arrived some other way. Named out loud with
+ *                 the reason, because a button that quietly skips a row is worse
+ *                 than one that says it cannot help.
+ */
+export function cliUpdatePlan() {
+  const agents = CLIS.filter((c) => c.bin && c.run && !NEVER_UPDATED.has(c.id)
+    && !PASSIVE_CLIS.includes(c.id) && !isRemote(c.id));
+  return {
+    targets: agents.filter((c) => c.npm)
+      .map((c) => ({ id: c.id, label: c.label, bin: c.bin, npm: c.npm })),
+    excluded: agents.filter((c) => !c.npm)
+      .map((c) => ({ id: c.id, label: c.label, reason: c.noUpdate || 'not installed through npm' })),
+  };
 }
 
 // tmux is no longer part of the terminal path: sessions are PTYs held by this
@@ -68,8 +147,36 @@ export function cliVersion(id) {
 const setupHint = (...keys) =>
   `Launch it once — the first run walks you through sign-in. Or add ${keys.join(' / ')} as a Space secret.`;
 
-// Panels rather than processes: no binary, nothing to launch, no trace of their
-// own. Everywhere the app asks "is this an agent?" it means "not one of these".
+// What OPENING A SESSION actually shows an operator with no credentials.
+//
+// This is not what the docs say and not what the CLI's own login command does
+// — it is what appeared on screen when each agent was launched the way
+// runner.js launches it (bash -lc <run>, in a PTY) with a HOME holding no
+// credentials. A Space runs in a container the operator's browser cannot
+// reach, so any flow that redirects to localhost is useless here however well
+// it works on a laptop.
+//
+//  - claude: theme picker, then a login-method menu, then "Browser didn't
+//    open? Use the url below to sign in" with a platform.claude.com URL and
+//    "Paste code here if prompted". Completes in the pane. Nothing to type.
+//  - codex:  the first screen is a menu — "Sign in with ChatGPT" (serves a
+//    localhost:1455 redirect, dead from a Space), "Sign in with Device Code"
+//    (auth.openai.com/codex/device plus a one-time code, completes in the
+//    pane), "Provide your own API key". So opening a session is enough, but
+//    the operator has to pick the second entry rather than the first.
+//  - gemini / opencode / hermes / openclaw / fx: no sign-in was observed that
+//    is confirmed to complete from a Space. fx offers a menu (Vercel / Codex /
+//    Grok) whose routes are unverified here; openclaw opens straight into a
+//    working TUI; gemini opens a folder-trust dialog first. Rather than guess,
+//    these are `null` and the UI recommends the API key.
+//
+// `note` is the one thing the operator must know that the pane does not make
+// obvious. Keep it to a sentence, or leave it out.
+const IN_SESSION_SIGN_IN = {
+  claude: { note: null },
+  codex: { note: 'Choose "Sign in with Device Code" — the ChatGPT option redirects to localhost on the machine the agent runs on.' },
+};
+
 export const PASSIVE_CLIS = ['files', 'trace'];
 
 // A remote agent IS an agent (card, digest, status light) but has no process
@@ -101,34 +208,41 @@ export const CLIS = [
   // a conversation, so it gets a light and a digest like any other agent.
   { id: 'remote',   label: 'Remote agent', bin: null,      color: '#5ec2e0', run: null,             cont: null },
   { id: 'claude',   label: 'Claude Code', bin: 'claude',   color: '#d97757', run: 'claude',         cont: 'claude --continue', resizeMode: 'repaint',
+    npm: '@anthropic-ai/claude-code',
     withPrompt: (q) => `claude ${q}`,
-    setup: setupHint('ANTHROPIC_API_KEY') },
+    secrets: ['ANTHROPIC_API_KEY'], setup: setupHint('ANTHROPIC_API_KEY') },
   { id: 'codex',    label: 'Codex',       bin: 'codex',    color: '#5eb6a6', run: codexCommand(),   cont: codexCommand('resume --last'), resizeMode: 'repaint',
+    npm: '@openai/codex',
     resume: (id) => codexCommand(`resume ${id}`),
     // `q` and image paths arrive shell-quoted from runner.commandFor(). Repeat
     // -i because Codex's variadic flag would otherwise consume the prompt.
     withPrompt: (q, images = []) => `${codexCommand()}${images.length ? ` ${images.map((image) => `-i ${image}`).join(' ')}` : ''} ${q}`,
-    setup: setupHint('OPENAI_API_KEY') },
+    secrets: ['OPENAI_API_KEY'], setup: setupHint('OPENAI_API_KEY') },
   { id: 'gemini',   label: 'Gemini CLI',  bin: 'gemini',   color: '#4796e3', run: 'gemini',         cont: null, resizeMode: 'repaint',
+    npm: '@google/gemini-cli',
     withPrompt: (q) => `gemini -i ${q}`, // -i = interactive session seeded with the prompt
-    setup: setupHint('GEMINI_API_KEY') },
+    secrets: ['GEMINI_API_KEY'], setup: setupHint('GEMINI_API_KEY') },
   { id: 'opencode', label: 'opencode',    bin: 'opencode', color: '#8a93a0', run: 'opencode',       cont: 'opencode --continue', resizeMode: 'repaint',
+    npm: 'opencode-ai',
     withPrompt: (q) => `opencode --prompt ${q}`,
-    setup: setupHint('ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY') },
+    secrets: ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY'], setup: setupHint('ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY') },
   { id: 'hermes',   label: 'Hermes',      bin: 'hermes',   color: '#a78bfa', run: 'hermes',         cont: 'hermes -c', resizeMode: 'repaint',
-    setup: setupHint('HF_TOKEN', 'ANTHROPIC_API_KEY', 'OPENROUTER_API_KEY', 'NOUS_API_KEY') },
+    noUpdate: 'installed by the vendor script from hermes-agent.nousresearch.com, onto its own Python venv',
+    secrets: ['HF_TOKEN', 'ANTHROPIC_API_KEY', 'OPENROUTER_API_KEY', 'NOUS_API_KEY'], setup: setupHint('HF_TOKEN', 'ANTHROPIC_API_KEY', 'OPENROUTER_API_KEY', 'NOUS_API_KEY') },
   // `chat` = TUI in --local mode: embedded agent, no gateway/daemon needed.
   { id: 'openclaw', label: 'OpenClaw',    bin: 'openclaw', color: '#c83636', run: 'openclaw chat',  cont: null, resizeMode: 'repaint',
-    setup: setupHint('ANTHROPIC_API_KEY') },
+    npm: 'openclaw',
+    secrets: ['ANTHROPIC_API_KEY'], setup: setupHint('ANTHROPIC_API_KEY') },
   // fx has no config-dir override: its state (auth, settings, sessions) is
   // hardcoded to ~/.fx, which entrypoint.sh points at local disk and
   // checkpoints — the same treatment opencode and Hermes get.
   { id: 'fx',       label: 'fx',          bin: 'fx',       color: '#626262', run: 'fx',             cont: 'fx --continue', resizeMode: 'repaint',
+    noUpdate: 'a prebuilt binary from releases.fx.sh, not an npm package',
     resume: (id) => `fx --resume ${id}`,
     // fx has no "start interactive, seeded with this prompt" form: `fx ask` runs
     // one request and exits, which would end the pane instead of opening it. So
     // no withPrompt — a queued first prompt is typed into the TUI instead.
-    setup: setupHint('AI_GATEWAY_API_KEY') },
+    secrets: ['AI_GATEWAY_API_KEY'], setup: setupHint('AI_GATEWAY_API_KEY') },
   // Test-only primary-screen repaint fixture. Absent from every normal runtime.
   ...(process.env.AM_TEST_REPAINT_CMD
     ? [{ id: 'test-repaint', label: 'Repaint fixture', bin: 'bash', color: '#8aa0ad', run: process.env.AM_TEST_REPAINT_CMD, cont: null, resizeMode: 'repaint' }]
@@ -202,6 +316,14 @@ export function cliCatalog() {
     ready: (c.bin ? commandExists(c.bin) : true) && isConfigured(c.id),
     version: versionCache.get(c.id) || null,
     setup: c.setup || null,
+    // The two ways in, as data rather than prose, so the first-run window can
+    // show the real ones per agent instead of a sentence that has to be kept in
+    // sync by hand. `signIn` is null where no pane-usable flow is confirmed.
+    secrets: c.secrets || [],
+    // Whether opening a session presents a sign-in that completes from a
+    // Space, and anything the operator must know to use it. null = we did not
+    // confirm one, so the UI must not invent instructions.
+    signIn: IN_SESSION_SIGN_IN[c.id] || null,
   }));
 }
 

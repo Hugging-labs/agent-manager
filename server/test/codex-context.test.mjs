@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { CodexBindings } from '../src/codex-bindings.js';
-import { run, tuiSpec } from '../../scripts/am-codex-context.mjs';
+import { run, tuiSpec, localOrigin } from '../../scripts/am-codex-context.mjs';
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'am-context-'));
 process.env.DATA_DIR = root;
 // This fixture includes standalone observation-only hosts.
@@ -129,4 +129,12 @@ test('self-import has explicit native attribution and never borrows AM_ID or ope
  assert.equal(importOperationOrigin(`codex-thread:${threadId}`,req).type,'codex-thread');
  for(const bad of [{...req,method:'GET'},{...req,path:'/api/agents'},{...req,body:{threadId:sessionUuid}}])assert.equal(importOperationOrigin(`codex-thread:${threadId}`,bad),null);
  assert.equal(importOperationOrigin('operator',req),null);
+});
+
+test('shared helper supports configured loopback interfaces without allowing remote hosts', () => {
+  assert.equal(localOrigin('http://127.0.0.2:7860'), 'http://127.0.0.2:7860');
+  assert.equal(localOrigin('http://[::1]:7860'), 'http://[::1]:7860');
+  for (const origin of ['http://192.168.0.1:7860', 'http://127.example:7860', 'http://127.0.0.1.example:7860', 'http://user@127.0.0.2:7860']) {
+    assert.throws(() => localOrigin(origin));
+  }
 });
