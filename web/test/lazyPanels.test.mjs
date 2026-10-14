@@ -96,7 +96,17 @@ try {
     // the one piece worth moving sits on the send path. Raised to 775, a
     // deliberately tighter headroom than the two raises above, so the next
     // eager import still trips this.
-    assert.ok(entry.length <= 775 * 1024, `entry chunk is ${(entry.length / 1024).toFixed(0)} kB, over the 775 kB budget`);
+    // Vite 5.4 → 6.4 (2026-10-15, Dependabot alerts on vite/esbuild): 789,118 →
+    // 793,762 characters (+4.6 kB) with no source change. Attributed per module
+    // from rollup's rendered lengths: it is all CommonJS interop from vite 6's
+    // @rollup/plugin-commonjs 28 (was 26) — +0.3 to +0.2 kB of wrapper on each
+    // of react-dom, react/jsx-runtime, scheduler and the xterm addons, new
+    // `?commonjs-es-import` proxy modules, and vite's preload helper (+0.3).
+    // `commonjsOptions.strictRequires: 'auto'` would win it back (790,392), but
+    // it changes how every CJS module is wrapped at run time, which is not a
+    // trade for a dependency bump to make. Raised to 780 for the toolchain
+    // alone, keeping the headroom as tight as the raise above.
+    assert.ok(entry.length <= 780 * 1024, `entry chunk is ${(entry.length / 1024).toFixed(0)} kB, over the 780 kB budget`);
     // One literal only that panel's module contains — a dynamic import that
     // merely wraps an unchanged graph would leave these in the entry.
     for (const [panel, marker] of [
