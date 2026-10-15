@@ -6,14 +6,23 @@
 # trees) or SQLite's online backup API (live databases). This is intentional:
 # hf-mount's streaming writer holds an open file in memory until close, while
 # copying a database and its WAL independently can produce a torn backup.
+#
+# Restore speed. The bucket costs ~27 ms per file, read or stat, so a restore is
+# bound by file COUNT, not bytes — and one sequential rsync per harness kept a
+# Space silent for 25 minutes at boot. Three things keep it short: what is not
+# worth restoring is excluded (and pruned from the bucket once); the adapters
+# restore concurrently; and the big trees are split by subdirectory into a
+# bounded pool of rsyncs, each applying exactly the filters a single rsync
+# would. The restore reports progress on stdout as it goes.
 
 set -u
 
 MODE="${1:-}"
 case "$MODE" in
-  restore|checkpoint|checkpoint-final) ;;
-  *) echo "usage: $0 restore|checkpoint|checkpoint-final" >&2; exit 2 ;;
+  restore|checkpoint|checkpoint-final|prune|_part) ;;
+  *) echo "usage: $0 restore|checkpoint|checkpoint-final|prune" >&2; exit 2 ;;
 esac
+SELF="$0"
 
 : "${DATA_DIR:?DATA_DIR is required}"
 : "${AM_LOCAL:?AM_LOCAL is required}"
@@ -41,18 +50,53 @@ HERMES_DURABLE="${HERMES_DURABLE:-$DATA_DIR/state/hermes}"
 FX_LIVE="${FX_LIVE:-$AM_LOCAL/fx-home}"
 FX_DURABLE="${FX_DURABLE:-$DATA_DIR/state/fx}"
 
+# rsyncs one big tree may run at once. Claude and Codex each get a pool, the
+# five small adapters one rsync each: at most 2×JOBS+5 concurrent at boot.
+JOBS="${AGENT_STATE_JOBS:-8}"
+HEARTBEAT="${AGENT_STATE_HEARTBEAT:-30}"
+# Claude writes a `.claude.json.backup.<ms>` on every config save and keeps the
+# last five itself. Checkpoints never delete, so the bucket kept every one ever
+# made (2,065, 250 MB, measured). Only the newest few come back.
+KEEP_CLAUDE_BACKUPS="${AGENT_STATE_KEEP_CLAUDE_BACKUPS:-5}"
+# The most junk files one prune removes; the rest goes on the next boot.
+PRUNE_MAX="${AGENT_STATE_PRUNE_MAX:-50000}"
+# Diagnostic: `restore` with this set only lists what the tree rsyncs would
+# copy (`rsync -n`) and writes nothing — no stamps, no databases.
+DRY_RUN="${AGENT_STATE_DRY_RUN:-}"
+
 LOCK="$AM_LOCAL/agent-state-checkpoint.lock"
 mkdir -p "$AM_LOCAL"
-exec 9>"$LOCK"
-if [ "$MODE" = restore ] || [ "$MODE" = checkpoint-final ]; then
-  # A dev-mode restart may overlap the previous app's final checkpoint. Never
-  # restore an older durable view while that checkpoint is still being made.
-  flock 9
+if [ "$MODE" = _part ]; then
+  # One slice of a parallel restore, started by the restore holding the lock.
+  :
+elif [ "$MODE" = prune ]; then
+  # Deletes only paths no checkpoint writes and no restore reads, so it does
+  # not contend with either; it only must not run twice at once.
+  exec 8>"$AM_LOCAL/agent-state-prune.lock"
+  flock -n 8 || exit 0
 else
-  # Timer and shutdown checkpoints can race; the one already holding the lock
-  # is sufficient, and a later timer/shutdown will catch subsequent writes.
-  flock -n 9 || exit 0
+  exec 9>"$LOCK"
+  if [ "$MODE" = restore ] || [ "$MODE" = checkpoint-final ]; then
+    # A dev-mode restart may overlap the previous app's final checkpoint. Never
+    # restore an older durable view while that checkpoint is still being made.
+    flock 9
+  else
+    # Timer and shutdown checkpoints can race; the one already holding the lock
+    # is sufficient, and a later timer/shutdown will catch subsequent writes.
+    flock -n 9 || exit 0
+  fi
 fi
+
+log() { echo "agent-state: $*"; }
+now() { date +%s; }
+elapsed() {
+  _s=$(( $(now) - $1 ))
+  if [ "$_s" -ge 60 ]; then printf '%dm%02ds' $((_s / 60)) $((_s % 60)); else printf '%ds' "$_s"; fi
+}
+count_files() { find "$1" -type f 2>/dev/null | wc -l | tr -d ' '; }
+tree_size() { du -sh "$1" 2>/dev/null | cut -f1; }
+# A name as a literal rsync pattern: [ ] * ? and \ would otherwise be wildcards.
+literal() { printf '%s' "$1" | sed 's/[][*?\\]/\\&/g'; }
 
 # `find -newer` is a strict comparison. A file written in the same filesystem
 # timestamp tick as a checkpoint marker would otherwise be skipped forever.
@@ -77,8 +121,107 @@ rsync_tree() {
   return "$_rs_rc"
 }
 
+# Each adapter's filters, in ONE place, for both directions and for every slice
+# of a parallel restore. Checkpoints enumerate files explicitly via
+# --files-from, and excluding just a directory name does not exclude its
+# explicitly listed descendants: subtree patterns (`**/x/***`, or `/x/***` for
+# the top level only) cover both the directory and everything under it.
+#
+#   codex  tmp/ holds one `arg0/codex-arg0XXXXXX/.lock` per process that ever
+#          ran (1,888 in the bucket, 9 live); plugins/ held only cache/ — the
+#          curated plugins Codex downloads again — and its install staging.
+#   claude backups/ come back as the newest few only (restore_claude_backups).
+#          file-history/ is kept: it is what /rewind restores edited files from,
+#          for resumed conversations too.
+rsync_adapter() {
+  _dir="$1" _key="$2"; shift 2
+  case "$_key" in
+    codex)
+      rsync_tree --exclude '*.sqlite*' --exclude '*.db' --exclude '*.db-*' \
+        --exclude '*-wal' --exclude '*-shm' --exclude '**/db-backups/***' \
+        --exclude '**/cache/***' --exclude '**/.tmp/***' --exclude '**/mcp-oauth-locks/***' \
+        --exclude '/tmp/***' --exclude '/plugins/.remote-plugin-install-staging/***' "$@" ;;
+    claude)
+      if [ "$_dir" = restore ]; then rsync_tree --exclude '/backups/***' "$@"; else rsync_tree "$@"; fi ;;
+    fx)
+      rsync_tree --exclude '*.lock' --exclude 'index.pending' "$@" ;;
+    *-files)
+      rsync_tree --exclude 'checkpoints' --exclude '*.db' --exclude '*.db-*' \
+        --exclude '*.sqlite*' --exclude '*-wal' --exclude '*-shm' "$@" ;;
+    *)
+      rsync_tree "$@" ;;
+  esac
+}
+
+restore_flags() {
+  if [ -n "$DRY_RUN" ]; then echo '-a --update -n --out-format=%n'; else echo '-a --update'; fi
+}
+
+# One slice of a tree: the same transfer root and the same adapter filters as a
+# whole-tree rsync, narrowed by include/exclude rules to one part of it. rsync
+# never descends an excluded directory, so a slice walks only its own part.
+#   all      the whole tree (no pool)
+#   files:   the top-level files
+#   files:D  the files directly in D
+#   tree:D   all of D
+#   tree:D/C all of D/C
+restore_slice() {
+  _key="$1" _durable="$2" _live="$3" _spec="$4"
+  # shellcheck disable=SC2046  # restore_flags is a fixed list of flags
+  set -- $(restore_flags)
+  case "$_spec" in
+    all) rsync_adapter restore "$_key" "$@" "$_durable/" "$_live/" ;;
+    files:) rsync_adapter restore "$_key" --exclude '/*/' "$@" "$_durable/" "$_live/" ;;
+    files:*)
+      _d=$(literal "${_spec#files:}")
+      rsync_adapter restore "$_key" --include "/$_d/" --exclude "/$_d/*/" --include "/$_d/*" --exclude '/*' \
+        "$@" "$_durable/" "$_live/" ;;
+    tree:*/*)
+      _p="${_spec#tree:}"; _a=$(literal "${_p%%/*}"); _b=$(literal "${_p#*/}")
+      rsync_adapter restore "$_key" --include "/$_a/" --include "/$_a/$_b/***" --exclude "/$_a/*" --exclude '/*' \
+        "$@" "$_durable/" "$_live/" ;;
+    tree:*)
+      _d=$(literal "${_spec#tree:}")
+      rsync_adapter restore "$_key" --include "/$_d/***" --exclude '/*' "$@" "$_durable/" "$_live/" ;;
+    *) echo "agent-state: unknown restore slice '$_spec'" >&2; return 2 ;;
+  esac
+}
+
+# The slices of a durable tree, NUL-separated: its top-level files, each
+# top-level directory, and — for the directories named in $2 — each of their
+# subdirectories instead. Listing reads directories only (no stat of their
+# contents); symlinks are never followed into.
+list_slices() {
+  _root="$1" _split="$2"
+  printf 'files:\0'
+  for _e in "$_root"/* "$_root"/.[!.]* "$_root"/..?*; do
+    [ -d "$_e" ] && [ ! -L "$_e" ] || continue
+    _n="${_e##*/}"
+    case " $_split " in
+      *" $_n "*)
+        printf 'files:%s\0' "$_n"
+        for _c in "$_e"/* "$_e"/.[!.]* "$_e"/..?*; do
+          [ -d "$_c" ] && [ ! -L "$_c" ] || continue
+          printf 'tree:%s/%s\0' "$_n" "${_c##*/}"
+        done ;;
+      *) printf 'tree:%s\0' "$_n" ;;
+    esac
+  done
+}
+
+# Every slice of a tree through a pool of at most $JOBS rsyncs. Any failed
+# slice fails the tree (xargs exits non-zero when any command did).
+parallel_restore() {
+  _key="$1" _durable="$2" _live="$3" _split="$4"
+  if [ "$JOBS" -le 1 ]; then
+    restore_slice "$_key" "$_durable" "$_live" all
+    return
+  fi
+  list_slices "$_durable" "$_split" | xargs -0 -r -n 1 -P "$JOBS" sh "$SELF" _part "$_key" "$_durable" "$_live"
+}
+
 restore_tree() {
-  key="$1" durable="$2" live="$3"; shift 3
+  key="$1" durable="$2" live="$3" split="${4:-}"
   mkdir -p "$durable" "$live"
   stamp_dir="$AM_LOCAL/agent-state-stamps"
   stamp="$stamp_dir/$key"
@@ -87,7 +230,8 @@ restore_tree() {
   # --update matters for hot/dev restarts: local disk survives those and can be
   # newer than the last completed bucket checkpoint. A fresh container starts
   # with an empty destination, so the same command performs a full restore.
-  if rsync_tree -a --update "$@" "$durable/" "$live/"; then
+  if parallel_restore "$key" "$durable" "$live" "$split"; then
+    [ -n "$DRY_RUN" ] && return 0
     mkdir -p "$stamp_dir"
     if [ ! -e "$stamp" ]; then
       if [ "$had_local" = true ]; then
@@ -105,7 +249,7 @@ restore_tree() {
 }
 
 checkpoint_tree() {
-  key="$1" live="$2" durable="$3"; shift 3
+  key="$1" live="$2" durable="$3"
   [ -d "$live" ] || return 0
   stamp_dir="$AM_LOCAL/agent-state-stamps"
   mkdir -p "$durable" "$stamp_dir"
@@ -126,8 +270,8 @@ checkpoint_tree() {
     # the remote tree every 15 seconds — a critical property on the bucket
     # mount. Destination temporaries close before rename, retaining the prior
     # object if this process dies during transfer.
-    if ! rsync_tree -a -r --from0 --files-from="$list" --delay-updates \
-      "$@" "$live/" "$durable/"; then
+    if ! rsync_adapter checkpoint "$key" -a -r --from0 --files-from="$list" --delay-updates \
+      "$live/" "$durable/"; then
       rm -f "$next" "$list"
       return 1
     fi
@@ -136,15 +280,34 @@ checkpoint_tree() {
   rm -f "$list"
 }
 
+# The newest few Claude config backups, by the millisecond stamp in their
+# names — read from the directory listing alone, without a stat per file.
+newest_claude_backups() {
+  ls -A "$1" 2>/dev/null | grep -E '^\.claude\.json\.backup\.[0-9]+$' | sort -t . -k 5,5n | tail -n "$2"
+}
+
+restore_claude_backups() {
+  _src="$CLAUDE_DURABLE/backups" _dst="$CLAUDE_CONFIG_DIR/backups"
+  [ -d "$_src" ] && [ ! -L "$_src" ] || return 0
+  _list="$AM_LOCAL/agent-state-claude-backups.$$"
+  newest_claude_backups "$_src" "$KEEP_CLAUDE_BACKUPS" > "$_list"
+  if [ -s "$_list" ] && [ -z "$DRY_RUN" ]; then
+    mkdir -p "$_dst"
+    if ! rsync -a --update --files-from="$_list" "$_src/" "$_dst/"; then rm -f "$_list"; return 1; fi
+  elif [ -n "$DRY_RUN" ]; then
+    cat "$_list"
+  fi
+  rm -f "$_list"
+}
+
 restore_sqlite_tree() {
   durable="$1" live="$2" db_name="$3" checkpoint_name="$4"
   mkdir -p "$durable" "$live"
 
-  if ! restore_tree "$checkpoint_name-files" "$durable" "$live" \
-    --exclude 'checkpoints' --exclude '*.db' --exclude '*.db-*' \
-    --exclude '*.sqlite*' --exclude '*-wal' --exclude '*-shm'; then
+  if ! restore_tree "$checkpoint_name-files" "$durable" "$live"; then
     return 1
   fi
+  [ -n "$DRY_RUN" ] && return 0
 
   checkpoint="$durable/checkpoints/$checkpoint_name"
   target="$live/$db_name"
@@ -199,9 +362,7 @@ checkpoint_sqlite_tree() {
   # A harness can write ordinary state before it creates its database (Hermes
   # setup files are a real example). Always publish that file tree first. The
   # database backup is optional until the database itself exists.
-  if ! checkpoint_tree "$checkpoint_name-files" "$live" "$durable" \
-    --exclude 'checkpoints' --exclude '*.db' --exclude '*.db-*' \
-    --exclude '*.sqlite*' --exclude '*-wal' --exclude '*-shm'; then
+  if ! checkpoint_tree "$checkpoint_name-files" "$live" "$durable"; then
     return 1
   fi
   [ -s "$source" ] || return 0
@@ -254,35 +415,182 @@ checkpoint_sqlite_tree() {
   mv "$sqlite_next" "$sqlite_stamp"
 }
 
-# Checkpoints enumerate files explicitly via --files-from. Excluding just a
-# directory name does not exclude its explicitly listed descendants in rsync;
-# subtree patterns cover both root and nested scratch paths in both directions.
+# ---------- restore: every adapter at once, with progress ----------
+
+restore_codex() { restore_tree codex "$CODEX_DURABLE" "$CODEX_HOME"; }
+# projects/ is most of Claude's bytes in one directory: one slice per project.
+restore_claude() {
+  restore_tree claude "$CLAUDE_DURABLE" "$CLAUDE_CONFIG_DIR" "projects file-history" && restore_claude_backups
+}
+restore_gemini() { restore_tree gemini "$GEMINI_DURABLE" "$GEMINI_LIVE"; }
+restore_openclaw() { restore_tree openclaw "$OPENCLAW_DURABLE" "$OPENCLAW_STATE_DIR"; }
+restore_opencode() { restore_sqlite_tree "$OPENCODE_DURABLE" "$OPENCODE_LIVE" opencode.db opencode.db; }
+restore_hermes() { restore_sqlite_tree "$HERMES_DURABLE" "$HERMES_LIVE" state.db state.db; }
+restore_fx() { restore_tree fx "$FX_DURABLE" "$FX_LIVE"; }
+
+ADAPTERS="codex claude gemini openclaw opencode hermes fx"
+live_of() {
+  case "$1" in
+    codex) echo "$CODEX_HOME" ;; claude) echo "$CLAUDE_CONFIG_DIR" ;; gemini) echo "$GEMINI_LIVE" ;;
+    openclaw) echo "$OPENCLAW_STATE_DIR" ;; opencode) echo "$OPENCODE_LIVE" ;; hermes) echo "$HERMES_LIVE" ;;
+    fx) echo "$FX_LIVE" ;;
+  esac
+}
+
+# One adapter, start to finish, with its own progress lines. In a dry run its
+# stdout is the list of paths that would be restored.
+run_adapter() {
+  _name="$1" _t0=$(now)
+  if [ -n "$DRY_RUN" ]; then
+    "restore_$_name" > "$WORK/$_name.list"; _rc=$?
+    log "$_name: $(grep -cv '/$' "$WORK/$_name.list") files would be restored ($(elapsed "$_t0"))"
+    : > "$WORK/done.$_name"
+    return "$_rc"
+  fi
+  log "restoring $_name…"
+  if "restore_$_name"; then
+    _live=$(live_of "$_name")
+    log "$_name done: $(count_files "$_live") files, $(tree_size "$_live") in $(elapsed "$_t0")"
+    : > "$WORK/done.$_name"
+  else
+    log "$_name FAILED after $(elapsed "$_t0")" >&2
+    : > "$WORK/failed.$_name"
+    return 1
+  fi
+}
+
+# Every $HEARTBEAT seconds, the files already on the LOCAL side of each adapter
+# still restoring — counting there costs nothing, unlike walking the bucket.
+heartbeat() {
+  _parent="$1" _t0="$2" _sp=""
+  # Killed, take the pending sleep with it: a sleep left behind keeps the
+  # restore's stdout open, and whoever reads that output waits on it.
+  trap 'kill $_sp 2>/dev/null; exit 0' TERM INT HUP
+  while :; do
+    sleep "$HEARTBEAT" & _sp=$!
+    wait "$_sp"
+    kill -0 "$_parent" 2>/dev/null || exit 0
+    _line=""
+    for _a in $ADAPTERS; do
+      [ -e "$WORK/done.$_a" ] || [ -e "$WORK/failed.$_a" ] && continue
+      _line="$_line, $_a $(count_files "$(live_of "$_a")") files"
+    done
+    [ -n "$_line" ] && log "still restoring after $(elapsed "$_t0"): ${_line#, } on local disk so far"
+  done
+}
+
 failures=0
 
+if [ "$MODE" = _part ]; then
+  restore_slice "$2" "$3" "$4" "$5"
+  exit $?
+fi
+
+if [ "$MODE" = prune ]; then
+  # Junk the excludes above keep out of every restore and checkpoint, but that
+  # an older version had already written to the bucket — 10k+ files of it,
+  # paid for at every boot. Deletes exactly these paths and nothing else:
+  # only under the durable roots, never through a symlink (find does not
+  # follow them; rm removes a link, not its target), at most $PRUNE_MAX files.
+  WORK=$(mktemp -d "$AM_LOCAL/agent-state-prune.XXXXXX")
+  trap 'rm -rf "$WORK"' EXIT
+  budget="$PRUNE_MAX" total=0 t0=$(now)
+  prune_subtree() {
+    _root="$1"
+    [ -e "$_root" ] || [ -L "$_root" ] || return 0
+    if [ -L "$_root" ]; then log "prune: left ${_root#"$DATA_DIR"/} alone (a symlink)"; return 0; fi
+    [ -d "$_root" ] && [ "$budget" -gt 0 ] || return 0
+    find "$_root" \( -type f -o -type l \) -print0 | head -z -n "$budget" > "$WORK/list"
+    _n=$(tr -cd '\0' < "$WORK/list" | wc -c | tr -d ' ')
+    [ "$_n" -gt 0 ] && xargs -0 -r -n 64 -P 16 rm -f -- < "$WORK/list"
+    find "$_root" -depth -type d -empty -delete 2>/dev/null
+    budget=$((budget - _n)); total=$((total + _n))
+    [ "$_n" -gt 0 ] && log "prune: ${_root#"$DATA_DIR"/}: removed $_n files"
+  }
+  for rel in .tmp tmp cache mcp-oauth-locks plugins/cache plugins/.remote-plugin-install-staging; do
+    prune_subtree "$CODEX_DURABLE/$rel"
+  done
+  # Claude config backups beyond the newest few, by name.
+  if [ -d "$CLAUDE_DURABLE/backups" ] && [ ! -L "$CLAUDE_DURABLE/backups" ] && [ "$budget" -gt 0 ]; then
+    newest_claude_backups "$CLAUDE_DURABLE/backups" "$KEEP_CLAUDE_BACKUPS" > "$WORK/keep"
+    ls -A "$CLAUDE_DURABLE/backups" | grep -E '^\.claude\.json\.backup\.[0-9]+$' | grep -vxF -f "$WORK/keep" \
+      | head -n "$budget" | sed "s|^|$CLAUDE_DURABLE/backups/|" | tr '\n' '\0' > "$WORK/list"
+    n=$(tr -cd '\0' < "$WORK/list" | wc -c | tr -d ' ')
+    [ "$n" -gt 0 ] && xargs -0 -r -n 64 -P 16 rm -f -- < "$WORK/list" \
+      && log "prune: ${CLAUDE_DURABLE#"$DATA_DIR"/}/backups: removed $n old config backups, kept the newest $KEEP_CLAUDE_BACKUPS"
+    total=$((total + n)); budget=$((budget - n))
+  fi
+  if [ "$total" -gt 0 ]; then
+    log "prune: removed $total junk files from the durable state in $(elapsed "$t0")"
+    [ "$budget" -le 0 ] && log "prune: stopped at $PRUNE_MAX files; the rest goes on the next boot"
+  fi
+  exit 0
+fi
+
+# Files some process holds open under the live roots. A restore replaces files
+# by rename, so a process holding one keeps writing to an unlinked inode while
+# the path holds the older copy — and that inode is never checkpointed. This
+# happened (2026-10-15): a restore run from a shell inside a running Space
+# (whose environment exports these very paths) orphaned six open Codex
+# rollouts. At boot no agent runs yet, so the check costs nothing there.
+open_in_live_roots() {
+  ls -l /proc/[0-9]*/fd 2>/dev/null | awk -v roots="$CODEX_HOME|$CLAUDE_CONFIG_DIR|$GEMINI_LIVE|$OPENCLAW_STATE_DIR|$OPENCODE_LIVE|$HERMES_LIVE|$FX_LIVE" '
+    BEGIN { n = split(roots, r, "|") }
+    /^\/proc\/[0-9]+\/fd:$/ { pid = $0; sub(/^\/proc\//, "", pid); sub(/\/fd:$/, "", pid); next }
+    / -> / { t = $0; sub(/^.* -> /, "", t)
+      for (i = 1; i <= n; i++) if (r[i] != "" && index(t, r[i] "/") == 1) { print "pid " pid ": " t; break } }
+  ' | head -n 20
+}
+
+if [ "$MODE" = restore ] && [ -z "$DRY_RUN" ]; then
+  if [ -z "${AGENT_STATE_FROM_ENTRYPOINT:-}" ]; then
+    log "WARNING: restore was not started by the entrypoint. It writes into $CODEX_HOME, $CLAUDE_CONFIG_DIR and the other live trees named by this environment."
+  fi
+  _open=$(open_in_live_roots)
+  if [ -n "$_open" ] && [ -n "${AGENT_STATE_FROM_ENTRYPOINT:-}" ]; then
+    # At boot nothing should hold these; if a restart ever left agents
+    # running, refusing here would refuse to boot the Space at all. Say so
+    # loudly and carry on, as the restore always has.
+    echo "agent-state: WARNING: processes still have files open in the live trees; a file the restore replaces is left unlinked under them:" >&2
+    echo "$_open" | sed 's/^/  /' >&2
+  elif [ -n "$_open" ]; then
+    echo "agent-state: refusing to restore: processes have files open in the live trees it would replace:" >&2
+    echo "$_open" | sed 's/^/  /' >&2
+    echo "agent-state: stop them first, or point every *_LIVE / *_HOME / *_DIR variable at a scratch tree." >&2
+    exit 1
+  fi
+fi
+
 if [ "$MODE" = restore ]; then
-  restore_tree codex "$CODEX_DURABLE" "$CODEX_HOME" \
-    --exclude '*.sqlite*' --exclude '*.db' --exclude '*.db-*' \
-    --exclude '*-wal' --exclude '*-shm' --exclude '**/db-backups/***' \
-    --exclude '**/cache/***' --exclude '**/.tmp/***' --exclude '**/mcp-oauth-locks/***' || failures=$((failures + 1))
-  restore_tree claude "$CLAUDE_DURABLE" "$CLAUDE_CONFIG_DIR" || failures=$((failures + 1))
-  restore_tree gemini "$GEMINI_DURABLE" "$GEMINI_LIVE" || failures=$((failures + 1))
-  restore_tree openclaw "$OPENCLAW_DURABLE" "$OPENCLAW_STATE_DIR" || failures=$((failures + 1))
-  restore_sqlite_tree "$OPENCODE_DURABLE" "$OPENCODE_LIVE" opencode.db opencode.db || failures=$((failures + 1))
-  restore_sqlite_tree "$HERMES_DURABLE" "$HERMES_LIVE" state.db state.db || failures=$((failures + 1))
-  restore_tree fx "$FX_DURABLE" "$FX_LIVE" \
-    --exclude '*.lock' --exclude 'index.pending' || failures=$((failures + 1))
+  WORK=$(mktemp -d "$AM_LOCAL/agent-state-restore.XXXXXX")
+  t0=$(now)
+  pids=""
+  heartbeat $$ "$t0" &
+  hb=$!
+  # The heartbeat must not outlive the restore, however it ends; the adapters
+  # must not outlive an interrupted one.
+  trap 'kill $hb $pids 2>/dev/null; rm -rf "$WORK"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  [ -n "$DRY_RUN" ] || log "restoring $ADAPTERS from ${DATA_DIR%/}/state, $JOBS rsyncs per large tree"
+  for a in $ADAPTERS; do
+    run_adapter "$a" &
+    pids="$pids $!"
+  done
+  for p in $pids; do
+    wait "$p" || failures=$((failures + 1))
+  done
+  kill "$hb" 2>/dev/null
+  [ "$failures" -eq 0 ] && log "restore finished in $(elapsed "$t0")"
 else
-  checkpoint_tree codex "$CODEX_HOME" "$CODEX_DURABLE" \
-    --exclude '*.sqlite*' --exclude '*.db' --exclude '*.db-*' \
-    --exclude '*-wal' --exclude '*-shm' --exclude '**/db-backups/***' \
-    --exclude '**/cache/***' --exclude '**/.tmp/***' --exclude '**/mcp-oauth-locks/***' || failures=$((failures + 1))
+  checkpoint_tree codex "$CODEX_HOME" "$CODEX_DURABLE" || failures=$((failures + 1))
   checkpoint_tree claude "$CLAUDE_CONFIG_DIR" "$CLAUDE_DURABLE" || failures=$((failures + 1))
   checkpoint_tree gemini "$GEMINI_LIVE" "$GEMINI_DURABLE" || failures=$((failures + 1))
   checkpoint_tree openclaw "$OPENCLAW_STATE_DIR" "$OPENCLAW_DURABLE" || failures=$((failures + 1))
   checkpoint_sqlite_tree "$OPENCODE_LIVE" "$OPENCODE_DURABLE" opencode.db opencode.db || failures=$((failures + 1))
   checkpoint_sqlite_tree "$HERMES_LIVE" "$HERMES_DURABLE" state.db state.db || failures=$((failures + 1))
-  checkpoint_tree fx "$FX_LIVE" "$FX_DURABLE" \
-    --exclude '*.lock' --exclude 'index.pending' || failures=$((failures + 1))
+  checkpoint_tree fx "$FX_LIVE" "$FX_DURABLE" || failures=$((failures + 1))
 fi
 
 [ "$failures" -eq 0 ] || {
