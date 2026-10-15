@@ -48,14 +48,52 @@ export function isBehind({ deployed, ownSha, latestSha }) {
   return !!ownSha && ownSha !== latestSha;
 }
 
+/**
+ * Which upstream commit to believe this Space is running.
+ *
+ * The local record is preferred, but only while it is about the commit the
+ * Space is actually on: anything else pushing to the Space makes it a statement
+ * about a tree that is no longer there. The marker in the Space's own history
+ * is the fallback, and it is what a duplicated or restored Space has.
+ */
+export function deployedFrom({ record, marker, ownSha }) {
+  return (record && ownSha && record.ownSha === ownSha) ? record.upstream : (marker || null);
+}
+
+/**
+ * Run one update at a time, and release the latch whatever happens.
+ *
+ * The route used to set a module flag, then allocate a temp directory, and only
+ * then enter its try/finally — so a tmp that is full or unwritable threw past
+ * the release and every later update answered `busy` until the Space restarted.
+ * Holding the latch here makes that unrepresentable: there is no statement
+ * between taking it and the try that releases it.
+ */
+export async function exclusively(state, body) {
+  if (state.busy) return { ok: false, reason: 'busy' };
+  state.busy = true;
+  try { return await body(); }
+  finally { state.busy = false; }
+}
+
 const fail = (reason, detail) => ({ ok: false, reason, detail: detail ? String(detail).slice(0, 600) : undefined });
 
 /**
- * @param git  (args, cwd) => Promise<string>, rejecting with a token-scrubbed
- *             Error. Injected so the caller owns scrubbing, and so a test can
- *             watch the order of operations.
+ * @param git     (args, cwd) => Promise<string>, rejecting with a token-scrubbed
+ *                Error. Injected so the caller owns scrubbing, and so a test can
+ *                watch the order of operations.
+ * @param record  (upstreamSha, ownSha) => void, called whenever upstream's tree
+ *                is known to be in place — after a push AND when it already
+ *                was. The second case is why this exists: upstream can move to
+ *                a commit with an identical tree (a metadata-only change), and
+ *                there is then nothing to push, so the marker in the Space's
+ *                history still names the older commit and `check` would report
+ *                "behind" forever. Pushing a commit just to move that marker
+ *                would rebuild the Space — restarting the operator's running
+ *                agents — for a byte-identical image, so it is written down
+ *                instead.
  */
-export async function deployUpstreamTree({ sourceUrl, branch = 'main', ownUrl, dir, git }) {
+export async function deployUpstreamTree({ sourceUrl, branch = 'main', ownUrl, dir, git, record = () => {} }) {
   const one = (text) => String(text || '').trim();
   try {
     await git(['clone', '--quiet', '--branch', branch, '--single-branch', sourceUrl, dir]);
@@ -84,6 +122,7 @@ export async function deployUpstreamTree({ sourceUrl, branch = 'main', ownUrl, d
   if (parent) {
     try {
       if (one(await git(['rev-parse', `${parent}^{tree}`], dir)) === tree) {
+        record(upstream, parent);
         return { ok: true, upToDate: true, from: parent, to: upstream };
       }
     } catch (error) { return fail('own-unreadable', error.message); }
@@ -108,8 +147,14 @@ export async function deployUpstreamTree({ sourceUrl, branch = 'main', ownUrl, d
 
   // Only when the tree actually carries pointers: on a repo with no LFS files
   // this is a no-op worth skipping rather than a transfer worth failing on.
-  let pointers = '';
-  try { pointers = one(await git(['lfs', 'ls-files', '-n', commit], dir)); } catch { pointers = ''; }
+  //
+  // But a scan that FAILED is not a scan that found nothing. Swallowing it into
+  // "no pointers" pushed the ref anyway, which is the one outcome this whole
+  // step exists to prevent — a tree of pointers on a Space whose objects were
+  // never sent. If we cannot tell, we do not push.
+  let pointers;
+  try { pointers = one(await git(['lfs', 'ls-files', '-n', commit], dir)); }
+  catch (error) { return fail('lfs-scan-failed', error.message); }
   if (pointers) {
     try {
       await git(['lfs', 'push', 'own', ref], dir);
@@ -120,5 +165,6 @@ export async function deployUpstreamTree({ sourceUrl, branch = 'main', ownUrl, d
     await git(['push', 'own', `${ref}:refs/heads/${branch}`], dir);
   } catch (error) { return fail('push-rejected', error.message); }
 
+  record(upstream, commit);
   return { ok: true, from: parent, to: upstream, commit, lfs: !!pointers };
 }

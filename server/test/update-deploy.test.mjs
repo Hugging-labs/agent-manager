@@ -16,7 +16,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { execFileSync } from 'node:child_process';
 import { execFile } from 'node:child_process';
-import { deployUpstreamTree, isBehind, upstreamShaFromMessage, deployMessage, UPSTREAM_MARKER } from '../src/update-deploy.js';
+import { deployUpstreamTree, deployedFrom, exclusively, isBehind, upstreamShaFromMessage, deployMessage, UPSTREAM_MARKER } from '../src/update-deploy.js';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'am-update-deploy-'));
 const ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
@@ -131,6 +131,26 @@ test('LFS objects are sent before the refs that need them', async () => {
   assert.ok(lfs < push, 'a tree of pointers whose objects never arrived is a broken Space');
 });
 
+test('a pointer scan that failed never reaches the ref push', async () => {
+  const w = world('lfs-scan');
+  const calls = [];
+  const result = await w.deploy({
+    git: (args, cwd) => {
+      calls.push(args.join(' '));
+      // Only the scan fails. "No pointers" and "could not tell" are different
+      // answers, and treating the second as the first pushes a tree of
+      // pointers whose objects were never sent.
+      if (args[0] === 'lfs' && args[1] === 'ls-files') return Promise.reject(new Error('git: lfs is not a git command'));
+      return w.git(args, cwd);
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'lfs-scan-failed');
+  assert.match(result.detail, /not a git command/);
+  assert.ok(!calls.some((c) => c.startsWith('push own')), `the ref was pushed anyway: ${calls.join(' | ')}`);
+  assert.equal(w.ownHead(), w.ownSha, 'and the Space is left as it was');
+});
+
 test('the deploy records which upstream commit it carried', async () => {
   const w = world('marker');
   await w.deploy();
@@ -161,6 +181,32 @@ test('up to date is still up to date, before and after a tree deploy', async () 
   const again = await w.deploy();
   assert.deepEqual({ ok: again.ok, upToDate: again.upToDate }, { ok: true, upToDate: true });
   assert.equal(sh(['rev-list', '--count', 'main'], w.own).trim(), '2', 'no empty commit was pushed');
+});
+
+test('an upstream commit with an identical tree is still recorded as deployed', async () => {
+  const w = world('same-tree');
+  const records = [];
+  await w.deploy({ record: (upstream, ownSha) => records.push({ upstream, ownSha }) });
+  assert.deepEqual(records, [{ upstream: w.upstreamSha, ownSha: w.ownHead() }]);
+
+  // Upstream moves on without changing a single file — an empty commit is the
+  // simplest shape of it; a revert of a revert is the one that happens.
+  sh(['commit', '--quiet', '--allow-empty', '-m', 'release notes only'], w.upstream);
+  const moved = sh(['rev-parse', 'HEAD'], w.upstream).trim();
+  assert.notEqual(moved, w.upstreamSha);
+  assert.equal(sh(['rev-parse', 'HEAD^{tree}'], w.upstream).trim(),
+    sh(['rev-parse', `${w.upstreamSha}^{tree}`], w.upstream).trim(), 'same tree, new sha');
+
+  // check offers the update, because the marker still names the old commit.
+  assert.equal(isBehind({ ownSha: w.ownHead(), latestSha: moved, deployed: w.upstreamSha }), true);
+  const again = await w.deploy({ record: (upstream, ownSha) => records.push({ upstream, ownSha }) });
+  assert.equal(again.upToDate, true, 'there is nothing to push, and nothing is pushed');
+  assert.equal(sh(['rev-list', '--count', 'main'], w.own).trim(), '2', 'no commit just to move a marker');
+
+  // …and the deploy says so, so the next check stops offering it. Without
+  // this the Space is permanently "behind" something it already runs.
+  assert.deepEqual(records[1], { upstream: moved, ownSha: w.ownHead() });
+  assert.equal(isBehind({ ownSha: w.ownHead(), latestSha: moved, deployed: records[1].upstream }), false);
 });
 
 test('a refused push is answered with its reason, not thrown', async () => {
@@ -206,6 +252,33 @@ test('the first deploy into an empty Space has no parent to stand on', async () 
   assert.equal(result.from, null);
   assert.equal(sh(['rev-list', '--count', 'main'], w.own).trim(), '1');
   assert.equal(w.ownFile('README.md'), 'v2\n');
+});
+
+test('the local record is believed only about the commit the Space is on', () => {
+  const A = 'a'.repeat(40), B = 'b'.repeat(40), head = 'c'.repeat(40);
+  const record = { upstream: B, ownSha: head };
+  assert.equal(deployedFrom({ record, marker: A, ownSha: head }), B, 'it knows about the push that never happened');
+  assert.equal(deployedFrom({ record, marker: A, ownSha: 'd'.repeat(40) }), A,
+    'something else pushed since, so the record is about a tree that has gone');
+  assert.equal(deployedFrom({ record: null, marker: A, ownSha: head }), A, 'a restored Space has only its history');
+  assert.equal(deployedFrom({ record: null, marker: null, ownSha: head }), null);
+});
+
+test('one update at a time, and the latch is released however it ends', async () => {
+  const state = { busy: false };
+  let release;
+  const first = exclusively(state, () => new Promise((r) => { release = r; }));
+  assert.deepEqual(await exclusively(state, async () => ({ ok: true })), { ok: false, reason: 'busy' },
+    'a second update while one is running is refused, not run beside it');
+  release({ ok: true });
+  assert.deepEqual(await first, { ok: true });
+  assert.equal(state.busy, false);
+
+  // The failure that jammed it: the temp directory could not be made, and the
+  // throw went past the release. Anything that throws has to leave it clear.
+  await assert.rejects(exclusively(state, () => { throw new Error('ENOSPC: no space left on device'); }), /ENOSPC/);
+  assert.equal(state.busy, false, 'the next update would have answered busy for the life of the process');
+  assert.deepEqual(await exclusively(state, async () => ({ ok: true, ran: true })), { ok: true, ran: true });
 });
 
 test('deployMessage says what it is, not only which sha', () => {
