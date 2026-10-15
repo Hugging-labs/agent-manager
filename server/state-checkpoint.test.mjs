@@ -12,8 +12,16 @@ const data = path.join(root, 'durable');
 const local = path.join(root, 'local');
 const script = path.resolve(here, '../scripts/agent-state.sh');
 
+// An ALLOWLIST, not process.env with overrides: inside a running Space every
+// shell exports the real CODEX_HOME, CLAUDE_CONFIG_DIR, *_LIVE and *_DURABLE,
+// and a variable this list forgot to override would point the script at live
+// agent state (it did, once, from a hand-run measurement — see the PR that
+// added this). Nothing reaches the script that is not named here.
+const inherited = Object.fromEntries(['PATH', 'LANG', 'LC_ALL', 'TMPDIR', 'TZ']
+  .filter((k) => process.env[k] !== undefined).map((k) => [k, process.env[k]]));
 const env = {
-  ...process.env,
+  ...inherited,
+  HOME: path.join(root, 'home'),
   DATA_DIR: data,
   AM_LOCAL: local,
   CODEX_HOME: path.join(local, 'codex'),
@@ -35,7 +43,7 @@ const env = {
 
 let failures = 0;
 const check = (name, ok, detail = '') => {
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `  ${detail}` : ''}`);
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail && !ok ? `  ${detail}` : ''}`);
   if (!ok) failures++;
 };
 const put = (file, body) => {
@@ -288,6 +296,276 @@ try {
   check('restore still fails on a genuine rsync error (exit 23)',
     restoreStatus(23).status === 1);
   fs.rmSync(vanishRoot, { recursive: true, force: true });
+
+  // ---------- boot speed: progress, junk, parallel slices ----------
+  // Each block gets its own roots. Every path the script reads is set
+  // explicitly, so nothing here can reach the container's real agent state
+  // (the Space exports its own CODEX_HOME, *_DURABLE, … to every shell).
+  const fresh = (label) => {
+    const r = fs.mkdtempSync(path.join(os.tmpdir(), `am-agent-state-${label}-`));
+    const e = { ...env };
+    for (const [key, value] of Object.entries(e)) {
+      if (typeof value === 'string' && value.startsWith(root)) e[key] = value.replace(root, r);
+    }
+    return { r, e };
+  };
+  // An rsync that sleeps first, or fails for one slice only, and otherwise is
+  // the real one — so a failure sits in ONE branch of the parallel pool.
+  const realRsync = execFileSync('sh', ['-c', 'command -v rsync'], { encoding: 'utf8' }).trim();
+  const wrapRsync = (dir) => {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'rsync'), [
+      '#!/bin/sh',
+      '[ -n "${STUB_SLEEP:-}" ] && sleep "$STUB_SLEEP"',
+      'if [ -n "${STUB_FAIL_MATCH:-}" ]; then',
+      '  for a in "$@"; do case "$a" in *"$STUB_FAIL_MATCH"*) echo "stub: failing $a" >&2; exit 23 ;; esac; done',
+      'fi',
+      `exec ${realRsync} "$@"`,
+    ].join('\n'));
+    fs.chmodSync(path.join(dir, 'rsync'), 0o755);
+  };
+  // Run a mode with stdout+stderr to a file, so what is printed AFTER it exits
+  // (a heartbeat that outlived it) is visible.
+  const runTo = (e, mode, outFile, extra = {}) => {
+    const fd = fs.openSync(outFile, 'w');
+    const child = spawn('sh', [script, mode], { env: { ...e, ...extra }, stdio: ['ignore', fd, fd] });
+    const done = new Promise((resolve) => child.on('exit', (code, signal) => { fs.closeSync(fd); resolve({ code, signal }); }));
+    return { child, done };
+  };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // Every process whose command line names `needle` (a fixture root): the
+  // restore's workers carry their paths in their arguments.
+  const processesNaming = (needle) => fs.readdirSync('/proc').filter((d) => /^\d+$/.test(d)).flatMap((pid) => {
+    try {
+      const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ');
+      return cmd.includes(needle) && Number(pid) !== process.pid ? [`${pid}: ${cmd.slice(0, 80)}`] : [];
+    } catch { return []; }
+  });
+  const quietAfter = async (file, ms) => {
+    const before = fs.readFileSync(file, 'utf8');
+    await sleep(ms);
+    return fs.readFileSync(file, 'utf8') === before;
+  };
+
+  {
+    // Progress lines, and a heartbeat that stops with the restore.
+    const { r, e } = fresh('progress');
+    const bin = path.join(r, 'bin'); wrapRsync(bin);
+    for (let i = 0; i < 30; i++) put(path.join(e.CLAUDE_DURABLE, `projects/p${i % 3}/s${i}.jsonl`), `{"n":${i}}\n`);
+    put(path.join(e.CODEX_DURABLE, 'sessions/2026/10/15/rollout.jsonl'), '{}\n');
+    const slow = { PATH: `${bin}:${e.PATH}`, STUB_SLEEP: '1.2', AGENT_STATE_HEARTBEAT: '1' };
+    const out = path.join(r, 'out.txt');
+    const res = await runTo(e, 'restore', out, slow).done;
+    const text = fs.readFileSync(out, 'utf8');
+    check('restore reports each adapter starting and finishing',
+      res.code === 0 && /agent-state: restoring claude…/.test(text)
+        && /agent-state: claude done: 30 files, \S+ in \d+s/.test(text)
+        && /agent-state: codex done: 1 files/.test(text), text.slice(0, 500));
+    check('a heartbeat reports local progress while the restore runs',
+      /agent-state: still restoring after \d+s: .*files on local disk so far/.test(text), text.slice(0, 500));
+    check('the heartbeat stops when the restore succeeds', await quietAfter(out, 2500));
+
+    // …when it fails…
+    fs.rmSync(e.CLAUDE_CONFIG_DIR, { recursive: true, force: true });
+    const outFail = path.join(r, 'out-fail.txt');
+    const failed = await runTo(e, 'restore', outFail, { ...slow, STUB_FAIL_MATCH: '/p1/' }).done;
+    const failText = fs.readFileSync(outFail, 'utf8');
+    check('one failed slice of the parallel pool fails the whole restore', failed.code === 1, failText.slice(-300));
+    check('…names the adapter it failed in', /agent-state: claude FAILED after/.test(failText), failText.slice(-300));
+    check('…while the other slices still ran', fs.existsSync(path.join(e.CLAUDE_CONFIG_DIR, 'projects/p0/s0.jsonl')));
+    check('the heartbeat stops when the restore fails', await quietAfter(outFail, 2500));
+
+    // …and when it is killed: the restore's whole worker tree — xargs, slice
+    // shells, rsyncs, sleeps — must be gone, not just quiet. Two proofs: its
+    // stdout pipe reaches EOF (every process holding it has exited), and no
+    // process anywhere still names this fixture on its command line.
+    fs.rmSync(e.CLAUDE_CONFIG_DIR, { recursive: true, force: true });
+    // The stubbed rsyncs sleep far longer than the checks below wait, so a
+    // worker that survived the TERM is still there to be seen — not one that
+    // merely finished on its own in the meantime.
+    const kill = spawn('sh', [script, 'restore'], { env: { ...e, ...slow, STUB_SLEEP: '25' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let killOut = '';
+    kill.stdout.on('data', (chunk) => { killOut += chunk; });
+    const eof = new Promise((resolve) => kill.stdout.on('close', () => resolve(true)));
+    const exited = new Promise((resolve) => kill.on('exit', (code, signal) => resolve({ code, signal })));
+    for (let i = 0; i < 60 && !/still restoring/.test(killOut); i++) await sleep(100);
+    const workersBefore = processesNaming(r).length;
+    kill.kill('SIGTERM');
+    const k = await exited;
+    const leftovers = processesNaming(r);
+    const closed = await Promise.race([eof, sleep(4000).then(() => false)]);
+    check('a TERM ends the restore with a failure status', k.code !== 0, JSON.stringify(k));
+    check('…its stdout reaches EOF: no worker is left holding it', closed === true);
+    check('…and no xargs, slice shell, rsync or sleep of it is left running',
+      workersBefore > 0 && leftovers.length === 0, `${workersBefore} before; left: ${leftovers.join(' | ')}`);
+    fs.rmSync(r, { recursive: true, force: true });
+  }
+
+  {
+    // Junk stays out in both directions; what sits near it stays in.
+    const { r, e } = fresh('junk');
+    const junk = ['tmp/arg0/codex-arg0AbC/.lock', 'plugins/.remote-plugin-install-staging/x.tar', 'plugins/cache/openai/p/manifest.json'];
+    const keep = ['config.toml', 'sessions/2026/10/15/tmp/rollout.jsonl', 'plugins/my-plugin.toml'];
+    for (const rel of [...junk, ...keep]) put(path.join(e.CODEX_DURABLE, rel), 'x');
+    const stamps = Array.from({ length: 8 }, (_, i) => 1792000000000 + i * 1000);
+    for (const s of stamps) put(path.join(e.CLAUDE_DURABLE, `backups/.claude.json.backup.${s}`), `${s}`);
+    put(path.join(e.CLAUDE_DURABLE, 'file-history/sess/abc@v1'), 'before edit');
+    execFileSync('sh', [script, 'restore'], { env: e });
+    check('Codex tmp/, plugin cache and install staging are not restored',
+      junk.every((rel) => !fs.existsSync(path.join(e.CODEX_HOME, rel))));
+    check('a nested tmp/, and plugin config beside the cache, still are',
+      keep.every((rel) => fs.existsSync(path.join(e.CODEX_HOME, rel))));
+    const restoredBackups = fs.readdirSync(path.join(e.CLAUDE_CONFIG_DIR, 'backups')).sort();
+    check('only the newest five Claude config backups come back',
+      JSON.stringify(restoredBackups) === JSON.stringify(stamps.slice(-5).map((s) => `.claude.json.backup.${s}`)), restoredBackups.join(','));
+    check('Claude file-history (what /rewind restores from) is restored',
+      fs.existsSync(path.join(e.CLAUDE_CONFIG_DIR, 'file-history/sess/abc@v1')));
+    for (const rel of junk) { fs.rmSync(path.join(e.CODEX_DURABLE, rel)); put(path.join(e.CODEX_HOME, rel), 'new junk'); }
+    execFileSync('sh', [script, 'checkpoint'], { env: e });
+    check('Codex junk written locally is not checkpointed either',
+      junk.every((rel) => !fs.existsSync(path.join(e.CODEX_DURABLE, rel))));
+    fs.rmSync(r, { recursive: true, force: true });
+  }
+
+  {
+    // The prune deletes the excluded junk, and only it.
+    const { r, e } = fresh('prune');
+    const junk = ['.tmp/plugins/a.py', 'tmp/arg0/x/.lock', 'tmp/empty', 'mcp-oauth-locks/pid',
+      'plugins/cache/openai/p/m.json', 'plugins/.remote-plugin-install-staging/s'];
+    const keep = ['config.toml', 'auth.json', 'sessions/2026/10/15/tmp/rollout.jsonl', 'plugins/my-plugin.toml',
+      'db-backups/am-quarantine/logs_2.sqlite'];
+    for (const rel of [...junk, ...keep]) put(path.join(e.CODEX_DURABLE, rel), 'x');
+    // A symlink named like a junk directory, pointing at data that must
+    // survive — and one INSIDE a junk directory, pointing out of it.
+    const outside = path.join(r, 'outside');
+    put(path.join(outside, 'precious.txt'), 'keep me');
+    fs.symlinkSync(outside, path.join(e.CODEX_DURABLE, 'cache'));
+    fs.symlinkSync(outside, path.join(e.CODEX_DURABLE, 'tmp/arg0/link'));
+    const stamps = Array.from({ length: 8 }, (_, i) => 1792000000000 + i * 1000);
+    for (const s of stamps) put(path.join(e.CLAUDE_DURABLE, `backups/.claude.json.backup.${s}`), `${s}`);
+    put(path.join(e.CLAUDE_DURABLE, 'backups/notes.txt'), 'not a backup');
+    put(path.join(e.CLAUDE_DURABLE, 'file-history/sess/abc@v1'), 'before edit');
+    put(path.join(e.CLAUDE_DURABLE, 'projects/p/s.jsonl'), '{}');
+    const out = execFileSync('sh', [script, 'prune'], { env: e, encoding: 'utf8' });
+    check('prune removes the excluded Codex junk from the durable side',
+      junk.every((rel) => !fs.existsSync(path.join(e.CODEX_DURABLE, rel))), out);
+    check('prune keeps everything that is not excluded',
+      keep.every((rel) => fs.existsSync(path.join(e.CODEX_DURABLE, rel)))
+        && fs.existsSync(path.join(e.CLAUDE_DURABLE, 'file-history/sess/abc@v1'))
+        && fs.existsSync(path.join(e.CLAUDE_DURABLE, 'projects/p/s.jsonl'))
+        && fs.existsSync(path.join(e.CLAUDE_DURABLE, 'backups/notes.txt')));
+    check('prune never follows a symlink, at the top or inside a junk tree',
+      fs.readFileSync(path.join(outside, 'precious.txt'), 'utf8') === 'keep me'
+        && fs.lstatSync(path.join(e.CODEX_DURABLE, 'cache')).isSymbolicLink(), out);
+    const left = fs.readdirSync(path.join(e.CLAUDE_DURABLE, 'backups')).filter((n) => n.startsWith('.claude.json.backup.')).sort();
+    check('prune keeps the newest five Claude config backups',
+      JSON.stringify(left) === JSON.stringify(stamps.slice(-5).map((s) => `.claude.json.backup.${s}`)), left.join(','));
+    check('prune says what it removed', /prune: removed \d+ junk files/.test(out), out);
+
+    // Serialised with checkpoints: while a checkpoint holds the lock, the
+    // prune deletes nothing — and a backup that checkpoint publishes before
+    // letting go is ranked with the rest, not deleted as "old".
+    for (const rel of junk) put(path.join(e.CODEX_DURABLE, rel), 'x');
+    const lockFile = path.join(e.AM_LOCAL, 'agent-state-checkpoint.lock');
+    fs.mkdirSync(e.AM_LOCAL, { recursive: true });
+    const holder = spawn('flock', [lockFile, 'sh', '-c', 'echo held; sleep 30'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    await waitFor(holder, 'held');
+    const prune = spawn('sh', [script, 'prune'], { env: e, stdio: ['ignore', 'pipe', 'pipe'] });
+    let pruneOut = '';
+    prune.stdout.on('data', (c) => { pruneOut += c; });
+    const pruneDone = new Promise((resolve) => prune.on('exit', (code) => resolve(code)));
+    await sleep(1500);
+    check('prune waits while a checkpoint holds the lock, deleting nothing',
+      prune.exitCode === null && junk.every((rel) => fs.existsSync(path.join(e.CODEX_DURABLE, rel))), pruneOut);
+    const newest = 1793000000000;
+    put(path.join(e.CLAUDE_DURABLE, `backups/.claude.json.backup.${newest}`), 'just published');
+    holder.kill('SIGKILL');
+    const pruneCode = await pruneDone;
+    const afterRace = fs.readdirSync(path.join(e.CLAUDE_DURABLE, 'backups')).filter((n) => n.startsWith('.claude.json.backup.')).sort();
+    check('…then prunes once the checkpoint lets go',
+      pruneCode === 0 && junk.every((rel) => !fs.existsSync(path.join(e.CODEX_DURABLE, rel))), pruneOut);
+    // At shutdown the entrypoint stops a running prune (stop-prune) before the
+    // final checkpoint: its whole group goes, and the lock is free at once.
+    for (const rel of junk) put(path.join(e.CODEX_DURABLE, rel), 'x');
+    const holder2 = spawn('flock', [lockFile, 'sh', '-c', 'echo held; sleep 30'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    await waitFor(holder2, 'held');
+    const running = spawn('setsid', ['-w', 'sh', script, 'prune'], { env: e, stdio: ['ignore', 'pipe', 'pipe'] });
+    const runningDone = new Promise((resolve) => running.on('exit', resolve));
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(e.AM_LOCAL, 'agent-state-prune.pgid')); i++) await sleep(100);
+    const pruneGroup = fs.readFileSync(path.join(e.AM_LOCAL, 'agent-state-prune.pgid'), 'utf8').trim();
+    const inGroup = (g) => fs.readdirSync('/proc').filter((d) => /^\d+$/.test(d)).filter((pid) => {
+      try { return fs.readFileSync(`/proc/${pid}/stat`, 'utf8').replace(/^.*\) /, '').split(' ')[2] === g; } catch { return false; }
+    });
+    const groupBefore = inGroup(pruneGroup).length;
+    const stopped = execFileSync('sh', [script, 'stop-prune'], { env: e, encoding: 'utf8' });
+    await Promise.race([runningDone, sleep(5000)]);
+    holder2.kill('SIGKILL');
+    check('stop-prune ends a running prune and every process of it',
+      groupBefore > 0 && inGroup(pruneGroup).length === 0 && /stopped the junk prune/.test(stopped), `${groupBefore} in group before; ${stopped}`);
+    check('…before it deleted anything it was still waiting to',
+      junk.every((rel) => fs.existsSync(path.join(e.CODEX_DURABLE, rel))));
+    check('…and leaves no stale group id behind', !fs.existsSync(path.join(e.AM_LOCAL, 'agent-state-prune.pgid')));
+    check('stop-prune with no prune running is a no-op',
+      execFileSync('sh', [script, 'stop-prune'], { env: e, encoding: 'utf8' }) === '');
+
+    check('…keeping a backup the checkpoint published meanwhile as one of the newest five',
+      afterRace.length === 5 && afterRace.includes(`.claude.json.backup.${newest}`), afterRace.join(','));
+
+    const { r: r2, e: e2 } = fresh('prune-cap');
+    for (let i = 0; i < 10; i++) put(path.join(e2.CODEX_DURABLE, `tmp/f${i}`), 'x');
+    const capped = execFileSync('sh', [script, 'prune'], { env: { ...e2, AGENT_STATE_PRUNE_MAX: '4' }, encoding: 'utf8' });
+    check('prune is bounded, and says the rest waits for the next boot',
+      fs.readdirSync(path.join(e2.CODEX_DURABLE, 'tmp')).length === 6 && /stopped at 4 files/.test(capped), capped);
+    fs.rmSync(r, { recursive: true, force: true });
+    fs.rmSync(r2, { recursive: true, force: true });
+  }
+
+  {
+    // A restore never writes into a tree a live process has a file open in:
+    // rsync replaces by rename, and that process would go on writing to an
+    // unlinked inode no checkpoint ever sees.
+    const { r, e } = fresh('open');
+    put(path.join(e.CLAUDE_DURABLE, 'projects/p/s.jsonl'), 'durable');
+    const held = path.join(e.CLAUDE_CONFIG_DIR, 'projects/p/s.jsonl');
+    put(held, 'live');
+    const holder = spawn(process.execPath, ['-e', `
+      require('fs').openSync(process.argv[1], 'a'); process.stdout.write('open\\n'); setInterval(() => {}, 1000);
+    `, held], { stdio: ['ignore', 'pipe', 'pipe'] });
+    await waitFor(holder, 'open');
+    let refused = null;
+    try { execFileSync('sh', [script, 'restore'], { env: e, encoding: 'utf8', stdio: 'pipe' }); } catch (error) { refused = error; }
+    check('restore refuses while a process holds a file open in a live tree',
+      refused?.status === 1 && /refusing to restore/.test(refused.stderr) && refused.stderr.includes(held), refused?.stderr);
+    // The entrypoint must still boot: it warns and restores.
+    const boot = execFileSync('sh', [script, 'restore'], { env: { ...e, AGENT_STATE_FROM_ENTRYPOINT: '1' }, encoding: 'utf8', stdio: 'pipe' });
+    check('the entrypoint\'s restore warns about open files but still boots', typeof boot === 'string');
+    holder.kill('SIGKILL');
+    await new Promise((resolve) => holder.once('exit', resolve));
+    const ok = execFileSync('sh', [script, 'restore'], { env: e, encoding: 'utf8', stdio: 'pipe' });
+    check('…and restores once nothing holds it', fs.existsSync(held));
+    check('a restore not started by the entrypoint says so', /WARNING: restore was not started by the entrypoint/.test(ok), ok);
+    const quiet = execFileSync('sh', [script, 'restore'], { env: { ...e, AGENT_STATE_FROM_ENTRYPOINT: '1' }, encoding: 'utf8', stdio: 'pipe' });
+    check('…and the entrypoint\'s own restore does not', !/WARNING/.test(quiet), quiet);
+    fs.rmSync(r, { recursive: true, force: true });
+  }
+
+  // A hot restart through the parallel slices still keeps newer local state,
+  // with a pool and without one.
+  for (const jobs of ['6', '1']) {
+    const { r, e } = fresh(`hot-${jobs}`);
+    const rel = 'projects/work/session.jsonl';
+    put(path.join(e.CLAUDE_DURABLE, rel), 'stale');
+    put(path.join(e.CLAUDE_CONFIG_DIR, rel), 'new-local');
+    const t = Date.now() / 1000;
+    fs.utimesSync(path.join(e.CLAUDE_DURABLE, rel), t - 60, t - 60);
+    fs.utimesSync(path.join(e.CLAUDE_CONFIG_DIR, rel), t, t);
+    put(path.join(e.CLAUDE_DURABLE, 'projects/other/a.jsonl'), 'restored');
+    execFileSync('sh', [script, 'restore'], { env: { ...e, AGENT_STATE_JOBS: jobs } });
+    check(`hot restart keeps newer local state through ${jobs === '1' ? 'one rsync' : 'parallel slices'}`,
+      fs.readFileSync(path.join(e.CLAUDE_CONFIG_DIR, rel), 'utf8') === 'new-local'
+        && fs.readFileSync(path.join(e.CLAUDE_CONFIG_DIR, 'projects/other/a.jsonl'), 'utf8') === 'restored');
+    fs.rmSync(r, { recursive: true, force: true });
+  }
 } catch (error) {
   check('no unexpected exception', false, error?.stack || String(error));
 } finally {

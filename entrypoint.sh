@@ -1,4 +1,15 @@
 #!/bin/sh
+# Progress goes to stdout as plain "[boot] …" lines — the Space log viewer is the
+# only place the operator can watch a boot, and it garbles \r progress bars.
+BOOT_T0=$(date +%s)
+boot_elapsed() {
+  _s=$(( $(date +%s) - $1 ))
+  if [ "$_s" -ge 60 ]; then printf '%dm%02ds' $((_s / 60)) $((_s % 60)); else printf '%ds' "$_s"; fi
+}
+boot() { echo "[boot] $*"; }
+boot "container started; preparing agent state"
+PHASE_T0=$BOOT_T0
+
 # Resolve a writable durable root. /data is the mounted bucket; fall back to a
 # local (non-persistent) dir so the Space still boots before a bucket is attached.
 DATA_DIR="${DATA_DIR:-/data}"
@@ -130,14 +141,28 @@ ln -sfn "$OPENCODE_LIVE" "$OPENCODE_LINK"
 ln -sfn "$HERMES_LIVE" "$HERMES_LINK"
 ln -sfn "$FX_LIVE" "$FX_LINK"
 
+boot "migrations done in $(boot_elapsed "$PHASE_T0")"
+
 # Restore after all one-time migrations have populated the durable side. On a
 # hot/dev restart, --update preserves newer local state.
 AGENT_STATE_SCRIPT="${AGENT_STATE_SCRIPT:-/app/scripts/agent-state.sh}"
 export AGENT_STATE_SCRIPT
-if ! sh "$AGENT_STATE_SCRIPT" restore; then
+PHASE_T0=$(date +%s)
+boot "restoring agent state from $DATA_DIR/state…"
+if ! AGENT_STATE_FROM_ENTRYPOINT=1 sh "$AGENT_STATE_SCRIPT" restore; then
   echo "ERROR: agent-state restore was incomplete; refusing to start agents against partial state" >&2
   exit 1
 fi
+boot "agent state restored in $(boot_elapsed "$PHASE_T0")"
+
+# Junk an older version checkpointed (Codex tmp/plugin cache, old Claude config
+# backups) is excluded from every restore now, but still costs bucket space and
+# listing time. Remove it in the background: the app does not wait for it, and
+# it deletes only paths no restore reads and no checkpoint writes.
+# In its own process group (setsid), so stop_prune below can stop it and its
+# rm workers together; -w keeps $! meaningful even if setsid has to fork.
+AGENT_STATE_LOG_PREFIX='[boot] ' setsid -w sh "$AGENT_STATE_SCRIPT" prune &
+PRUNE_PID=$!
 
 # Small comforts in OpenClaw's private HOME (harmless if missing).
 cp "$HOME/.gitconfig" "$OPENCLAW_HOME/.gitconfig" 2>/dev/null || true
@@ -176,7 +201,8 @@ fi
 # Space with no UI to fix it. Log to a file and echo to the Space logs; capture
 # the real exit code; continue regardless.
 INSTALL_TIMEOUT="${INSTALL_TIMEOUT:-600}"
-echo "Running $DATA_DIR/install.sh (blocking, ${INSTALL_TIMEOUT}s limit)…"
+PHASE_T0=$(date +%s)
+boot "running $DATA_DIR/install.sh (blocking, ${INSTALL_TIMEOUT}s limit)…"
 timeout "$INSTALL_TIMEOUT" sh "$DATA_DIR/install.sh" > "$DATA_DIR/install.log" 2>&1
 INSTALL_CODE=$?
 cat "$DATA_DIR/install.log"
@@ -188,6 +214,8 @@ else
   echo "[install.sh FAILED (exit $INSTALL_CODE) — starting anyway; fix it via the Files browser, see $DATA_DIR/install.log]"
 fi
 echo "[install.sh finished $(date -u) exit=$INSTALL_CODE]" >> "$DATA_DIR/install.log"
+boot "install.sh finished in $(boot_elapsed "$PHASE_T0") (exit $INSTALL_CODE)"
+boot "starting the app — boot took $(boot_elapsed "$BOOT_T0")"
 
 # Keep PID 1 as a tiny supervisor so normal Space/dev restarts receive a final
 # state checkpoint. The timer bounds loss on an ungraceful stop; the child is
@@ -207,10 +235,20 @@ checkpoint_loop() {
 checkpoint_loop &
 CHECKPOINT_PID=$!
 
+# The prune holds the checkpoint lock a batch at a time; stop it (and wait
+# for it) before the final checkpoint rather than racing it at shutdown.
+stop_prune() {
+  kill -0 "$PRUNE_PID" 2>/dev/null || return 0
+  sh "$AGENT_STATE_SCRIPT" stop-prune
+  kill -TERM "$PRUNE_PID" 2>/dev/null
+  wait "$PRUNE_PID" 2>/dev/null
+}
+
 finish() {
   code="${1:-0}"
   kill "$CHECKPOINT_PID" 2>/dev/null || true
   wait "$CHECKPOINT_PID" 2>/dev/null || true
+  stop_prune
   # A timer checkpoint may still be finishing after its loop shell is stopped.
   # checkpoint-final waits for that lock, then captures the quiet post-Node
   # state instead of silently treating a busy lock as success.
