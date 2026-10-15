@@ -19,8 +19,8 @@ set -u
 
 MODE="${1:-}"
 case "$MODE" in
-  restore|checkpoint|checkpoint-final|prune|_part) ;;
-  *) echo "usage: $0 restore|checkpoint|checkpoint-final|prune" >&2; exit 2 ;;
+  restore|checkpoint|checkpoint-final|prune|stop-prune|_part|_adapter) ;;
+  *) echo "usage: $0 restore|checkpoint|checkpoint-final|prune|stop-prune" >&2; exit 2 ;;
 esac
 SELF="$0"
 
@@ -66,14 +66,31 @@ DRY_RUN="${AGENT_STATE_DRY_RUN:-}"
 
 LOCK="$AM_LOCAL/agent-state-checkpoint.lock"
 mkdir -p "$AM_LOCAL"
-if [ "$MODE" = _part ]; then
-  # One slice of a parallel restore, started by the restore holding the lock.
+if [ "$MODE" = stop-prune ]; then
+  # The entrypoint, at shutdown: stop a running prune's whole process group
+  # (it was started under setsid) and return once it is gone, so the final
+  # checkpoint neither races it nor waits on it.
+  _pf="$AM_LOCAL/agent-state-prune.pgid"
+  _g=$(cat "$_pf" 2>/dev/null) || exit 0
+  [ -n "$_g" ] || exit 0
+  kill -TERM "-$_g" 2>/dev/null || { rm -f "$_pf"; exit 0; }
+  _i=0
+  while kill -0 "-$_g" 2>/dev/null && [ "$_i" -lt 50 ]; do sleep 0.1; _i=$((_i + 1)); done
+  kill -KILL "-$_g" 2>/dev/null
+  rm -f "$_pf"
+  echo "agent-state: stopped the junk prune for shutdown"
+  exit 0
+elif [ "$MODE" = _part ] || [ "$MODE" = _adapter ]; then
+  # Part of a parallel restore, started by the restore holding the lock.
   :
 elif [ "$MODE" = prune ]; then
-  # Deletes only paths no checkpoint writes and no restore reads, so it does
-  # not contend with either; it only must not run twice at once.
+  # One prune at a time. It also takes the CHECKPOINT lock, a batch at a time
+  # (see the prune below): a checkpoint that published a new Claude backup
+  # between the prune listing the backups and deleting them would otherwise
+  # lose it.
   exec 8>"$AM_LOCAL/agent-state-prune.lock"
   flock -n 8 || exit 0
+  exec 9>"$LOCK"
 else
   exec 9>"$LOCK"
   if [ "$MODE" = restore ] || [ "$MODE" = checkpoint-final ]; then
@@ -87,7 +104,7 @@ else
   fi
 fi
 
-log() { echo "agent-state: $*"; }
+log() { echo "${AGENT_STATE_LOG_PREFIX:-}agent-state: $*"; }
 now() { date +%s; }
 elapsed() {
   _s=$(( $(now) - $1 ))
@@ -486,6 +503,16 @@ if [ "$MODE" = _part ]; then
   exit $?
 fi
 
+if [ "$MODE" = _adapter ]; then
+  # One adapter in its own process group (the restore starts it under setsid),
+  # so an interrupted restore can stop it and every xargs, slice and rsync
+  # under it in one kill — not just this shell.
+  WORK="$2"
+  echo "$$" > "$WORK/pgid.$3"
+  run_adapter "$3"
+  exit $?
+fi
+
 if [ "$MODE" = prune ]; then
   # Junk the excludes above keep out of every restore and checkpoint, but that
   # an older version had already written to the bucket — 10k+ files of it,
@@ -493,8 +520,28 @@ if [ "$MODE" = prune ]; then
   # only under the durable roots, never through a symlink (find does not
   # follow them; rm removes a link, not its target), at most $PRUNE_MAX files.
   WORK=$(mktemp -d "$AM_LOCAL/agent-state-prune.XXXXXX")
-  trap 'rm -rf "$WORK"' EXIT
+  # The entrypoint starts the prune as a process-group leader and stops that
+  # group at shutdown; this is how it finds it.
+  echo "$$" > "$AM_LOCAL/agent-state-prune.pgid"
+  trap 'rm -rf "$WORK" "$AM_LOCAL/agent-state-prune.pgid"' EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  trap 'exit 129' HUP
   budget="$PRUNE_MAX" total=0 t0=$(now)
+  # Deletion happens under the checkpoint lock, PRUNE_BATCH files at a time,
+  # so a timer checkpoint skips at most one batch and a final one waits for
+  # at most one batch.
+  PRUNE_BATCH="${AGENT_STATE_PRUNE_BATCH:-2000}"
+  rm_locked() {
+    split -t '\0' -l "$PRUNE_BATCH" "$1" "$WORK/batch."
+    for _b in "$WORK"/batch.*; do
+      [ -e "$_b" ] || continue
+      flock 9
+      xargs -0 -r -n 64 -P 16 rm -f -- < "$_b"
+      flock -u 9
+      rm -f "$_b"
+    done
+  }
   prune_subtree() {
     _root="$1"
     [ -e "$_root" ] || [ -L "$_root" ] || return 0
@@ -502,7 +549,7 @@ if [ "$MODE" = prune ]; then
     [ -d "$_root" ] && [ "$budget" -gt 0 ] || return 0
     find "$_root" \( -type f -o -type l \) -print0 | head -z -n "$budget" > "$WORK/list"
     _n=$(tr -cd '\0' < "$WORK/list" | wc -c | tr -d ' ')
-    [ "$_n" -gt 0 ] && xargs -0 -r -n 64 -P 16 rm -f -- < "$WORK/list"
+    [ "$_n" -gt 0 ] && rm_locked "$WORK/list"
     find "$_root" -depth -type d -empty -delete 2>/dev/null
     budget=$((budget - _n)); total=$((total + _n))
     [ "$_n" -gt 0 ] && log "prune: ${_root#"$DATA_DIR"/}: removed $_n files"
@@ -510,14 +557,25 @@ if [ "$MODE" = prune ]; then
   for rel in .tmp tmp cache mcp-oauth-locks plugins/cache plugins/.remote-plugin-install-staging; do
     prune_subtree "$CODEX_DURABLE/$rel"
   done
-  # Claude config backups beyond the newest few, by name.
-  if [ -d "$CLAUDE_DURABLE/backups" ] && [ ! -L "$CLAUDE_DURABLE/backups" ] && [ "$budget" -gt 0 ]; then
-    newest_claude_backups "$CLAUDE_DURABLE/backups" "$KEEP_CLAUDE_BACKUPS" > "$WORK/keep"
-    ls -A "$CLAUDE_DURABLE/backups" | grep -E '^\.claude\.json\.backup\.[0-9]+$' | grep -vxF -f "$WORK/keep" \
-      | head -n "$budget" | sed "s|^|$CLAUDE_DURABLE/backups/|" | tr '\n' '\0' > "$WORK/list"
-    n=$(tr -cd '\0' < "$WORK/list" | wc -c | tr -d ' ')
-    [ "$n" -gt 0 ] && xargs -0 -r -n 64 -P 16 rm -f -- < "$WORK/list" \
-      && log "prune: ${CLAUDE_DURABLE#"$DATA_DIR"/}/backups: removed $n old config backups, kept the newest $KEEP_CLAUDE_BACKUPS"
+  # Claude config backups beyond the newest few. What to keep and what to
+  # delete come from ONE listing, read and acted on while holding the
+  # checkpoint lock, so a backup a checkpoint publishes is either in that
+  # listing (and ranked) or arrives after the prune has let go.
+  _bk="$CLAUDE_DURABLE/backups"
+  if [ -d "$_bk" ] && [ ! -L "$_bk" ] && [ "$budget" -gt 0 ]; then
+    flock 9
+    ls -A "$_bk" | grep -E '^\.claude\.json\.backup\.[0-9]+$' | sort -t . -k 5,5n > "$WORK/backups"
+    _all=$(wc -l < "$WORK/backups" | tr -d ' ')
+    _drop=$((_all - KEEP_CLAUDE_BACKUPS))
+    [ "$_drop" -gt "$budget" ] && _drop="$budget"
+    n=0
+    if [ "$_drop" -gt 0 ]; then
+      head -n "$_drop" "$WORK/backups" | sed "s|^|$_bk/|" | tr '\n' '\0' > "$WORK/list"
+      xargs -0 -r -n 64 -P 16 rm -f -- < "$WORK/list"
+      n="$_drop"
+    fi
+    flock -u 9
+    [ "$n" -gt 0 ] && log "prune: ${CLAUDE_DURABLE#"$DATA_DIR"/}/backups: removed $n old config backups, kept the newest $KEEP_CLAUDE_BACKUPS"
     total=$((total + n)); budget=$((budget - n))
   fi
   if [ "$total" -gt 0 ]; then
@@ -567,15 +625,37 @@ if [ "$MODE" = restore ]; then
   pids=""
   heartbeat $$ "$t0" &
   hb=$!
-  # The heartbeat must not outlive the restore, however it ends; the adapters
-  # must not outlive an interrupted one.
-  trap 'kill $hb $pids 2>/dev/null; rm -rf "$WORK"' EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  trap 'exit 129' HUP
+  # Interrupted, stop every adapter's whole process group — its xargs, slice
+  # shells, rsyncs and sleeps — and reap them before reporting failure:
+  # otherwise they go on changing the live trees after the restore has said
+  # it failed. TERM first, KILL after five seconds.
+  stop_workers() {
+    trap '' INT TERM HUP
+    _groups=""
+    for _f in "$WORK"/pgid.*; do [ -e "$_f" ] && _groups="$_groups $(cat "$_f")"; done
+    for _g in $_groups; do kill -TERM "-$_g" 2>/dev/null; done
+    kill -TERM $pids 2>/dev/null
+    _i=0
+    while [ "$_i" -lt 50 ]; do
+      _alive=0
+      for _g in $_groups; do kill -0 "-$_g" 2>/dev/null && _alive=1; done
+      [ "$_alive" -eq 0 ] && break
+      sleep 0.1; _i=$((_i + 1))
+    done
+    for _g in $_groups; do kill -KILL "-$_g" 2>/dev/null; done
+    kill "$hb" 2>/dev/null
+    wait
+  }
+  # The heartbeat must not outlive the restore, however it ends.
+  trap 'kill $hb 2>/dev/null; rm -rf "$WORK"' EXIT
+  trap 'stop_workers; exit 130' INT
+  trap 'stop_workers; exit 143' TERM
+  trap 'stop_workers; exit 129' HUP
   [ -n "$DRY_RUN" ] || log "restoring $ADAPTERS from ${DATA_DIR%/}/state, $JOBS rsyncs per large tree"
   for a in $ADAPTERS; do
-    run_adapter "$a" &
+    # Its own process group; -w so the restore waits on it and gets its status
+    # even if setsid has to fork to make it a group leader.
+    setsid -w sh "$SELF" _adapter "$WORK" "$a" &
     pids="$pids $!"
   done
   for p in $pids; do

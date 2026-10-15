@@ -159,7 +159,10 @@ boot "agent state restored in $(boot_elapsed "$PHASE_T0")"
 # backups) is excluded from every restore now, but still costs bucket space and
 # listing time. Remove it in the background: the app does not wait for it, and
 # it deletes only paths no restore reads and no checkpoint writes.
-( sh "$AGENT_STATE_SCRIPT" prune 2>&1 | sed 's/^/[boot] /' ) &
+# In its own process group (setsid), so stop_prune below can stop it and its
+# rm workers together; -w keeps $! meaningful even if setsid has to fork.
+AGENT_STATE_LOG_PREFIX='[boot] ' setsid -w sh "$AGENT_STATE_SCRIPT" prune &
+PRUNE_PID=$!
 
 # Small comforts in OpenClaw's private HOME (harmless if missing).
 cp "$HOME/.gitconfig" "$OPENCLAW_HOME/.gitconfig" 2>/dev/null || true
@@ -232,10 +235,20 @@ checkpoint_loop() {
 checkpoint_loop &
 CHECKPOINT_PID=$!
 
+# The prune holds the checkpoint lock a batch at a time; stop it (and wait
+# for it) before the final checkpoint rather than racing it at shutdown.
+stop_prune() {
+  kill -0 "$PRUNE_PID" 2>/dev/null || return 0
+  sh "$AGENT_STATE_SCRIPT" stop-prune
+  kill -TERM "$PRUNE_PID" 2>/dev/null
+  wait "$PRUNE_PID" 2>/dev/null
+}
+
 finish() {
   code="${1:-0}"
   kill "$CHECKPOINT_PID" 2>/dev/null || true
   wait "$CHECKPOINT_PID" 2>/dev/null || true
+  stop_prune
   # A timer checkpoint may still be finishing after its loop shell is stopped.
   # checkpoint-final waits for that lock, then captures the quiet post-Node
   # state instead of silently treating a busy lock as success.

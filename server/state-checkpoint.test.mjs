@@ -333,6 +333,14 @@ try {
     return { child, done };
   };
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // Every process whose command line names `needle` (a fixture root): the
+  // restore's workers carry their paths in their arguments.
+  const processesNaming = (needle) => fs.readdirSync('/proc').filter((d) => /^\d+$/.test(d)).flatMap((pid) => {
+    try {
+      const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ');
+      return cmd.includes(needle) && Number(pid) !== process.pid ? [`${pid}: ${cmd.slice(0, 80)}`] : [];
+    } catch { return []; }
+  });
   const quietAfter = async (file, ms) => {
     const before = fs.readFileSync(file, 'utf8');
     await sleep(ms);
@@ -367,14 +375,29 @@ try {
     check('…while the other slices still ran', fs.existsSync(path.join(e.CLAUDE_CONFIG_DIR, 'projects/p0/s0.jsonl')));
     check('the heartbeat stops when the restore fails', await quietAfter(outFail, 2500));
 
-    // …and when it is killed.
-    const outKill = path.join(r, 'out-kill.txt');
-    const killed = runTo(e, 'restore', outKill, { ...slow, STUB_SLEEP: '6' });
-    for (let i = 0; i < 40 && !/still restoring/.test(fs.readFileSync(outKill, 'utf8')); i++) await sleep(100);
-    killed.child.kill('SIGTERM');
-    const k = await killed.done;
+    // …and when it is killed: the restore's whole worker tree — xargs, slice
+    // shells, rsyncs, sleeps — must be gone, not just quiet. Two proofs: its
+    // stdout pipe reaches EOF (every process holding it has exited), and no
+    // process anywhere still names this fixture on its command line.
+    fs.rmSync(e.CLAUDE_CONFIG_DIR, { recursive: true, force: true });
+    // The stubbed rsyncs sleep far longer than the checks below wait, so a
+    // worker that survived the TERM is still there to be seen — not one that
+    // merely finished on its own in the meantime.
+    const kill = spawn('sh', [script, 'restore'], { env: { ...e, ...slow, STUB_SLEEP: '25' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let killOut = '';
+    kill.stdout.on('data', (chunk) => { killOut += chunk; });
+    const eof = new Promise((resolve) => kill.stdout.on('close', () => resolve(true)));
+    const exited = new Promise((resolve) => kill.on('exit', (code, signal) => resolve({ code, signal })));
+    for (let i = 0; i < 60 && !/still restoring/.test(killOut); i++) await sleep(100);
+    const workersBefore = processesNaming(r).length;
+    kill.kill('SIGTERM');
+    const k = await exited;
+    const leftovers = processesNaming(r);
+    const closed = await Promise.race([eof, sleep(4000).then(() => false)]);
     check('a TERM ends the restore with a failure status', k.code !== 0, JSON.stringify(k));
-    check('the heartbeat stops when the restore is killed', await quietAfter(outKill, 2500));
+    check('…its stdout reaches EOF: no worker is left holding it', closed === true);
+    check('…and no xargs, slice shell, rsync or sleep of it is left running',
+      workersBefore > 0 && leftovers.length === 0, `${workersBefore} before; left: ${leftovers.join(' | ')}`);
     fs.rmSync(r, { recursive: true, force: true });
   }
 
@@ -438,6 +461,55 @@ try {
     check('prune keeps the newest five Claude config backups',
       JSON.stringify(left) === JSON.stringify(stamps.slice(-5).map((s) => `.claude.json.backup.${s}`)), left.join(','));
     check('prune says what it removed', /prune: removed \d+ junk files/.test(out), out);
+
+    // Serialised with checkpoints: while a checkpoint holds the lock, the
+    // prune deletes nothing — and a backup that checkpoint publishes before
+    // letting go is ranked with the rest, not deleted as "old".
+    for (const rel of junk) put(path.join(e.CODEX_DURABLE, rel), 'x');
+    const lockFile = path.join(e.AM_LOCAL, 'agent-state-checkpoint.lock');
+    fs.mkdirSync(e.AM_LOCAL, { recursive: true });
+    const holder = spawn('flock', [lockFile, 'sh', '-c', 'echo held; sleep 30'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    await waitFor(holder, 'held');
+    const prune = spawn('sh', [script, 'prune'], { env: e, stdio: ['ignore', 'pipe', 'pipe'] });
+    let pruneOut = '';
+    prune.stdout.on('data', (c) => { pruneOut += c; });
+    const pruneDone = new Promise((resolve) => prune.on('exit', (code) => resolve(code)));
+    await sleep(1500);
+    check('prune waits while a checkpoint holds the lock, deleting nothing',
+      prune.exitCode === null && junk.every((rel) => fs.existsSync(path.join(e.CODEX_DURABLE, rel))), pruneOut);
+    const newest = 1793000000000;
+    put(path.join(e.CLAUDE_DURABLE, `backups/.claude.json.backup.${newest}`), 'just published');
+    holder.kill('SIGKILL');
+    const pruneCode = await pruneDone;
+    const afterRace = fs.readdirSync(path.join(e.CLAUDE_DURABLE, 'backups')).filter((n) => n.startsWith('.claude.json.backup.')).sort();
+    check('…then prunes once the checkpoint lets go',
+      pruneCode === 0 && junk.every((rel) => !fs.existsSync(path.join(e.CODEX_DURABLE, rel))), pruneOut);
+    // At shutdown the entrypoint stops a running prune (stop-prune) before the
+    // final checkpoint: its whole group goes, and the lock is free at once.
+    for (const rel of junk) put(path.join(e.CODEX_DURABLE, rel), 'x');
+    const holder2 = spawn('flock', [lockFile, 'sh', '-c', 'echo held; sleep 30'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    await waitFor(holder2, 'held');
+    const running = spawn('setsid', ['-w', 'sh', script, 'prune'], { env: e, stdio: ['ignore', 'pipe', 'pipe'] });
+    const runningDone = new Promise((resolve) => running.on('exit', resolve));
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(e.AM_LOCAL, 'agent-state-prune.pgid')); i++) await sleep(100);
+    const pruneGroup = fs.readFileSync(path.join(e.AM_LOCAL, 'agent-state-prune.pgid'), 'utf8').trim();
+    const inGroup = (g) => fs.readdirSync('/proc').filter((d) => /^\d+$/.test(d)).filter((pid) => {
+      try { return fs.readFileSync(`/proc/${pid}/stat`, 'utf8').replace(/^.*\) /, '').split(' ')[2] === g; } catch { return false; }
+    });
+    const groupBefore = inGroup(pruneGroup).length;
+    const stopped = execFileSync('sh', [script, 'stop-prune'], { env: e, encoding: 'utf8' });
+    await Promise.race([runningDone, sleep(5000)]);
+    holder2.kill('SIGKILL');
+    check('stop-prune ends a running prune and every process of it',
+      groupBefore > 0 && inGroup(pruneGroup).length === 0 && /stopped the junk prune/.test(stopped), `${groupBefore} in group before; ${stopped}`);
+    check('…before it deleted anything it was still waiting to',
+      junk.every((rel) => fs.existsSync(path.join(e.CODEX_DURABLE, rel))));
+    check('…and leaves no stale group id behind', !fs.existsSync(path.join(e.AM_LOCAL, 'agent-state-prune.pgid')));
+    check('stop-prune with no prune running is a no-op',
+      execFileSync('sh', [script, 'stop-prune'], { env: e, encoding: 'utf8' }) === '');
+
+    check('…keeping a backup the checkpoint published meanwhile as one of the newest five',
+      afterRace.length === 5 && afterRace.includes(`.claude.json.backup.${newest}`), afterRace.join(','));
 
     const { r: r2, e: e2 } = fresh('prune-cap');
     for (let i = 0; i < 10; i++) put(path.join(e2.CODEX_DURABLE, `tmp/f${i}`), 'x');
