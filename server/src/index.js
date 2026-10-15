@@ -22,6 +22,7 @@ import {
   ensureDirs, cliCatalog, cliById, slugify, workspacePath, refreshVersions, PASSIVE_CLIS, isRemote,
 } from './config.js';
 import { createSkillsService, skillTargetDirs } from './skills.js';
+import { deployUpstreamTree, isBehind, upstreamShaFromMessage } from './update-deploy.js';
 import { cliUpdateStatus, startCliUpdate, configureCliUpdate } from './cli-update.js';
 import * as remote from './remote.js';
 import * as store from './sessions.js';
@@ -1563,16 +1564,35 @@ function upstreamSha() {
   });
 }
 
+// What upstream commit this Space is actually running.
+//
+// Since the updater deploys upstream's TREE as one commit, the Space's HEAD sha
+// is its own and will never equal upstream's again — comparing them would
+// report "behind" forever. The deploy records which upstream commit it carried,
+// so read that back. A Space that has only ever been force-pushed the old way
+// has no marker, and falls back to the sha comparison that was right for it.
+async function deployedUpstream(own, headers) {
+  try {
+    const res = await fetch(`https://huggingface.co/api/spaces/${own}/commits/main?limit=1`, { headers });
+    if (!res.ok) return null;
+    const commits = await res.json();
+    const head = Array.isArray(commits) ? commits[0] : null;
+    return upstreamShaFromMessage(`${head?.title || ''}\n${head?.message || ''}`);
+  } catch { return null; }
+}
+
 async function updateSource() {
   const own = process.env.SPACE_ID;
   const token = hfToken();
   const headers = token ? { authorization: `Bearer ${token}` } : {};
-  const [info, latest] = await Promise.all([
+  const [info, latest, deployed] = await Promise.all([
     fetch(`https://huggingface.co/api/spaces/${own}`, { headers }).then((r) => r.json()),
     upstreamSha(),
+    deployedUpstream(own, headers),
   ]);
-  return { own, ownSha: info.sha || null, source: SOURCE_SLUG, sourceUrl: SOURCE_URL, latestSha: latest };
+  return { own, ownSha: info.sha || null, deployed, source: SOURCE_SLUG, sourceUrl: SOURCE_URL, latestSha: latest };
 }
+
 
 api.get('/api/update/check', async (_req, res) => {
   if (!process.env.SPACE_ID) return res.json({ ok: false, reason: 'no-space' });
@@ -1583,8 +1603,9 @@ api.get('/api/update/check', async (_req, res) => {
       source: src.source,
       sourceUrl: src.sourceUrl,
       current: src.ownSha,
+      deployed: src.deployed,
       latest: src.latestSha,
-      behind: !!(src.ownSha && src.latestSha && src.ownSha !== src.latestSha),
+      behind: isBehind(src),
       canUpdate: !!hfToken(),
     });
   } catch (e) { throw e; }
@@ -1598,24 +1619,27 @@ api.post('/api/update', async (_req, res) => {
   if (updateBusy) return res.json({ ok: false, reason: 'busy' });
   updateBusy = true;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'am-update-'));
+  const scrub = (text) => String(text).split(token).join('***');
   const git = (args, cwd) => new Promise((resolve, reject) => {
     execFile('git', args, { cwd, timeout: 180_000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } },
-      (err, stdout, stderr) => (err ? reject(new Error(String(stderr || err.message).replace(token, '***'))) : resolve(stdout)));
+      (err, stdout, stderr) => (err ? reject(new Error(scrub(stderr || err.message))) : resolve(stdout)));
   });
   try {
     const src = await updateSource();
     if (!src.latestSha) return res.json({ ok: false, reason: 'upstream-unreachable' });
-    if (src.ownSha && src.ownSha === src.latestSha) {
-      return res.json({ ok: true, upToDate: true });
-    }
-    // Clone upstream's branch, then force-push it onto the Space repo's main —
-    // HF only builds `main`, whatever upstream calls its default branch.
-    await git(['clone', '--quiet', '--branch', SOURCE_BRANCH, SOURCE_URL, dir]);
-    await git(['remote', 'add', 'own', `https://user:${token}@huggingface.co/spaces/${src.own}`], dir);
-    await git(['push', '--force', 'own', 'HEAD:main'], dir);
-    res.json({ ok: true, from: src.ownSha, to: src.latestSha });
+    if (!isBehind(src)) return res.json({ ok: true, upToDate: true });
+    // Answered, not thrown: a 5xx body is replaced wholesale by errorEnvelope,
+    // which is why every one of these failures reached the operator as
+    // "Request failed." with nothing to act on.
+    const result = await deployUpstreamTree({
+      sourceUrl: SOURCE_URL, branch: SOURCE_BRANCH, dir, git,
+      ownUrl: `https://user:${token}@huggingface.co/spaces/${src.own}`,
+    });
+    if (!result.ok) console.error('[update]', result.reason, result.detail || '');
+    res.json(result);
   } catch (e) {
-    throw e;
+    console.error('[update]', e && e.message);
+    res.json({ ok: false, reason: 'update-failed', detail: scrub(e && e.message || 'unknown').slice(0, 600) });
   } finally {
     updateBusy = false;
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}

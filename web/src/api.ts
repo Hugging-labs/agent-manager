@@ -151,9 +151,11 @@ export const relaunchSpace = (): Promise<{ ok: boolean; reason?: string }> =>
 export interface UpdateCheck {
   ok: boolean; reason?: string; source?: string; sourceUrl?: string;
   current?: string | null; latest?: string | null; behind?: boolean; canUpdate?: boolean;
+  /** The upstream commit this Space's last tree deploy carried, if any. */
+  deployed?: string | null;
 }
 export const checkUpdate = (): Promise<UpdateCheck> => fetch('/api/update/check').then(json);
-export const runUpdate = (): Promise<{ ok: boolean; reason?: string; upToDate?: boolean }> =>
+export const runUpdate = (): Promise<{ ok: boolean; reason?: string; detail?: string; upToDate?: boolean }> =>
   fetch('/api/update', { method: 'POST' }).then(json);
 
 // ---- installing the latest agent CLIs in place (no Space rebuild) ----

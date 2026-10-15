@@ -376,7 +376,9 @@ export default function SettingsView({
       if (r.ok && r.upToDate) setUpdState({ msg: 'Already up to date.' });
       else if (r.ok) setUpdState({ msg: 'Update pushed. The Space rebuilds now (1 to 2 min); reload once it is back.' });
       else if (r.reason === 'no-token') setUpdState({ msg: 'Add a write-scoped HF_TOKEN secret to the Space to enable updates.' });
-      else setUpdState({ msg: `Update failed (${r.reason}).` });
+      // The reason is the point: every one of these used to arrive as
+      // "Request failed." with nothing to act on.
+      else setUpdState({ msg: `Update failed (${r.reason})${r.detail ? `: ${r.detail}` : ''}` });
     } catch { setUpdState({ msg: 'Request failed.' }); }
   };
 
