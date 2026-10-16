@@ -257,6 +257,21 @@ try {
   assert.equal(oddValues.fileLinkUrl, `${origin}//evil.example/x?vvdebug=1#file=a.md`);
   assert.equal(oddValues.appRootUrl, `${origin}/`);
   for (const [label, value] of Object.entries(oddValues)) clean(value, `odd-path ${label}`);
+  // The real page-HTML refetch at this path, with the foreign parameters still
+  // in the address: assert the request that actually goes out, not a string.
+  // Anything sent to another host is refused here so it never leaves the box.
+  const offOrigin = (url) => url.origin !== origin;
+  await context.route(offOrigin, (route) => route.abort());
+  const oddBefore = requests.length;
+  const oddHtml = await odd.evaluate(() => t.fetchPageHtml());
+  const oddFetches = requests.slice(oddBefore).filter((r) => r.resourceType() === 'fetch');
+  assert.equal(oddFetches.length, 1, 'odd-path refetch sends exactly one request');
+  const sent = new URL(oddFetches[0].url());
+  assert.equal(sent.origin, origin, `odd-path refetch stays on this origin: ${sent.origin}`);
+  assert.equal(sent.pathname, '//evil.example/x', 'odd-path refetch asks for this page');
+  assert.equal(sent.search, '', 'odd-path refetch carries no query');
+  assert.ok(oddHtml, 'odd-path refetch still gets the page HTML');
+  await context.unroute(offOrigin);
   // The boot cleanup itself, run on the dirty odd path, stays on this origin too.
   assert.equal(await odd.evaluate(() => t.stripForeignParams()), true);
   assert.equal(odd.url(), `${origin}//evil.example/x?vvdebug=1`);
