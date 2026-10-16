@@ -44,7 +44,7 @@ export const lazyModuleInternals = {
   importUrl: (url: string): Promise<unknown> => import(/* @vite-ignore */ url),
   fetchPageHtml: async (): Promise<string | null> => {
     try {
-      const r = await fetch(`${location.pathname}${location.search}`, { cache: 'no-store', headers: { accept: 'text/html' } });
+      const r = await fetch(location.pathname, { cache: 'no-store', headers: { accept: 'text/html' } });
       return r.ok ? await r.text() : null;
     } catch { return null; }
   },

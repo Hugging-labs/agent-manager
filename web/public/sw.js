@@ -13,9 +13,25 @@ self.addEventListener('push', (e) => {
   }));
 });
 
+// Same list as web/src/lib/appUrl.ts: the only query parameters the app reads.
+const APP_PARAMS = ['vvdebug', 'touchdebug'];
+
+// A notification may only open a page of this app, with the app's own query
+// parameters. Anything else (another origin, edge parameters) falls back to '/'.
+function appTarget(raw) {
+  try {
+    const url = new URL(raw || '/', self.location.origin);
+    if (url.origin !== self.location.origin) return '/';
+    const kept = new URLSearchParams();
+    for (const key of APP_PARAMS) for (const value of url.searchParams.getAll(key)) kept.append(key, value);
+    const search = kept.toString();
+    return url.pathname + (search ? '?' + search : '') + url.hash;
+  } catch { return '/'; }
+}
+
 self.addEventListener('notificationclick', (e) => {
   e.notification.close();
-  const url = (e.notification.data && e.notification.data.url) || '/';
+  const url = appTarget(e.notification.data && e.notification.data.url);
   e.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((cs) => {
     for (const c of cs) {
       if ('focus' in c) {

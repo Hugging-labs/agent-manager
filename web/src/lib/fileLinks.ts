@@ -1,3 +1,5 @@
+import { appPath } from './appUrl';
+
 export type FileLinkContext = { session?: string; root?: string; base?: string; unavailable?: boolean };
 export type FileLinkRequest = { file: string; session?: string; root?: string; line?: number; column?: number; unavailable?: boolean };
 export type FileLinkTarget = { root: string; path: string; absolute: string };
@@ -69,7 +71,7 @@ export function requestFromHash(hash: string): FileLinkRequest | null {
 }
 
 export function fileLinkUrl(request: FileLinkRequest): string {
-  return location.pathname + location.search + fileLinkHash(request);
+  return appPath(fileLinkHash(request));
 }
 
 export function fileResourceUrl(action: 'resolve' | 'preview' | 'raw' | 'download', request: FileLinkRequest): string {
