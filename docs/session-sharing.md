@@ -20,9 +20,11 @@ own Agent Manager and keep working.
 > history plus §5 below. Sections 5 and 9 are kept as the DESIGN for whenever this is picked
 > up; they do not describe the code.
 >
-> The visibility choice is now plainly **Private** or **Public**. Private is a gated dataset
-> with named users granted access directly, so the username box remains there — it *grants*
-> access, without which a gated dataset is readable by nobody. Public needs no names at all,
+> The visibility choice is **Approved people only** or **Public**. The first is a gated
+> dataset with named users granted access directly, so the username box remains there — it
+> *grants* access, without which a gated dataset is readable by nobody. It is not a private
+> repo: the repo name, card and file list are public, so none of them is built from the
+> session (§5, publish order). Public needs no names at all,
 > so that mode has no box: you send the link.
 
 ## 1. Decisions (locked)
@@ -238,7 +240,26 @@ A share always produces a payload dataset; visibility is a flag on it.
 | Mode | Payload repo | Who can read it |
 |---|---|---|
 | Public | public dataset | anyone; the Hub trace viewer also renders it |
-| Private | **gated** dataset + `grant_access(recipient)` | only granted users, via authenticated download |
+| Approved people only | **gated** dataset + `grant_access(recipient)` | only granted users, via authenticated download |
+
+### Publish order (server/src/share.js `shareSession`)
+
+A gated repo is a public repo with an access gate, so the gate has to be on before any
+trace byte is uploaded:
+
+1. Redaction gate: any secret hit refuses the share, public or gated.
+2. Create the repo public and empty, under a fresh random name. No exist-ok: a taken name
+   is refused, never written into.
+3. Gated: set `gated: manual`, re-read the repo and check it reports `manual`. If not,
+   delete the empty repo and stop. Nothing has been uploaded.
+4. Upload, grant users, then re-read and check the trace is there and still gated.
+5. Any failure in step 4 rolls back: make the repo private (and check), else delete it
+   (and check). If neither works, the error says the trace may be public and gives the URL.
+
+Observed on the Hub with a gated repo and a logged-out client: the trace file returns 401,
+the card `README.md` is readable, and `/api/datasets/<repo>/tree/main` lists the file
+names. So a gated share uses a neutral repo name (`am-session-<random>`), card title and
+trace filename (`trace.jsonl`); `meta/` names were already neutral.
 
 Gating is used here as a **transport ACL, not a viewer entry point.** It does block the Hub
 dataset viewer — the anonymous datasets-server reports a gated repo as *"does not exist, or
@@ -381,8 +402,8 @@ Ruleset v1:
   leaks precisely what the trace hid. The first run of the prototype did exactly this: the
   trace was clean while the briefing still carried a personal email address.
 
-Gate: **public share blocks on any hit.** Private share warns and shows a diff preview
-before publishing. Prior art worth copying: Hermes' `--redact`, and
+Gate: **any share, public or gated, blocks on any secret hit** (email is redacted but does
+not block). The ruleset lives in `scripts/share-redact.mjs`. Prior art worth copying: Hermes' `--redact`, and
 [`pi-share-hf`](https://github.com/badlogic/pi-share-hf) (TruffleHog + LLM review,
 upload only if clean). An optional LLM review pass is a natural phase-3 addition.
 
@@ -447,7 +468,7 @@ generator wearing a different hat.
 
 ## 9. UI surface
 
-- **Share** — session context menu → dialog: visibility (public / private-gated), recipients,
+- **Share** — session context menu → dialog: visibility (public / approved people only), recipients,
   redaction report, publish. On success: copyable link, and the session records
   `lastShare: { repo, sha, sentTo[] }`.
 - **Inbox banner** — persists until actioned, with Accept / Decline and the sender's name.

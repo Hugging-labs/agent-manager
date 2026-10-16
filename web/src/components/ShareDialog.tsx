@@ -5,14 +5,16 @@ import { LockGlyph } from './icons';
 
 // Share one agent session as a Hub dataset (docs/session-sharing.md).
 //
-// Private or public, one code path on the server: private is a gated repo with
-// the named users pre-authorized (the Hub lets us grant access without them
-// requesting it), public is public. Either way the outcome is a LINK the operator
-// sends to whoever should read it — there is no in-app notification, by design.
+// "Approved people only" or public, one code path on the server: the first is a
+// gated repo with the named users pre-authorized (the Hub lets us grant access
+// without them requesting it), public is public. It is NOT a private repo — the
+// repo name, card and file list are listed publicly — so the dialog says so.
+// Either way the outcome is a LINK the operator sends to whoever should read it
+// — there is no in-app notification, by design.
 //
-// The dialog's job beyond collecting two fields is to be honest about redaction:
-// a public share is REFUSED when a credential is found, and we show which rule
-// caught what either way. A trace is not a thing to publish hopefully.
+// The dialog's job beyond collecting two fields is to be honest: a share is
+// REFUSED when a credential is found, and a failed share says exactly what
+// became of the dataset — above all when it may have been left public.
 export default function ShareDialog({ session, onClose }: { session: Session; onClose: () => void }) {
   const [info, setInfo] = useState<api.ShareInfo | null>(null);
   const [visibility, setVisibility] = useState<'public' | 'gated'>('gated');
@@ -21,6 +23,8 @@ export default function ShareDialog({ session, onClose }: { session: Session; on
   const [result, setResult] = useState<api.ShareResult | null>(null);
   const [blocked, setBlocked] = useState<{ message: string; hits: Record<string, number> } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Set only when a failed share could not be rolled back: the trace may be public.
+  const [exposed, setExposed] = useState<{ message: string; url: string | null } | null>(null);
   const [copied, setCopied] = useState(false);
 
   useEffect(() => { api.getShareInfo(session.id).then(setInfo).catch(() => setInfo(null)); }, [session.id]);
@@ -34,7 +38,7 @@ export default function ShareDialog({ session, onClose }: { session: Session; on
   const users = recipients.split(/[\s,]+/).map((u) => u.trim().replace(/^@/, '')).filter(Boolean);
 
   const publish = async () => {
-    setBusy(true); setError(null); setBlocked(null);
+    setBusy(true); setError(null); setBlocked(null); setExposed(null);
     try {
       setResult(await api.shareSession(session.id, {
         visibility,
@@ -42,6 +46,7 @@ export default function ShareDialog({ session, onClose }: { session: Session; on
       }));
     } catch (e) {
       if (e instanceof api.RedactionBlocked) setBlocked({ message: e.message, hits: e.hits });
+      else if (e instanceof api.ApiError && e.code === 'share-exposed') setExposed({ message: e.message, url: e.data.share?.url || null });
       else setError((e as Error).message || 'share failed');
     } finally {
       setBusy(false);
@@ -86,7 +91,7 @@ export default function ShareDialog({ session, onClose }: { session: Session; on
                 className={`btn-ghost${visibility === 'gated' ? ' on' : ''}`}
                 onClick={() => setVisibility('gated')}
               >
-                Private
+                Approved people only
               </button>
               <button
                 className={`btn-ghost${visibility === 'public' ? ' on' : ''}`}
@@ -103,7 +108,16 @@ export default function ShareDialog({ session, onClose }: { session: Session; on
               </p>
             )}
 
-            {/* Only for a private share, and only because it GRANTS access —
+            {visibility === 'gated' && (
+              <p className="share-note">
+                The dataset is listed publicly on the Hub, but only people you approve can read the trace.
+                Its repo name, card title and file list are public, so they are kept neutral and never
+                include the session’s name. Like a public share, it is <strong>refused</strong> if the
+                transcript contains anything credential-shaped.
+              </p>
+            )}
+
+            {/* Only for an approved-people share, and only because it GRANTS access —
                 without a named user a gated dataset is readable by nobody. A
                 public share needs no names: you just send the link. */}
             {visibility === 'gated' && (
@@ -116,8 +130,8 @@ export default function ShareDialog({ session, onClose }: { session: Session; on
                   autoFocus
                 />
                 <small>
-                  Hugging Face usernames. Published as a gated dataset and each person is granted
-                  access directly — they don’t have to request it. Optional — leave empty to publish
+                  Hugging Face usernames. Each person is approved directly — they don’t have to
+                  request it. If anyone can’t be approved, nothing is shared. Optional — leave empty to publish
                   with nobody granted yet.
                 </small>
               </label>
@@ -126,10 +140,22 @@ export default function ShareDialog({ session, onClose }: { session: Session; on
             {blocked && (
               <div className="share-blocked">
                 <strong>Not published.</strong> The transcript contains {hitList(blocked.hits)}.
-                Share it with named people instead, or clear the secret from the session first.
+                Clear the secret from the session first, or download the transcript instead.
               </div>
             )}
-            {error && <div className="share-blocked">{error}</div>}
+            {exposed && (
+              <div className="share-exposed" role="alert">
+                {exposed.url ? (
+                  <>
+                    <strong>This trace may be public at </strong>
+                    <a href={exposed.url} target="_blank" rel="noreferrer">{exposed.url}</a>
+                    <strong> — check it now.</strong>
+                    <div>Sharing failed, and the dataset could not be made private or deleted.</div>
+                  </>
+                ) : <strong>{exposed.message}</strong>}
+              </div>
+            )}
+            {error && <div className="share-blocked" role="alert">{error}</div>}
 
             <div className="share-actions">
               <button className="btn-ghost" onClick={onClose}>Cancel</button>
@@ -171,7 +197,7 @@ export default function ShareDialog({ session, onClose }: { session: Session; on
                   ? `Published for ${result.granted.join(', ')}.`
                   // Gated with nobody granted: the repo exists but is unreadable by
                   // anyone else, so say that rather than implying it was delivered.
-                  : 'Published as a gated dataset — nobody has access yet.'}
+                  : 'Published for approved people only — nobody has access yet.'}
             </p>
             <div className="share-linkrow">
               <input readOnly value={result.url} onFocus={(e) => e.currentTarget.select()} />
@@ -181,7 +207,7 @@ export default function ShareDialog({ session, onClose }: { session: Session; on
                 with it and what they do at the other end. */}
             <p className="share-note">
               Send this link to whoever should read it. They paste it into <em>Settings → Open a shared
-              trace</em> in their own Agent Manager to open the session{result.visibility === 'public' ? '' : ' — a granted user can read it even though the dataset is gated'}.
+              trace</em> in their own Agent Manager to open the session{result.visibility === 'public' ? '' : ' — an approved user can read it even though the dataset is gated'}.
             </p>
             <ul className="share-facts">
               <li>{result.stats.prompts} prompts · {result.stats.turns} turns · {result.stats.toolCalls} tool calls</li>
@@ -192,11 +218,6 @@ export default function ShareDialog({ session, onClose }: { session: Session; on
                 <li>Dropped {hitList(result.dropped)} (these embed whole files)</li>
               )}
             </ul>
-            {!!result.grantErrors.length && (
-              <div className="share-blocked">
-                Couldn’t grant: {result.grantErrors.map((g) => `${g.user} (${g.error})`).join('; ')}
-              </div>
-            )}
             <p className="share-note">
               The dataset viewer can take a while to render a brand-new dataset. The
               <em> Files</em> tab works immediately.

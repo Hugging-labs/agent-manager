@@ -37,6 +37,14 @@ try {
   await assert.rejects(api.getFileTracePage('one', 'fixture'), (e) => e.status === 500 && !(e instanceof api.TraceUnavailable));
   json({ error: 'Refused by redaction', code: 'redaction-blocked', hits: { fixture: 2 } }, 409);
   await assert.rejects(api.shareSession('one', { visibility: 'public' }), (e) => e instanceof api.RedactionBlocked && e.hits.fixture === 2 && e.status === 409);
+  // A failed share says what became of the dataset; the dialog needs the outcome
+  // and, for a possibly-public one, a Hub dataset URL — nothing else.
+  const exposedUrl = 'https://huggingface.co/datasets/tester/am-session-0123456789';
+  json({ error: `This trace may be public at ${exposedUrl}`, code: 'share-exposed', share: { stage: 'upload', outcome: 'exposed', url: exposedUrl, raw: 'x' } }, 424);
+  await assert.rejects(api.shareSession('one', { visibility: 'gated' }), (e) => e instanceof api.ApiError && !(e instanceof api.RedactionBlocked)
+    && e.code === 'share-exposed' && e.status === 424 && e.data.share.url === exposedUrl && e.data.share.outcome === 'exposed' && !('raw' in e.data.share));
+  json({ error: 'Not shared', code: 'share-rolled-back', share: { stage: 'grant', outcome: 'made-private', url: 'javascript:alert(1)' } }, 424);
+  await assert.rejects(api.shareSession('one', { visibility: 'gated' }), (e) => e.data.share.outcome === 'made-private' && !('url' in e.data.share));
   json({ error: 'changed on disk', code: 'file-changed', mtime: 123, tag: 'new' }, 409);
   await assert.rejects(api.writeFile('one', 'fixture', 'draft', 'old'), (e) => e.code === 'file-changed' && e.data.mtime === 123 && e.data.tag === 'new');
   json({ ok: false, reason: 'no-space' }); assert.deepEqual(await api.relaunchSpace(), { ok: false, reason: 'no-space' });

@@ -97,7 +97,7 @@ try {
   await page.getByRole('button', { name: 'Publish', exact: true }).click();
   await page.getByText('Not published.', { exact: true }).waitFor();
   assert.match(await page.locator('.share-blocked').innerText(), /fixture_rule × 2/);
-  await page.getByRole('button', { name: 'Private', exact: true }).click();
+  await page.getByRole('button', { name: 'Approved people only', exact: true }).click();
   assert.equal(await page.getByPlaceholder('alice, bob').inputValue(), 'fixture-recipient');
   await page.getByRole('link', { name: 'Download transcript' }).waitFor();
   await page.evaluate(() => window.mount('reader'));

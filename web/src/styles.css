@@ -2054,6 +2054,13 @@ a.btn-ghost { text-decoration: none; }
   background: color-mix(in srgb, var(--danger) 12%, transparent);
   border: 1px solid color-mix(in srgb, var(--danger) 38%, transparent);
 }
+/* The share failed AND could not be rolled back: the trace may be public. */
+.share-exposed {
+  margin: 0; padding: 12px 13px; font-size: 13.5px; line-height: 1.5; border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--danger) 22%, transparent);
+  border: 2px solid var(--danger);
+}
+.share-exposed a { font-weight: 600; word-break: break-all; }
 .share-ok { margin: 0; font-size: 13px; font-weight: 600; }
 .share-linkrow { display: flex; gap: 7px; }
 .share-linkrow input { flex: 1; min-width: 0; font-family: var(--mono, monospace); font-size: 12px; }

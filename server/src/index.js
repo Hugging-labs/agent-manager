@@ -3413,20 +3413,14 @@ api.post('/api/sessions/:id/share', async (req, res) => {
   const visibility = b.visibility === 'gated' ? 'gated' : 'public';
   const names = (v) => (Array.isArray(v) ? v.map((u) => String(u).trim().replace(/^@/, '')).filter(Boolean).slice(0, 50) : []);
   const grantTo = names(b.grantTo);
-  try {
-    const out = await shareSession(s, { visibility, name: b.name, grantTo, allSessions: store.list() });
-    // Remember the last share so the UI can offer "open" / "manage access"
-    // without re-publishing.
-    store.update(s.id, { lastShare: { repo: out.repo, sha: out.sha, visibility, at: new Date().toISOString() } });
-    res.json(out);
-  } catch (e) {
-    // The redaction gate is a refusal, not a failure — give the UI enough to
-    // explain exactly what tripped.
-    if (e.code === 'redaction-blocked') {
-      return res.status(409).json({ error: e.message, code: e.code, hits: e.hits });
-    }
-    throw e;
-  }
+  // Refusals and failures arrive as ApiErrors whose message says exactly what
+  // happened to the dataset (never created, deleted, made private, or possibly
+  // public), with `hits` for a redaction block and `share` for the rest.
+  const out = await shareSession(s, { visibility, name: b.name, grantTo, allSessions: store.list() });
+  // Remember the last share so the UI can offer "open" / "manage access"
+  // without re-publishing.
+  store.update(s.id, { lastShare: { repo: out.repo, sha: out.sha, visibility, at: new Date().toISOString() } });
+  res.json(out);
 });
 
 // Can this session be shared at all, and where would it go? Lets the dialog

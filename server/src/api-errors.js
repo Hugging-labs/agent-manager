@@ -114,7 +114,7 @@ export function apiErrorHandler(error, req, res, next) {
       : new ApiError(500, 'internal-error', 'The request could not be completed. Please try again.');
   }
   const data = {};
-  for (const key of ['details', 'reason', 'hits', 'mtime', 'tag', 'currentTag', 'retryAfter']) {
+  for (const key of ['details', 'reason', 'hits', 'share', 'mtime', 'tag', 'currentTag', 'retryAfter']) {
     if (failure.data[key] !== undefined) data[key] = failure.data[key];
   }
   res.status(failure.statusCode).json({ ...data, error: failure.message, code: failure.code });
