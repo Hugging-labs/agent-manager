@@ -1026,6 +1026,18 @@ body {
 .term-image-status.has-action { display: flex; align-items: center; gap: 8px; pointer-events: auto; }
 .term-image-status button { padding: 0; border: 0; background: none; color: inherit; font: inherit; font-weight: 700; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
 .term-image-status button:disabled { opacity: 0.45; cursor: default; }
+/* A program's OSC 52 copy, offered rather than performed. Small and off to the
+   side; the preview is a single escaped line, so nothing in it can hide. */
+.term-program-copy { position: absolute; z-index: 8; right: 10px; bottom: 10px; max-width: min(460px, calc(100% - 20px)); display: flex; align-items: stretch; border: 1px solid var(--border); border-radius: var(--r-sm); background: color-mix(in srgb, var(--panel) 96%, transparent); color: var(--muted); box-shadow: 0 4px 14px rgb(0 0 0 / 0.14); font-size: 10.5px; }
+.term-program-copy.above-bar { bottom: 54px; }
+.term-program-copy.copied { padding: 5px 8px; color: var(--go); }
+.term-program-copy button { border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
+.term-program-copy .tpc-copy { min-width: 0; display: flex; flex-direction: column; gap: 2px; padding: 5px 4px 5px 8px; text-align: left; }
+.term-program-copy .tpc-head, .term-program-copy .tpc-text { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.term-program-copy .tpc-text { color: var(--text); }
+.term-program-copy .tpc-copy:hover .tpc-head { color: var(--accent); }
+.term-program-copy .tpc-x { flex: none; display: flex; align-items: center; padding: 0 7px; color: var(--muted); }
+.term-program-copy .tpc-x:hover { color: var(--text); }
 .pane-head .ph-image:disabled { opacity: 0.35; cursor: default; }
 /* The grid is measured against this filler, so it must stay unpadded: FitAddon
    reads the PARENT's computed height and does NOT subtract its padding, so a
