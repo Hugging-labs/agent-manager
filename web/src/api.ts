@@ -772,7 +772,7 @@ export interface TraceTurn {
   id?: string;
   messageId?: string;
   nativeTurnId?: string;
-  event?: { type: 'queue'; operation: string; text: string; reason?: string } | { type: 'task-complete'; text: string } | { type: 'task-start'; text: string };
+  event?: { type: 'queue'; operation: string; text: string; reason?: string; commandUuid?: string } | { type: 'task-complete'; text: string } | { type: 'task-start'; text: string };
   role: 'user' | 'assistant' | 'system';
   kind?: 'final' | 'update';
   /**

@@ -1432,7 +1432,11 @@ async function normalizeClaude(file, out, range, allowSubagent = false) {
           // turn (`absorbed_mid_turn`) from one the queue dropped. The reader
           // has to tell them apart: one was answered, the other never arrived.
           event: { type: 'queue', operation: j.operation, text: content,
-            ...(j.reason ? { reason: String(j.reason) } : {}) } });
+            ...(j.reason ? { reason: String(j.reason) } : {}),
+            // The removal names the queue entry it took. The enqueue names
+            // nothing at all, so this is the only identity in the lifecycle —
+            // and it is what lets the reader tell two identical messages apart.
+            ...(j.commandUuid ? { commandUuid: String(j.commandUuid) } : {}) } });
         continue;
       }
       if (j.operation === 'enqueue') {
@@ -1456,6 +1460,25 @@ async function normalizeClaude(file, out, range, allowSubagent = false) {
       } else if (j.operation === 'remove') {
         const at = pending.findIndex((p) => p.text === text);
         if (at >= 0) pending.splice(at, 1)[0].msg.superseded = false;
+      }
+      continue;
+    }
+    // How an absorbed prompt is actually handed to the model: a queued_command
+    // attachment carrying the text and the id of the queue entry it came from.
+    // A window can begin after the enqueue and the removal and still contain
+    // this, which is otherwise a prompt the reader never hears about.
+    //
+    // Only when it names its queue entry: without that id there is no way to
+    // tell it apart from the removal of the same text, and showing both would
+    // be the duplicate this whole area keeps producing.
+    if (j.type === 'attachment' && j.attachment?.type === 'queued_command'
+      && j.attachment?.source_uuid && range?.reader) {
+      const rawPrompt = String(j.attachment.prompt == null ? '' : j.attachment.prompt);
+      const prompt = unwrapPasted(rawPrompt);
+      if (queueKey(prompt) && !isHarnessText(queueKey(rawPrompt))) {
+        out.push({ role: 'system', ts: Date.parse(j.timestamp) || undefined, blocks: [],
+          event: { type: 'queue', operation: 'delivered', text: prompt,
+            commandUuid: String(j.attachment.source_uuid) } });
       }
       continue;
     }

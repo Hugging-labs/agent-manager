@@ -75,6 +75,13 @@ const normalize = async (records) => {
   try { return (await readTraceByPath(file, { window: { version: 2, at: 'tail', bytes: 8 * 1024 * 1024 } })).turns; }
   finally { fs.rmSync(file, { force: true }); }
 };
+/** The same, with the span and turn floor the reader actually asks for. */
+const normalizeTail = async (records, bytes, min) => {
+  const file = path.join(tmp, `t-${Math.random().toString(36).slice(2)}.jsonl`);
+  fs.writeFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  try { return (await readTraceByPath(file, { window: { version: 2, at: 'tail', bytes, min } })).turns; }
+  finally { fs.rmSync(file, { force: true }); }
+};
 
 await build({
   stdin: { resolveDir: web, loader: 'tsx', contents: `
@@ -231,6 +238,39 @@ try {
     check('still one copy after a reload', () => {
       assert.equal(reloaded, 1, `it is on screen ${reloaded} times`);
       assert.ok(!reloadedText.includes('pasted_content'), 'the wrapper is back after a reload');
+    });
+  }
+
+  // A window that does not reach back as far as the enqueue. The reader asks
+  // for a span of bytes with a minimum number of turns, so one large record
+  // between the enqueue and its removal is enough to push the enqueue out —
+  // and then the prompt was simply absent while its reply stayed behind in the
+  // previous exchange, which is why the live view and a reload disagreed.
+  console.log('\n### a window that begins after the enqueue');
+  {
+    const MID = 'the message whose enqueue fell off the window';
+    const REPLY = 'the reply to the message';
+    const bulky = 'x'.repeat(150 * 1024);
+    const records = [rec.user('first prompt', 0), rec.enqueue(MID, 1), rec.asst(bulky, 2),
+      rec.remove(MID, 3, 'absorbed_mid_turn'), rec.absorbed(MID, 4)];
+    for (let i = 0; i < 11; i++) records.push(rec.asst(`step ${i}`, 5 + i));
+    records.push(rec.asst(REPLY, 20));
+    const turns = await normalizeTail(records, 128 * 1024, 12);
+    const ops = turns.filter((t) => t.event?.type === 'queue').map((t) => t.event.operation);
+    console.log(`  window turns=${turns.length} queue events=${JSON.stringify(ops)}`);
+    assert.ok(!ops.includes('enqueue'), 'the window still reaches the enqueue — widen the bulky record');
+    await p.evaluate((t) => window.fixture.mount(t), turns);
+    await p.waitForSelector('.cxv-body');
+    await p.waitForTimeout(900);
+    const seen = await p.evaluate(() => document.querySelector('.cxv-body')?.innerText || '');
+    const bands = await p.evaluate((n) => [...document.querySelectorAll('.cx-prompt')]
+      .filter((el) => el.textContent.includes(n)).length, MID);
+    check('the prompt is there even though its enqueue is not', () => {
+      assert.equal(bands, 1, `the message is on screen ${bands} times`);
+    });
+    check('and its reply comes after it', () => {
+      const a = seen.indexOf(MID), b = seen.indexOf(REPLY);
+      assert.ok(a >= 0 && b > a, `order was ${JSON.stringify([a, b])}`);
     });
   }
 
