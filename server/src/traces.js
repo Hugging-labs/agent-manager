@@ -1428,7 +1428,11 @@ async function normalizeClaude(file, out, range, allowSubagent = false) {
       if (range?.reader) {
         if (isHarnessText(queueKey(raw))) continue;
         out.push({ role: 'system', ts: Date.parse(j.timestamp) || undefined, blocks: [],
-          event: { type: 'queue', operation: j.operation, text: content } });
+          // `reason` distinguishes a prompt that was DELIVERED into the running
+          // turn (`absorbed_mid_turn`) from one the queue dropped. The reader
+          // has to tell them apart: one was answered, the other never arrived.
+          event: { type: 'queue', operation: j.operation, text: content,
+            ...(j.reason ? { reason: String(j.reason) } : {}) } });
         continue;
       }
       if (j.operation === 'enqueue') {

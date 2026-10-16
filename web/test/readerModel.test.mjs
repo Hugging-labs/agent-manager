@@ -35,13 +35,41 @@ try {
   assert.equal(stepsOf([raw[1]])[1].pending, true, 'a call without a result is not a green success');
   assert.equal(stepsOf([expected[1]])[1].pending, false);
 
-  const event = (id, operation, text = 'queued') => turn(id, 'system', '', { blocks: [], event: { type: 'queue', operation, text } });
+  const event = (id, operation, text = 'queued', reason) => turn(id, 'system', '', {
+    blocks: [], event: { type: 'queue', operation, text, ...(reason ? { reason } : {}) } });
   const queue = [raw[0], event('enqueue', 'enqueue'), turn('work', 'assistant', 'later work'), event('remove', 'remove')];
   const queued = reconcileTrace(queue);
-  assert.deepEqual(queued.map((t) => t.id), ['u', 'enqueue', 'work'], 'removed queue prompt stays at enqueue time, not removal time');
-  assert.equal(queued[1].queued, true);
+  // The prompt goes in where the queue says it was CONSUMED, not where it was
+  // typed. The enqueue's position is in the middle of the turn that was still
+  // running, and a user turn there opens an exchange that takes the rest of
+  // that turn's answer with it — measured on a real transcript, where the
+  // output either side of an enqueue is timestamped seconds BEFORE it.
+  assert.deepEqual(queued.map((t) => t.id), ['u', 'work', 'enqueue'], 'removed queue prompt lands where it was consumed');
+  assert.equal(queued[2].queued, true, 'a prompt the queue dropped really was only ever queued');
   assert.equal(reconcileTrace(queue, queued), queued, 'unchanged queued prompts preserve identity across polls');
   assert.equal(reconcileTrace([event('enqueue', 'enqueue'), event('dequeue', 'dequeue'), event('remove', 'remove')]).length, 0, 'a consumed queue item never reappears');
+
+  // Delivered into the running turn: answered, so not waiting for anything.
+  const absorbedPage = [raw[0], event('enqueue', 'enqueue'), turn('prev', 'assistant', 'answer to the PREVIOUS prompt'),
+    event('remove', 'remove', 'queued', 'absorbed_mid_turn'), turn('reply', 'assistant', 'answer to the queued prompt')];
+  const absorbed = reconcileTrace(absorbedPage);
+  assert.deepEqual(absorbed.map((t) => t.id), ['u', 'prev', 'enqueue', 'reply'],
+    'an absorbed prompt does not split the turn it was delivered into');
+  assert.equal(absorbed[2].queued, false, 'a delivered prompt is not labelled as waiting in the queue');
+  // What the operator actually sees: the earlier answer stays with the prompt it
+  // belongs to, and the new prompt gets the reply that followed it.
+  const [first, second] = splitExchanges(absorbed);
+  assert.equal(first.prompt.id, 'u');
+  assert.ok(first.steps.concat(first.answer).some((t) => t.id === 'prev'),
+    'the previous answer was taken into the mid-turn prompt\'s exchange');
+  assert.equal(second.prompt.id, 'enqueue');
+  assert.ok(second.steps.concat(second.answer).some((t) => t.id === 'reply'),
+    'the reply to the mid-turn prompt is not in its exchange');
+  // The live tail delivers the enqueue and the remove in different fetches.
+  for (let cut = 1; cut < absorbedPage.length; cut++) {
+    assert.deepEqual(reconcileTrace(absorbedPage, reconcileTrace(absorbedPage.slice(0, cut))).map((t) => t.id),
+      ['u', 'prev', 'enqueue', 'reply'], `tail join keeps the order across split ${cut}`);
+  }
   const markup = turn('markup', 'user', '<div>Please review this markup</div>');
   assert.equal(splitExchanges([markup])[0].prompt, markup, 'operator markup starts an exchange, not a hidden work step');
   assert.equal(splitExchanges([turn('harness', 'user', '<task-notification>completed</task-notification>')])[0].prompt, null, 'known harness envelopes remain non-operator messages');

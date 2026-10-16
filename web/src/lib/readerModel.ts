@@ -57,7 +57,7 @@ export function reconcileTrace(raw: TraceTurn[], previous: TraceTurn[] = []): Tr
   const old = new Map(previous.filter((t) => t.id).map((t) => [t.id, t]));
   const messages: TraceTurn[] = [];
   const byMessage = new Map<string, number>();
-  const pending: { text: string; at: number; turn: TraceTurn }[] = [];
+  const pending: { text: string; turn: TraceTurn }[] = [];
   for (const turn of raw) {
     if (turn.event?.type === 'queue') {
       const event = turn.event;
@@ -66,14 +66,26 @@ export function reconcileTrace(raw: TraceTurn[], previous: TraceTurn[] = []): Tr
         const blocks: TraceBlock[] = prior?.queued && prior.blocks.length === 1
           && prior.blocks[0].type === 'text' && prior.blocks[0].text === event.text
           ? prior.blocks : [{ type: 'text', text: event.text }];
-        pending.push({ text: queueKey(event.text), at: messages.length,
+        // Held, not placed. The enqueue marks where the prompt was TYPED, which
+        // for a mid-turn message is in the middle of the answer to the previous
+        // one — and a user turn there opens an exchange that swallows the rest
+        // of that answer, leaving the exchange it belongs to with none. The
+        // prompt goes in where the queue record says it was consumed, below.
+        pending.push({ text: queueKey(event.text),
           turn: { ...turn, event: undefined, role: 'user', queued: true, blocks } });
-        messages.push(turn); // reserve its chronological position; invisible until removed
       }
       else if (event.operation === 'dequeue') pending.shift();
       else if (event.operation === 'remove') {
         const i = pending.findIndex((p) => p.text === queueKey(event.text));
-        if (i >= 0) { const p = pending.splice(i, 1)[0]; messages[p.at] = p.turn; }
+        if (i >= 0) {
+          const p = pending.splice(i, 1)[0];
+          // `absorbed_mid_turn` means the harness delivered it into the running
+          // turn, so it was answered and is not waiting for anything. Any other
+          // removal took it out of the queue undelivered, and that one really
+          // did only ever sit there.
+          messages.push(event.reason === 'absorbed_mid_turn'
+            ? { ...p.turn, queued: false } : p.turn);
+        }
       }
       continue;
     }
