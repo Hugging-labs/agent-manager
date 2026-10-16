@@ -21,6 +21,16 @@
 
 export type Loader<T> = () => Promise<T>;
 
+/** This page on its own origin, without the query: the address may carry
+ *  parameters that are not the app's, and a pathname like `//host/x` must not
+ *  turn into a request to another host. */
+export function pageUrl(): string {
+  const url = new URL(location.origin);
+  url.pathname = location.pathname;
+  if (url.origin !== location.origin) throw new Error('refusing to fetch another origin');
+  return url.href;
+}
+
 export type ModuleState<T> =
   | { kind: 'loading' }
   | { kind: 'ready'; module: T }
@@ -44,13 +54,13 @@ export const lazyModuleInternals = {
   importUrl: (url: string): Promise<unknown> => import(/* @vite-ignore */ url),
   fetchPageHtml: async (): Promise<string | null> => {
     try {
-      const r = await fetch(location.pathname, { cache: 'no-store', headers: { accept: 'text/html' } });
+      const r = await fetch(pageUrl(), { cache: 'no-store', headers: { accept: 'text/html' } });
       return r.ok ? await r.text() : null;
     } catch { return null; }
   },
   currentEntryScript: (): string | null =>
     document.querySelector('script[type="module"][src]')?.getAttribute('src') ?? null,
-  baseHref: () => location.href,
+  baseHref: () => pageUrl(),
 };
 
 const entries = new Map<Loader<unknown>, Entry<unknown>>();

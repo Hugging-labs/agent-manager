@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { FileView, FileWrapToggle, type LinkedFileSource, type ViewInfo } from './FilesPane';
-import { appPath, appUrl } from '../lib/appUrl';
-import { fileLinkHash, fileLinkUrl, fileResourceUrl, resolveFileLink, type FileLinkRequest, type FileLinkTarget } from '../lib/fileLinks';
+import { appUrl } from '../lib/appUrl';
+import { fileLinkUrl, fileResourceUrl, resolveFileLink, type FileLinkRequest, type FileLinkTarget } from '../lib/fileLinks';
 import { BackGlyph, CloseGlyph, DownloadGlyph, FileGlyph, RefreshGlyph } from './icons';
 import '../file-links.css';
 
@@ -87,7 +87,7 @@ export default function FileLinkPage({ request, embedded = false, onBack, onClos
         <div className="file-link-path" title={target?.absolute || request.file}>{target?.absolute || request.file}</div>
       </div>
       {onClose && <button className="mini-btn" onClick={onClose} title={closeLabel} aria-label={closeLabel}><CloseGlyph /></button>}
-      {!embedded && <a className="mini-btn" href={appPath()} target="_blank" rel="noopener noreferrer">Agent Manager ↗</a>}
+      {!embedded && <a className="mini-btn" href={appUrl()} target="_blank" rel="noopener noreferrer">Agent Manager ↗</a>}
     </header>
     <div className="file-link-tools">
       {kind && <span className="mono">{kind} · read-only</span>}
@@ -105,7 +105,7 @@ export default function FileLinkPage({ request, embedded = false, onBack, onClos
       <button className="mini-btn" onClick={() => setReload((n) => n + 1)} title="Reload file"><RefreshGlyph /></button>
       {target && <>
         <button className="mini-btn" onClick={() => void copy(target.absolute, 'Path copied')}>Copy path</button>
-        <button className="mini-btn" onClick={() => void copy(appUrl(fileLinkHash(resolved.current.current)), 'Link copied')}>Copy link</button>
+        <button className="mini-btn" onClick={() => void copy(fileLinkUrl(resolved.current.current), 'Link copied')}>Copy link</button>
         <a className="mini-btn" href={source?.downloadUrl} download><DownloadGlyph /> Download</a>
       </>}
     </div>

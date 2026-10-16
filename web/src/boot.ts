@@ -4,4 +4,10 @@
 // reload of the cleaned address still authenticates.
 import { stripForeignParams } from './lib/appUrl';
 
-try { stripForeignParams(); } catch { /* history unavailable: links still use the allowlist */ }
+// Never log the address itself: the parameters being removed may be secrets.
+// Links stay clean either way; they are built from the allowlist, not the address.
+try {
+  if (!stripForeignParams()) console.warn('[boot] could not remove foreign query parameters from the address');
+} catch (err) {
+  console.warn('[boot] could not remove foreign query parameters from the address:', err instanceof Error ? err.name : 'error');
+}

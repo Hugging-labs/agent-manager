@@ -17,16 +17,23 @@ self.addEventListener('push', (e) => {
 const APP_PARAMS = ['vvdebug', 'touchdebug'];
 
 // A notification may only open a page of this app, with the app's own query
-// parameters. Anything else (another origin, edge parameters) falls back to '/'.
+// parameters. Anything else (another origin, edge parameters) opens the root.
+// Built with URL setters on this origin and returned absolute, so no pathname
+// (`//other.example/x`, backslashes) can be read as a link to another host.
 function appTarget(raw) {
+  const origin = self.location.origin;
+  const root = new URL('/', origin).href;
   try {
-    const url = new URL(raw || '/', self.location.origin);
-    if (url.origin !== self.location.origin) return '/';
+    const from = new URL(raw || '/', origin);
+    if (from.origin !== origin) return root;
     const kept = new URLSearchParams();
-    for (const key of APP_PARAMS) for (const value of url.searchParams.getAll(key)) kept.append(key, value);
-    const search = kept.toString();
-    return url.pathname + (search ? '?' + search : '') + url.hash;
-  } catch { return '/'; }
+    for (const key of APP_PARAMS) for (const value of from.searchParams.getAll(key)) kept.append(key, value);
+    const url = new URL(origin);
+    url.pathname = from.pathname;
+    url.search = kept.toString();
+    url.hash = from.hash;
+    return url.origin === origin ? url.href : root;
+  } catch { return root; }
 }
 
 self.addEventListener('notificationclick', (e) => {

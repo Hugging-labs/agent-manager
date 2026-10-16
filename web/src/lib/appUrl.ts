@@ -13,20 +13,31 @@ export function appSearch(search: string = location.search): string {
   return text ? `?${text}` : '';
 }
 
-/** Same-origin link to this page: path, allowlisted parameters, then `hash`. */
-export function appPath(hash = ''): string {
-  return location.pathname + appSearch() + hash;
+// Built with URL setters on this origin, never by joining strings: a pathname
+// such as `//other.example/x` would otherwise read as a protocol-relative link
+// to another host. The origin check is the invariant every caller relies on.
+function onThisOrigin(pathname: string, search: string, hash: string): string {
+  const url = new URL(location.origin);
+  url.pathname = pathname;
+  url.search = search;
+  url.hash = hash;
+  if (url.origin !== location.origin) throw new Error('refusing to build a link to another origin');
+  return url.href;
 }
 
-/** Absolute form of appPath, for copying or opening outside this frame. */
+/** Absolute link to this page: origin, path, allowlisted parameters, then `hash`. */
 export function appUrl(hash = ''): string {
-  return location.origin + appPath(hash);
+  return onThisOrigin(location.pathname, appSearch(), hash);
 }
 
-/** Drop every non-app parameter from the address bar, keeping path and hash. */
-export function stripForeignParams(): void {
-  const clean = appPath(location.hash);
-  if (clean !== location.pathname + location.search + location.hash) {
-    history.replaceState(history.state, '', clean);
-  }
+/** The app's root on this origin, with nothing from the current address. */
+export function appRootUrl(): string {
+  return onThisOrigin('/', '', '');
+}
+
+/** Drop every non-app parameter from the address bar, keeping path and hash.
+ *  Returns whether the address is clean afterwards. */
+export function stripForeignParams(): boolean {
+  if (location.search !== appSearch()) history.replaceState(history.state, '', appUrl(location.hash));
+  return location.search === appSearch();
 }

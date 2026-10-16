@@ -2,7 +2,7 @@ import CodexSharedSessions from './CodexSharedSessions';
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { isPassive, isRemote, type Cli } from '../types';
 import * as api from '../api';
-import { appUrl } from '../lib/appUrl';
+import { appRootUrl } from '../lib/appUrl';
 import { useSaverState } from '../lib/saveQueue';
 import {
   configSaver, secretsSaver, saverFor, settingsSlot, subscribeSettings, noteServerRead,
@@ -194,7 +194,7 @@ export function PushRow() {
           {note && <div className="s-help" style={{ marginTop: 6 }}>{note}</div>}
         </div>
         {state === 'framed' ? (
-          <a className="btn-ghost" href={appUrl()} target="_blank" rel="noreferrer">Open directly to enable ↗</a>
+          <a className="btn-ghost" href={appRootUrl()} target="_blank" rel="noreferrer">Open directly to enable ↗</a>
         ) : state === 'unsupported' ? (
           <span className="s-muted">not supported here</span>
         ) : state === 'denied' ? (
