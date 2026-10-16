@@ -8,6 +8,7 @@ import { FileLinkScope, useFilePreview } from './FileLinkContent';
 import { installTerminalFileLinks, terminalLinkHandler, openTerminalLink } from '../lib/terminalFileLinks';
 import '@xterm/xterm/css/xterm.css';
 import { touchDebug, installTouchDebug } from '../lib/touchDebug';
+import { PROGRAM_COPY_MS, clipboardPreview, clipboardSize } from '../lib/programCopy';
 import type { Cli, Session } from '../types';
 import { STATE_LABEL, isRemote } from '../types';
 import StateLogo from './StateLogo';
@@ -271,6 +272,13 @@ export default function TerminalPane({
   const [draft, setDraft] = useState(session.name);
   // Fallback paste sheet: shown only when we can't read the clipboard directly.
   const [pasteOpen, setPasteOpen] = useState(false);
+  // Text a program in this pane asked to copy (OSC 52), shown over the
+  // terminal. `copied` is the brief confirmation after it was used.
+  const [programCopy, setProgramCopy] = useState<{ text: string; copied?: boolean } | null>(null);
+  // What Cmd+C with no selection may copy. Set only once the notice is on
+  // screen (the effect below), so nothing hidden can ever reach the clipboard.
+  const programCopyRef = useRef('');
+  const programCopyTimerRef = useRef<number | null>(null);
   const [imageDrop, setImageDrop] = useState(false);
   const [imageStatus, setImageStatus] = useState<{ kind: 'uploading' | 'success' | 'error'; text: string } | null>(null);
   const [imageUploadBusy, setImageUploadBusy] = useState(false);
@@ -320,6 +328,37 @@ export default function TerminalPane({
     termRef.current?.paste(text);
     focusTerm();
   };
+
+  const clearProgramCopy = () => {
+    if (programCopyTimerRef.current) window.clearTimeout(programCopyTimerRef.current);
+    programCopyTimerRef.current = null;
+    programCopyRef.current = '';
+    setProgramCopy(null);
+  };
+  // A newer copy replaces the older one, and an empty one (a program clearing
+  // its clipboard) withdraws it.
+  const offerProgramCopy = (text: string) => {
+    clearProgramCopy();
+    if (!text) return;
+    setProgramCopy({ text });
+    programCopyTimerRef.current = window.setTimeout(clearProgramCopy, PROGRAM_COPY_MS);
+  };
+  // Must run inside the user's gesture (keydown or click): see copyText.
+  const copyProgramText = () => {
+    const text = programCopyRef.current;
+    if (!text) return;
+    copyText(text);
+    clearProgramCopy();
+    setProgramCopy({ text, copied: true });
+    programCopyTimerRef.current = window.setTimeout(clearProgramCopy, 1500);
+  };
+  const programCopyShown = !!programCopy && !programCopy.copied && !reading && visible !== false;
+  useEffect(() => {
+    programCopyRef.current = programCopyShown ? programCopy!.text : '';
+  }, [programCopyShown, programCopy]);
+  useEffect(() => () => {
+    if (programCopyTimerRef.current) window.clearTimeout(programCopyTimerRef.current);
+  }, []);
 
   const showImageStatus = (status: { kind: 'uploading' | 'success' | 'error'; text: string }, linger = 0) => {
     if (imageStatusTimerRef.current) window.clearTimeout(imageStatusTimerRef.current);
@@ -495,19 +534,16 @@ export default function TerminalPane({
     term.loadAddon(fit);
 
     let lastSelection = '';
-    let osc52Text = '';
-    let osc52At = 0;
 
-    // An agent may deliberately emit OSC 52. Browsers generally reject an
-    // unsolicited clipboard write, so retain it briefly and let Cmd/C perform
-    // the write inside a real user gesture.
+    // OSC 52. A query is answered with an empty clipboard, for every selection:
+    // output in a pane must never be able to read the operator's clipboard.
+    // Pasting stays an explicit act (Cmd/Ctrl+V, the paste button). A write is
+    // not performed either, since browsers reject one no gesture started; it is
+    // shown on the pane, and the operator's Cmd+C or a click on it copies it.
     const clipboardProvider = {
-      readText: (sel: string) => (sel !== 'p' && navigator.clipboard?.readText ? navigator.clipboard.readText().catch(() => '') : ''),
+      readText: (_sel: string) => '',
       writeText: (sel: string, data: string) => {
-        if (sel !== 'p') {
-          osc52Text = data;
-          osc52At = Date.now();
-        }
+        if (sel !== 'p') offerProgramCopy(data);
       },
     };
     // addon-clipboard@0.1.0 has a (base64, provider) runtime constructor but
@@ -655,7 +691,7 @@ export default function TerminalPane({
     };
 
     // ⌘/Ctrl+C copies a local selection. Without one, Ctrl+C remains SIGINT;
-    // Cmd+C may accept a recent OSC 52 payload deliberately emitted by the app.
+    // Cmd+C copies a program's OSC 52 text, but only while its notice is shown.
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== 'keydown') return true;
       if ((e.metaKey || e.ctrlKey) && (e.key === 'c' || e.key === 'C') && term.hasSelection()) {
@@ -671,7 +707,7 @@ export default function TerminalPane({
         return false;
       }
       if (e.metaKey && (e.key === 'c' || e.key === 'C')) {
-        if (osc52Text && Date.now() - osc52At < 120_000) copyText(osc52Text);
+        copyProgramText();
         return false;
       }
       claimControl();
@@ -1213,6 +1249,7 @@ export default function TerminalPane({
       host.removeEventListener('dragleave', onDragLeave, true);
       host.removeEventListener('drop', onDrop, true);
       document.removeEventListener('copy', onCopy, true);
+      clearProgramCopy();
       frame.removeEventListener('touchstart', onTouchStart);
       frame.removeEventListener('touchmove', onTouchMove, true);
       frame.removeEventListener('touchend', onTouchEnd);
@@ -1525,6 +1562,25 @@ export default function TerminalPane({
             <>
               <button type="button" onClick={retryTerminalInsert} disabled={imageUploadBusy || conn !== 'connected' || !hasInputControl}>retry</button>
               <button type="button" onClick={discardTerminalInsert} disabled={imageUploadBusy}>remove</button>
+            </>
+          )}
+        </div>
+      )}
+      {programCopy && !reading && visible !== false && (
+        // Never more than this pane's own notice: the operator sees which
+        // session asked, how much, and what, before any of it is copied.
+        <div className={`term-program-copy${programCopy.copied ? ' copied' : ''}${isMobile && conn === 'connected' ? ' above-bar' : ''} mono`} role="status" aria-live="polite"
+          onPointerDown={(e) => e.stopPropagation()}>
+          {programCopy.copied ? <span className="tpc-head">copied</span> : (
+            <>
+              <button type="button" className="tpc-copy" onClick={() => { copyProgramText(); focusTerm(); }}
+                title="Copy this to the clipboard">
+                <span className="tpc-head">{session.name} wants to copy {clipboardSize(programCopy.text)} · {isMobile ? 'tap' : '⌘C or click'} to copy</span>
+                <span className="tpc-text">{clipboardPreview(programCopy.text)}</span>
+              </button>
+              <button type="button" className="tpc-x" aria-label="Dismiss copy" onClick={() => { clearProgramCopy(); focusTerm(); }}>
+                <CloseGlyph />
+              </button>
             </>
           )}
         </div>
