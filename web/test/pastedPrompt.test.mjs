@@ -241,6 +241,39 @@ try {
     });
   }
 
+  // The same words sent twice, once dequeued into a request and once absorbed.
+  // A dequeue says the ordinary message carries that prompt, so a later record
+  // of the same text must not be read as the same send — the second removal
+  // was being spent against the first dequeue and dropped, leaving its enqueue
+  // stranded at the end still marked queued.
+  console.log('\n### the same message sent twice, dequeued then absorbed');
+  {
+    const SAME = 'run the deploy again please';
+    const turns = await normalize([
+      rec.user('first prompt', 0),
+      rec.enqueue(SAME, 1), rec.dequeue(2), rec.user(SAME, 3),   // delivered as an ordinary message
+      rec.asst('working on it', 4),
+      rec.enqueue(SAME, 5), rec.remove(SAME, 6, 'absorbed_mid_turn'),   // sent again, mid-turn
+      rec.asst('done twice', 7),
+    ]);
+    await p.evaluate((t) => window.fixture.mount(t), turns);
+    await p.waitForSelector('.cxv-body');
+    await p.waitForTimeout(900);
+    const bands = await p.evaluate((n) => [...document.querySelectorAll('.cx-prompt')]
+      .filter((el) => el.textContent.includes(n)).map((el) => !!el.querySelector('.cx-queued')), SAME);
+    console.log(`  bands=${bands.length} badged=${JSON.stringify(bands)}`);
+    check('both sends are on screen', () => {
+      assert.equal(bands.length, 2, 'one of the two sends is missing or doubled');
+    });
+    check('and neither is left marked as waiting', () => {
+      assert.deepEqual(bands, [false, false], 'a delivered prompt is still badged queued');
+    });
+    const seen = await p.evaluate(() => document.querySelector('.cxv-body')?.innerText || '');
+    check('the reply to the second one is after it', () => {
+      assert.ok(seen.lastIndexOf(SAME) < seen.indexOf('done twice'), 'the last send has no reply after it');
+    });
+  }
+
   // A window that does not reach back as far as the enqueue. The reader asks
   // for a span of bytes with a minimum number of turns, so one large record
   // between the enqueue and its removal is enough to push the enqueue out —

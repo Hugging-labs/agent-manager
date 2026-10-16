@@ -122,6 +122,16 @@ export function reconcileTrace(raw: TraceTurn[], previous: TraceTurn[] = []): Tr
       }
       continue;
     }
+    // The dequeued prompt has arrived as an ordinary message, so that dequeue
+    // is answered for. Left standing, its count was spent by the next record of
+    // the same TEXT instead — a second send of the same words, whose removal
+    // was then skipped and whose enqueue sat at the end still marked queued.
+    if (turn.role === 'user' && consumed.size) {
+      const arrived = queueKey(turn.blocks.filter((b) => b.type === 'text')
+        .map((b) => ('text' in b ? b.text : '')).join(''));
+      const outstanding = arrived ? consumed.get(arrived) || 0 : 0;
+      if (outstanding) consumed.set(arrived, outstanding - 1);
+    }
     const index = turn.messageId ? byMessage.get(turn.messageId) : undefined;
     if (index !== undefined) {
       const first = messages[index];
