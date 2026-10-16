@@ -2,6 +2,7 @@ import CodexSharedSessions from './CodexSharedSessions';
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { isPassive, isRemote, type Cli } from '../types';
 import * as api from '../api';
+import { appRootUrl } from '../lib/appUrl';
 import { useSaverState } from '../lib/saveQueue';
 import {
   configSaver, secretsSaver, saverFor, settingsSlot, subscribeSettings, noteServerRead,
@@ -121,7 +122,7 @@ type PushState = 'checking' | 'unsupported' | 'framed' | 'denied' | 'off' | 'on'
 
 // "Enable notifications" for THIS device: agents can then message the operator
 // (only when explicitly asked to — see the environment skill).
-function PushRow() {
+export function PushRow() {
   const [state, setState] = useState<PushState>('checking');
   const [note, setNote] = useState('');
   useEffect(() => {
@@ -193,7 +194,7 @@ function PushRow() {
           {note && <div className="s-help" style={{ marginTop: 6 }}>{note}</div>}
         </div>
         {state === 'framed' ? (
-          <a className="btn-ghost" href={window.location.href} target="_blank" rel="noreferrer">Open directly to enable ↗</a>
+          <a className="btn-ghost" href={appRootUrl()} target="_blank" rel="noreferrer">Open directly to enable ↗</a>
         ) : state === 'unsupported' ? (
           <span className="s-muted">not supported here</span>
         ) : state === 'denied' ? (
