@@ -721,9 +721,8 @@ export interface ShareResult {
   redaction: Record<string, number>;
   dropped: Record<string, number>;
   granted: string[];
-  grantErrors: { user: string; error: string }[];
 }
-// Thrown when the redaction gate refuses a public share (HTTP 409). Carries the
+// Thrown when the redaction gate refuses a share, public or gated (HTTP 409). Carries the
 // rule names so the dialog can say exactly what tripped instead of "failed".
 export class RedactionBlocked extends ApiError {
   hits: Record<string, number>;

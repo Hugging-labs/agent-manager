@@ -2,6 +2,8 @@ export type ErrorData = {
   reason?: string; hint?: string; requestId?: string; retryAfter?: number;
   mtime?: number; tag?: string | null; currentTag?: string | null;
   hits?: Record<string, number>; details?: { field: string; message: string }[];
+  // A failed session share: which step stopped it and what became of the dataset.
+  share?: { stage: string; outcome: string; url?: string };
 };
 
 export class ApiError extends Error {
@@ -38,6 +40,11 @@ export function httpError(status: number, body: unknown): ApiError {
   if (Array.isArray(b.details)) data.details = b.details.slice(0, 20)
     .filter((d): d is { field: string; message: string } => record(d) && safeText(d.field) && safeText(d.message))
     .map(({ field, message }) => ({ field, message }));
+  if (record(b.share) && safeText(b.share.stage) && safeText(b.share.outcome)) {
+    const { stage, outcome, url } = b.share;
+    data.share = { stage, outcome };
+    if (typeof url === 'string' && /^https:\/\/huggingface\.co\/datasets\/[\w.-]+\/[\w.-]+$/.test(url)) data.share.url = url;
+  }
   const code = typeof b.code === 'string' && /^[a-z][a-z0-9-]{0,63}$/.test(b.code)
     ? b.code : codes[status] || (status >= 500 ? 'internal-error' : 'request-failed');
   const error = new ApiError(safeText(b.error) ? b.error : fallbackMessage(status), status, code, data);

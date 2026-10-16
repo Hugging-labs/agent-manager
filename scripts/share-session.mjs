@@ -2,8 +2,9 @@
 // docs/session-sharing.md §6: locate -> redact -> assemble.
 // Trace only; publishing is a separate step (server/src/share.js).
 //
-// Usage: node scripts/share-session.mjs <src> <outdir> [harness] [sessionId]
+// Usage: node scripts/share-session.mjs <src> <outdir> [harness] [sessionId] [traceName]
 //        harness: claude (default) | codex | hermes | opencode | openclaw
+//        traceName: the bundle's trace filename; default is the native one
 //
 // Claude and Codex are Hub-native, so their trace ships VERBATIM. The other
 // three are converted to the Hub's documented Session Trace Simple Format
@@ -27,8 +28,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { makeRedactor } from './share-redact.mjs';
 
-const [src, outdir, harnessArg, sessionArg] = process.argv.slice(2);
+const [src, outdir, harnessArg, sessionArg, traceNameArg] = process.argv.slice(2);
 const HARNESS = harnessArg || 'claude';
 const NATIVE = ['claude', 'codex'];              // Hub reads these as-is
 const CONVERTED = ['hermes', 'opencode', 'openclaw']; // emitted as STS
@@ -41,46 +43,8 @@ if (!src || !outdir) {
   process.exit(1);
 }
 
-// ---------- redaction ruleset v1 (§7) ----------
-const PATTERNS = [
-  ['hf-token', /\bhf_[A-Za-z0-9]{20,}\b/g],
-  ['anthropic-key', /\bsk-ant-[A-Za-z0-9_-]{20,}\b/g],
-  ['openai-key', /\bsk-(?:proj-)?[A-Za-z0-9]{32,}\b/g],
-  ['github-token', /\bgh[pousr]_[A-Za-z0-9]{30,}\b/g],
-  ['aws-key-id', /\bAKIA[0-9A-Z]{16}\b/g],
-  ['google-key', /\bAIza[0-9A-Za-z_-]{35}\b/g],
-  ['jwt', /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g],
-  ['private-key', /-----BEGIN [A-Z ]*PRIVATE KEY-----/g],
-  // PII: a shared trace should not carry personal addresses. Deliberately broad;
-  // every hit is counted so the operator can see what tripped.
-  ['email', /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g],
-];
-
-// Value rules: match the ACTUAL secret values from the environment, so secrets
-// that don't look like secrets are still caught.
-const envRules = [];
-for (const [k, v] of Object.entries(process.env)) {
-  if (!/(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i.test(k)) continue;
-  if (!v || v.length < 8) continue;
-  envRules.push([`env:${k}`, v]);
-}
-
-const hits = {};
-const bump = (rule, n = 1) => { hits[rule] = (hits[rule] || 0) + n; };
-
-function redact(text) {
-  let out = text;
-  // Value rules first — an env secret may itself look like a pattern.
-  for (const [rule, value] of envRules) {
-    if (!out.includes(value)) continue;
-    bump(rule, out.split(value).length - 1);
-    out = out.split(value).join(`«redacted:${rule}»`);
-  }
-  for (const [rule, re] of PATTERNS) {
-    out = out.replace(re, () => { bump(rule, 1); return `«redacted:${rule}»`; });
-  }
-  return out;
-}
+// ---------- redaction (§7): ruleset in share-redact.mjs ----------
+const { redact, bump, hits, rules: redactionRules } = makeRedactor({ env: process.env });
 
 // Codex rollout lines. Shapes mirror parseCodex() in server/src/traces.js, which
 // is the battle-tested reader for this format -- keep the two in step.
@@ -361,12 +325,20 @@ if (stats.subagent) {
 // rollout-<ts>-<uuid>.jsonl for codex. The Hub's trace detection and every
 // working trace dataset in the wild use the native name, and it is the only
 // place the session id survives if the manifest is lost (§4).
-const traceName = CONVERTED.includes(HARNESS)
-  ? `${(sessionArg || path.basename(src, '.jsonl')).replace(/[^\w.-]/g, '_')}.jsonl`
+//
+// A gated share passes a neutral name instead: file names in a gated repo are
+// listed publicly, and a codex name carries the session's start time.
+const nativeName = CONVERTED.includes(HARNESS)
+  ? `${(sessionArg && sessionArg !== '-' ? sessionArg : path.basename(src, '.jsonl')).replace(/[^\w.-]/g, '_')}.jsonl`
   : path.basename(src);
+if (traceNameArg && !/^[\w-]+\.jsonl$/.test(traceNameArg)) {
+  console.error(`bad trace name: ${traceNameArg}`);
+  process.exit(1);
+}
+const traceName = traceNameArg || nativeName;
 const uuid = HARNESS === 'codex'
-  ? (traceName.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/) || [])[1] || traceName.replace(/\.jsonl$/, '')
-  : traceName.replace(/\.jsonl$/, '');
+  ? (nativeName.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/) || [])[1] || nativeName.replace(/\.jsonl$/, '')
+  : nativeName.replace(/\.jsonl$/, '');
 fs.mkdirSync(path.join(outdir, 'meta'), { recursive: true });
 const trace = kept.join('\n') + '\n';
 fs.writeFileSync(path.join(outdir, traceName), trace);
@@ -381,7 +353,7 @@ const HARNESS_NAME = { claude: 'Claude Code', codex: 'Codex', hermes: 'Hermes',
 // mechanical. Codex shards by date: sessions/YYYY/MM/DD/rollout-*.jsonl.
 const nativePath = HARNESS === 'codex'
   ? path.join('sessions', ...src.split(path.sep).slice(-4))
-  : HARNESS === 'claude' ? path.join('projects', cwdSlug, traceName)
+  : HARNESS === 'claude' ? path.join('projects', cwdSlug, nativeName)
   : null; // converted: no native file to put back, the source is a db or foreign format
 
 const manifest = {
@@ -392,7 +364,7 @@ const manifest = {
   trace: { path: traceName, nativePath, sha256, lines: kept.length,
            converted: CONVERTED.includes(HARNESS), format: CONVERTED.includes(HARNESS) ? 'sts' : HARNESS },
   stats: { ...stats, firstTs: iso(stats.firstTs), lastTs: iso(stats.lastTs) },
-  redaction: { ruleset: '1', hits, blocked: false },
+  redaction: { ruleset: '2', hits, blocked: false },
   lineage: { parent: null },
 };
 
@@ -427,8 +399,8 @@ ${prompts.map((p, i) => `${i + 1}. ${p}`).join('\n')}
 // Written last, so `hits` includes redactions made in the derived artifacts above.
 fs.writeFileSync(path.join(outdir, 'meta/manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
 fs.writeFileSync(path.join(outdir, 'meta/redaction.json'), JSON.stringify({
-  ruleset: '1',
-  rules: PATTERNS.map(([r]) => r).concat(envRules.map(([r]) => r)),
+  ruleset: '2',
+  rules: redactionRules,
   hits,
   dropped: stats.dropped,
 }, null, 2) + '\n');
