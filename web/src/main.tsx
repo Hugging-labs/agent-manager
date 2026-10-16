@@ -4,6 +4,7 @@ import type { ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App';
 import { requestFromHash } from './lib/fileLinks';
+import { defaultTrusted, frameVerdict } from './lib/framing';
 import './styles.css';
 import './conversation.css';
 
@@ -34,6 +35,9 @@ class Boundary extends Component<{ children: ReactNode }, { err: unknown }> {
 
 // No StrictMode: it double-mounts in dev, which would open duplicate WebSockets.
 const FileLinkPage = lazy(() => import('./components/FileLinkPage'));
+// Only ever loaded inside a frame the defaults don't trust, so it stays out of
+// the entry chunk. If it fails to load, the page stays blank: nothing to click.
+const UntrustedFrame = lazy(() => import('./components/UntrustedFrame'));
 function Entry() {
   const [hash, setHash] = useState(location.hash);
   useEffect(() => {
@@ -47,7 +51,17 @@ function Entry() {
     ? <Suspense fallback={<div className="fv-empty">Loading file preview…</div>}><FileLinkPage key={hash} request={request} /></Suspense>
     : <App />;
 }
-createRoot(document.getElementById('root')!).render(<Boundary><Entry /></Boundary>);
+
+// Inside a frame, render nothing until every ancestor is known to be trusted
+// (lib/framing.ts). Top-level loads and the Hub's own embed decide synchronously;
+// anything else is settled by the lazily loaded UntrustedFrame.
+function FrameGate({ children }: { children: ReactNode }) {
+  const [trusted, setTrusted] = useState(() => frameVerdict({ win: window }, defaultTrusted(window)) !== 'untrusted');
+  if (trusted) return <>{children}</>;
+  return <Suspense fallback={null}><UntrustedFrame onTrusted={() => setTrusted(true)} /></Suspense>;
+}
+
+createRoot(document.getElementById('root')!).render(<Boundary><FrameGate><Entry /></FrameGate></Boundary>);
 
 // Push notifications ride on this worker (agents message the operator on request).
 if ('serviceWorker' in navigator) {
