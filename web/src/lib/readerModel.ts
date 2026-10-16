@@ -57,23 +57,56 @@ export function reconcileTrace(raw: TraceTurn[], previous: TraceTurn[] = []): Tr
   const old = new Map(previous.filter((t) => t.id).map((t) => [t.id, t]));
   const messages: TraceTurn[] = [];
   const byMessage = new Map<string, number>();
-  const pending: { text: string; at: number; turn: TraceTurn }[] = [];
+  const pending: { text: string; turn: TraceTurn }[] = [];
+  const placed = new Set<string>();   // queue entries already shown, by the id their removal names
+  const consumed = new Map<string, number>();   // dequeued into a request: the real message carries it
   for (const turn of raw) {
     if (turn.event?.type === 'queue') {
       const event = turn.event;
+      // Text is the only thing an enqueue carries, so it is what connects one
+      // to its removal. Everything else uses the removal's own identity: it
+      // names the queue entry, and taking the enqueue's id instead let a
+      // non-FIFO removal of two identical messages wear the other one's id and
+      // timestamp.
+      const sameText = (t?: TraceTurn) => !!t && t.blocks.length === 1
+        && t.blocks[0].type === 'text' && t.blocks[0].text === event.text;
+      const prior = turn.id ? old.get(turn.id) : undefined;
+      const blocks: TraceBlock[] = sameText(prior) ? prior!.blocks : [{ type: 'text', text: event.text }];
+      const key = queueKey(event.text);
       if (event.operation === 'enqueue') {
-        const prior = turn.id ? old.get(turn.id) : undefined;
-        const blocks: TraceBlock[] = prior?.queued && prior.blocks.length === 1
-          && prior.blocks[0].type === 'text' && prior.blocks[0].text === event.text
-          ? prior.blocks : [{ type: 'text', text: event.text }];
-        pending.push({ text: queueKey(event.text), at: messages.length,
-          turn: { ...turn, event: undefined, role: 'user', queued: true, blocks } });
-        messages.push(turn); // reserve its chronological position; invisible until removed
+        // Held, not placed. The enqueue marks where the prompt was TYPED, which
+        // for a mid-turn message is in the middle of the answer to the previous
+        // one — and a user turn there opens an exchange that swallows the rest
+        // of that answer, leaving the exchange it belongs to with none. Still
+        // waiting prompts are appended after the loop instead.
+        pending.push({ text: key, turn: { ...turn, event: undefined, role: 'user', queued: true, blocks } });
       }
-      else if (event.operation === 'dequeue') pending.shift();
-      else if (event.operation === 'remove') {
-        const i = pending.findIndex((p) => p.text === queueKey(event.text));
-        if (i >= 0) { const p = pending.splice(i, 1)[0]; messages[p.at] = p.turn; }
+      else if (event.operation === 'dequeue') {
+        // Popped into a request: the ordinary user message is on its way and
+        // that copy keeps the prompt. Positional, because a dequeue names no
+        // text — but the entry it pops does, and a later record of the same
+        // prompt must not add it a second time.
+        const gone = pending.shift();
+        if (gone) consumed.set(gone.text, (consumed.get(gone.text) || 0) + 1);
+      }
+      else {
+        // `remove` and `delivered` are both terminal: whatever the queue did
+        // with it, it is not waiting any more, so the badge comes off. They are
+        // also two records of the SAME prompt, so the first to arrive places it
+        // and the id keeps the second from placing it again.
+        const id = event.commandUuid;
+        if (id && placed.has(id)) { continue; }
+        const already = consumed.get(key) || 0;
+        if (already) { consumed.set(key, already - 1); continue; }
+        const at = pending.findIndex((p) => p.text === key);
+        if (at >= 0) pending.splice(at, 1);   // no longer waiting
+        // The removal alone is enough. A window can begin after the enqueue and
+        // still carry this, and the prompt used to vanish in that window while
+        // its reply stayed — which is why a reload and the live view disagreed.
+        // `blocks` is reused from the previous poll's copy of THIS turn, which
+        // is what keeps the rendered row identical across polls.
+        messages.push({ ...turn, event: undefined, role: 'user', queued: false, blocks });
+        if (id) placed.add(id);
       }
       continue;
     }
@@ -89,6 +122,16 @@ export function reconcileTrace(raw: TraceTurn[], previous: TraceTurn[] = []): Tr
       }
       continue;
     }
+    // The dequeued prompt has arrived as an ordinary message, so that dequeue
+    // is answered for. Left standing, its count was spent by the next record of
+    // the same TEXT instead — a second send of the same words, whose removal
+    // was then skipped and whose enqueue sat at the end still marked queued.
+    if (turn.role === 'user' && consumed.size) {
+      const arrived = queueKey(turn.blocks.filter((b) => b.type === 'text')
+        .map((b) => ('text' in b ? b.text : '')).join(''));
+      const outstanding = arrived ? consumed.get(arrived) || 0 : 0;
+      if (outstanding) consumed.set(arrived, outstanding - 1);
+    }
     const index = turn.messageId ? byMessage.get(turn.messageId) : undefined;
     if (index !== undefined) {
       const first = messages[index];
@@ -98,6 +141,13 @@ export function reconcileTrace(raw: TraceTurn[], previous: TraceTurn[] = []): Tr
       messages.push(turn);
     }
   }
+  // Anything still in the queue when the page ends is a prompt the operator has
+  // sent and is waiting on. Held back above so it does not split the answer it
+  // was typed into, it goes in here, at the end, where it is waiting — and
+  // visibly queued, which is the one case that badge is for. Without this a
+  // genuinely queued prompt was in the transcript and nowhere on screen, so it
+  // disappeared on reload.
+  for (const held of pending) messages.push(held.turn);
   // Results can arrive in a different HTTP request, or before their call in a
   // backward page. Ordinary tools need the same identity join as subagents.
   const calls = new Set<string>();

@@ -46,6 +46,9 @@ const user = (text) => ({ type: 'user', sessionId: 's', timestamp: now(),
   message: { role: 'user', content: [{ type: 'text', text }] } });
 const asst = (text, id) => ({ type: 'assistant', sessionId: 's', timestamp: now(),
   message: { id, role: 'assistant', content: [{ type: 'text', text }] } });
+const attachment = (prompt, sourceUuid) => ({ type: 'attachment', sessionId: 's', timestamp: now(),
+  attachment: { type: 'queued_command', prompt, humanTurn: true,
+    ...(sourceUuid ? { source_uuid: sourceUuid } : {}) } });
 const queue = (operation, content, reason) => ({ type: 'queue-operation', operation,
   sessionId: 's', timestamp: now(), ...(content ? { content } : {}),
   ...(reason ? { reason, deliveryId: '18445368-4b59', commandUuid: 'a26f88b4' } : {}) });
@@ -76,6 +79,56 @@ for (const [name, records] of [
       assert.ok(text.includes('att_1.png'), 'the attachment list was dropped');
     });
   }
+}
+
+console.log('\n# what the reader is told about a removal');
+{
+  // `reader` is derived from the WINDOW's version, not from an opts flag: the
+  // calls above exercise the older path. In the reader's own mode a queue
+  // record arrives as an event, and the reason has to come with it — the reader
+  // cannot otherwise tell a prompt that was delivered into the running turn
+  // from one the queue dropped undelivered.
+  const file = write('absorbed-event', [user('first'), asst('working', 'm1'),
+    queue('enqueue', 'a mid-turn message'),
+    queue('remove', 'a mid-turn message', 'absorbed_mid_turn')]);
+  const { turns } = await readTraceByPath(file, { window: { version: 2, at: 'tail', bytes: 8 * 1024 * 1024 } });
+  const events = turns.filter((t) => t.event?.type === 'queue');
+  check('the reader gets the queue records as events', () => {
+    assert.deepEqual(events.map((e) => e.event.operation), ['enqueue', 'remove']);
+  });
+  check('and the removal says why it was removed', () => {
+    assert.equal(events[1].event.reason, 'absorbed_mid_turn');
+  });
+  check('and which queue entry it took', () => {
+    assert.equal(events[1].event.commandUuid, 'a26f88b4', 'the only identity in the lifecycle is dropped');
+  });
+}
+{
+  // The delivery record is the prompt's last chance: a window can begin after
+  // both the enqueue and the removal and still contain it.
+  const file = write('delivery-event', [user('first'), asst('working', 'm1'),
+    attachment('a mid-turn message', 'cmd-7')]);
+  const { turns } = await readTraceByPath(file, { window: { version: 2, at: 'tail', bytes: 8 * 1024 * 1024 } });
+  const events = turns.filter((t) => t.event?.type === 'queue');
+  check('a queued_command attachment reaches the reader', () => {
+    assert.deepEqual(events.map((e) => e.event.operation), ['delivered']);
+    assert.equal(events[0].event.text, 'a mid-turn message');
+    assert.equal(events[0].event.commandUuid, 'cmd-7');
+  });
+  const anon = write('delivery-anon', [user('first'), asst('working', 'm1'),
+    attachment('a mid-turn message', null)]);
+  const anonTurns = (await readTraceByPath(anon, { window: { version: 2, at: 'tail', bytes: 8 * 1024 * 1024 } })).turns;
+  check('one that names no queue entry is left alone', () => {
+    // Without an id there is no way to tell it from the removal of the same
+    // text, and showing both is the duplicate this area keeps producing.
+    assert.equal(anonTurns.filter((t) => t.event?.type === 'queue').length, 0);
+  });
+  const plain = write('plain-event', [user('first'), asst('working', 'm1'),
+    queue('enqueue', 'another'), queue('remove', 'another')]);
+  const plainTurns = (await readTraceByPath(plain, { window: { version: 2, at: 'tail', bytes: 8 * 1024 * 1024 } })).turns;
+  check('an ordinary removal carries no reason to misread', () => {
+    assert.equal(plainTurns.filter((x) => x.event?.type === 'queue')[1].event.reason, undefined);
+  });
 }
 
 console.log('\n# a prompt that only talks about the wrapper');

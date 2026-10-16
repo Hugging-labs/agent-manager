@@ -106,7 +106,32 @@ try {
     // it changes how every CJS module is wrapped at run time, which is not a
     // trade for a dependency bump to make. Raised to 780 for the toolchain
     // alone, keeping the headroom as tight as the raise above.
-    assert.ok(entry.length <= 780 * 1024, `entry chunk is ${(entry.length / 1024).toFixed(0)} kB, over the 780 kB budget`);
+    // Two security fixes used the headroom up (2026-10-16). On a clean `npm ci`
+    // checkout of 617e625 the review measured main's entry at 798,544 — 176
+    // under this budget's predecessor (780 kB, 798,720) — and this PR adds
+    // ~310 characters, which puts it over. #182
+    // (security/edge-params-out-of-links) and #185 (security/frame-ancestors)
+    // are what consumed it; measured here by building at each merge point, they
+    // added 960 and 1,077 characters.
+    //
+    // Nothing of that is lazy-able. #185 already moved its untrusted-frame UI
+    // into a chunk of its own, what remains of both fixes is the check itself,
+    // and this PR's share is in readerModel, which the entry carries.
+    //
+    // Raised to 790 for the three of them. That leaves more headroom (~9 kB)
+    // than the raises above kept (~1 kB, deliberately, so the next eager import
+    // trips this); 785 is the tighter choice if that matters more than room for
+    // the next security fix.
+    //
+    // Note for whoever measures next: this box builds 617e625 at 799,223
+    // characters, reproduced from a pristine clone with `npm ci` and the
+    // lockfile's vite 6.4.4 / esbuild 0.25.12 / rollup 4.62.2 — 679 more than
+    // the review's clean install of the same commit. Same package versions, so
+    // the difference is in the toolchain's environment rather than the source;
+    // Node differed (v24.22.0 here). Both numbers sit under 790 and over 780, so
+    // the budget holds either way, but do not expect the byte counts above to
+    // reproduce exactly.
+    assert.ok(entry.length <= 790 * 1024, `entry chunk is ${(entry.length / 1024).toFixed(0)} kB, over the 790 kB budget`);
     // One literal only that panel's module contains — a dynamic import that
     // merely wraps an unchanged graph would leave these in the entry.
     for (const [panel, marker] of [

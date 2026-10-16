@@ -69,7 +69,17 @@ const rec = {
 const normalize = async (records) => {
   const file = path.join(tmp, `t-${Math.random().toString(36).slice(2)}.jsonl`);
   fs.writeFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
-  try { return (await readTraceByPath(file, { reader: true, limit: 500 })).turns; }
+  // A v2 WINDOW request is what puts the normalizer in the reader's mode —
+  // `reader` is derived from `window.version`, so passing it directly (as this
+  // did) quietly exercised the older path the reader does not use.
+  try { return (await readTraceByPath(file, { window: { version: 2, at: 'tail', bytes: 8 * 1024 * 1024 } })).turns; }
+  finally { fs.rmSync(file, { force: true }); }
+};
+/** The same, with the span and turn floor the reader actually asks for. */
+const normalizeTail = async (records, bytes, min) => {
+  const file = path.join(tmp, `t-${Math.random().toString(36).slice(2)}.jsonl`);
+  fs.writeFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  try { return (await readTraceByPath(file, { window: { version: 2, at: 'tail', bytes, min } })).turns; }
   finally { fs.rmSync(file, { force: true }); }
 };
 
@@ -228,6 +238,122 @@ try {
     check('still one copy after a reload', () => {
       assert.equal(reloaded, 1, `it is on screen ${reloaded} times`);
       assert.ok(!reloadedText.includes('pasted_content'), 'the wrapper is back after a reload');
+    });
+  }
+
+  // The same words sent twice, once dequeued into a request and once absorbed.
+  // A dequeue says the ordinary message carries that prompt, so a later record
+  // of the same text must not be read as the same send — the second removal
+  // was being spent against the first dequeue and dropped, leaving its enqueue
+  // stranded at the end still marked queued.
+  console.log('\n### the same message sent twice, dequeued then absorbed');
+  {
+    const SAME = 'run the deploy again please';
+    const turns = await normalize([
+      rec.user('first prompt', 0),
+      rec.enqueue(SAME, 1), rec.dequeue(2), rec.user(SAME, 3),   // delivered as an ordinary message
+      rec.asst('working on it', 4),
+      rec.enqueue(SAME, 5), rec.remove(SAME, 6, 'absorbed_mid_turn'),   // sent again, mid-turn
+      rec.asst('done twice', 7),
+    ]);
+    await p.evaluate((t) => window.fixture.mount(t), turns);
+    await p.waitForSelector('.cxv-body');
+    await p.waitForTimeout(900);
+    const bands = await p.evaluate((n) => [...document.querySelectorAll('.cx-prompt')]
+      .filter((el) => el.textContent.includes(n)).map((el) => !!el.querySelector('.cx-queued')), SAME);
+    console.log(`  bands=${bands.length} badged=${JSON.stringify(bands)}`);
+    check('both sends are on screen', () => {
+      assert.equal(bands.length, 2, 'one of the two sends is missing or doubled');
+    });
+    check('and neither is left marked as waiting', () => {
+      assert.deepEqual(bands, [false, false], 'a delivered prompt is still badged queued');
+    });
+    const seen = await p.evaluate(() => document.querySelector('.cxv-body')?.innerText || '');
+    check('the reply to the second one is after it', () => {
+      assert.ok(seen.lastIndexOf(SAME) < seen.indexOf('done twice'), 'the last send has no reply after it');
+    });
+  }
+
+  // A window that does not reach back as far as the enqueue. The reader asks
+  // for a span of bytes with a minimum number of turns, so one large record
+  // between the enqueue and its removal is enough to push the enqueue out —
+  // and then the prompt was simply absent while its reply stayed behind in the
+  // previous exchange, which is why the live view and a reload disagreed.
+  console.log('\n### a window that begins after the enqueue');
+  {
+    const MID = 'the message whose enqueue fell off the window';
+    const REPLY = 'the reply to the message';
+    const bulky = 'x'.repeat(150 * 1024);
+    const records = [rec.user('first prompt', 0), rec.enqueue(MID, 1), rec.asst(bulky, 2),
+      rec.remove(MID, 3, 'absorbed_mid_turn'), rec.absorbed(MID, 4)];
+    for (let i = 0; i < 11; i++) records.push(rec.asst(`step ${i}`, 5 + i));
+    records.push(rec.asst(REPLY, 20));
+    const turns = await normalizeTail(records, 128 * 1024, 12);
+    const ops = turns.filter((t) => t.event?.type === 'queue').map((t) => t.event.operation);
+    console.log(`  window turns=${turns.length} queue events=${JSON.stringify(ops)}`);
+    assert.ok(!ops.includes('enqueue'), 'the window still reaches the enqueue — widen the bulky record');
+    await p.evaluate((t) => window.fixture.mount(t), turns);
+    await p.waitForSelector('.cxv-body');
+    await p.waitForTimeout(900);
+    const seen = await p.evaluate(() => document.querySelector('.cxv-body')?.innerText || '');
+    const bands = await p.evaluate((n) => [...document.querySelectorAll('.cx-prompt')]
+      .filter((el) => el.textContent.includes(n)).length, MID);
+    check('the prompt is there even though its enqueue is not', () => {
+      assert.equal(bands, 1, `the message is on screen ${bands} times`);
+    });
+    check('and its reply comes after it', () => {
+      const a = seen.indexOf(MID), b = seen.indexOf(REPLY);
+      assert.ok(a >= 0 && b > a, `order was ${JSON.stringify([a, b])}`);
+    });
+  }
+
+  // A message delivered INTO the running turn, with the timestamps the harness
+  // actually writes: the answer to the previous prompt is stamped before the
+  // mid-turn message was typed, and the delivery record is stamped before its
+  // own enqueue. Nothing may be reordered or re-parented because of that.
+  console.log('\n### a message absorbed into the running turn');
+  {
+    const FIRST = 'answer to the first prompt';
+    const MID = 'can we set up just one dev space instead of three?';
+    const REPLY = 'answer to the mid-turn message';
+    await p.evaluate((t) => window.fixture.mount(t), await normalize([
+      rec.user('first prompt', 0),
+      // File order, exactly as the harness writes it: the enqueue is appended
+      // mid-turn, and the answer to the PREVIOUS prompt is written after it
+      // while being stamped five seconds EARLIER. Put the answer first and
+      // there is nothing to split, which is how this case can look fixed when
+      // it is not.
+      rec.enqueue(MID, 10),
+      rec.asst(FIRST, 5),
+      rec.remove(MID, 13, 'absorbed_mid_turn'),
+      rec.absorbed(MID, 9),              // stamped before its own enqueue
+      rec.asst(REPLY, 46),
+    ]));
+    await p.waitForSelector('.cxv-body');
+    await p.waitForTimeout(900);
+    const seen = await p.evaluate(() => document.querySelector('.cxv-body')?.innerText || '');
+    const bands = await p.evaluate((n) => [...document.querySelectorAll('.cx-prompt')]
+      .filter((el) => el.textContent.includes(n)).length, MID);
+    const badged = await p.evaluate((n) => [...document.querySelectorAll('.cx-prompt')]
+      .some((el) => el.textContent.includes(n) && el.querySelector('.cx-queued')), MID);
+    const order = [FIRST, MID, REPLY].map((t) => seen.indexOf(t));
+    console.log(`  bands=${bands} badged=${badged} order=${JSON.stringify(order)}`);
+    check('the message is on screen once', () => assert.equal(bands, 1));
+    check('it is not labelled as still waiting in the queue', () => {
+      assert.equal(badged, false, 'a message the agent answered is badged "queued"');
+    });
+    check('output that predates it is not shown after it', () => {
+      assert.ok(order.every((i) => i >= 0), `something is missing from the reader: ${JSON.stringify(order)}`);
+      assert.ok(order[0] < order[1], 'the previous answer was moved below the mid-turn message');
+      assert.ok(order[1] < order[2], 'the reply to the mid-turn message is not after it');
+    });
+    // The previous prompt keeps its own answer rather than donating it.
+    const firstExchange = await p.evaluate((t) => {
+      const section = document.querySelector('.cx');
+      return !!section && section.innerText.includes(t);
+    }, FIRST);
+    check('the previous prompt keeps its answer', () => {
+      assert.equal(firstExchange, true, 'the earlier answer was re-parented into the mid-turn exchange');
     });
   }
 
