@@ -111,8 +111,8 @@ export default function ShareDialog({ session, onClose }: { session: Session; on
             {visibility === 'gated' && (
               <p className="share-note">
                 The dataset is listed publicly on the Hub, but only people you approve can read the trace.
-                Its repo name, card title and file list are public — they are kept neutral, with nothing
-                from this session in them. Like a public share, it is <strong>refused</strong> if the
+                Its repo name, card title and file list are public, so they are kept neutral and never
+                include the session’s name. Like a public share, it is <strong>refused</strong> if the
                 transcript contains anything credential-shaped.
               </p>
             )}
@@ -145,10 +145,14 @@ export default function ShareDialog({ session, onClose }: { session: Session; on
             )}
             {exposed && (
               <div className="share-exposed" role="alert">
-                <strong>This trace may be public{exposed.url ? ' at ' : '.'}</strong>
-                {exposed.url && <a href={exposed.url} target="_blank" rel="noreferrer">{exposed.url}</a>}
-                {exposed.url && <strong> — check it now.</strong>}
-                <div>{exposed.message}</div>
+                {exposed.url ? (
+                  <>
+                    <strong>This trace may be public at </strong>
+                    <a href={exposed.url} target="_blank" rel="noreferrer">{exposed.url}</a>
+                    <strong> — check it now.</strong>
+                    <div>Sharing failed, and the dataset could not be made private or deleted.</div>
+                  </>
+                ) : <strong>{exposed.message}</strong>}
               </div>
             )}
             {error && <div className="share-blocked" role="alert">{error}</div>}
