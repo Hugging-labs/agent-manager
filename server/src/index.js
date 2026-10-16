@@ -2454,6 +2454,9 @@ immediately (long-running foreground execs can destabilize some sessions):
 - \`$AM_LOCAL\` is a **fast local disk** for tools, envs, caches and git checkouts. Build Python envs there, **never** as a \`.venv\` on the \`/data\` bucket (object storage is slow and can't lock/mmap well). From a workspace:
   \`UV_PROJECT_ENVIRONMENT="$AM_LOCAL/envs/<name>" uv sync\`
 - Keep \`pyproject.toml\` / \`uv.lock\` / \`requirements.txt\` in the workspace — they're the durable source of truth; the env rebuilds from them in seconds after a restart.
+
+## Linking a Space for the operator
+Any Space link meant for the operator to click — this instance, an \`am-dev-*\` Space, the artifacts Space, a demo — is its **Hub page \`https://huggingface.co/spaces/<owner>/<name>\`** (plus \`?p=<page>.html\` for one page of the artifacts Space), **never** the direct \`https://<owner>-<name>.hf.space\` or \`*.static.hf.space\` URL, which fails on a private Space unless they have just opened its hf.co page. Direct \`*.hf.space\` URLs remain fine for programmatic access with a token (curl, health checks).
 ${artifactsSection(amCfg)}${jobsSection(amCfg)}
 ## Environment variables
 These are configured in the Space and available to every agent. Read a value

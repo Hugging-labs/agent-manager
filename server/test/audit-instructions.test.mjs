@@ -39,6 +39,7 @@ env.AUDIT_TEST_SECRET = 'synthetic-configured-value';
 
 const server = spawn(process.execPath, ['src/index.js'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
 let output = '';
+let second = null;   // the boot with artifacts disabled, below
 server.stdout.on('data', (chunk) => { output += chunk; });
 server.stderr.on('data', (chunk) => { output += chunk; });
 
@@ -129,6 +130,43 @@ try {
   assert.match(artifacts, /`hf repo create someone\/pages --repo-type space --space-sdk static --private`/,
     'visibility stays as configured');
 
+  // The linking rule covers EVERY Space — this instance, am-dev-*, demos —
+  // so it is its own section, not part of the artifacts one.
+  const linkRule = (doc) => {
+    const start = doc.indexOf('\n## Linking a Space for the operator');
+    assert.ok(start >= 0, 'the generated skill has the Space-linking rule');
+    const rest = doc.slice(start + 1);
+    const body = rest.slice(0, rest.indexOf('\n## ', 1) < 0 ? undefined : rest.indexOf('\n## ', 1));
+    assert.match(body, /Hub page `https:\/\/huggingface\.co\/spaces\/<owner>\/<name>`/);
+    assert.match(body, /\*\*never\*\* the direct `https:\/\/<owner>-<name>\.hf\.space` or `\*\.static\.hf\.space` URL/);
+    assert.match(body, /`am-dev-\*`/);
+    assert.match(body, /programmatic access with a token \(curl, health checks\)/);
+    return body;
+  };
+  linkRule(text);
+
+  // …and it is there with artifacts switched off, when no artifacts section is.
+  server.kill('SIGTERM');
+  await new Promise((resolve) => (server.exitCode != null ? resolve() : server.once('exit', resolve)));
+  // A fresh data tree: the generated skill is a managed file, and the first
+  // boot's ownership record would rightly stop it being recreated in place.
+  const dataDir2 = path.join(TMP, 'data-no-artifacts');
+  const generated2 = path.join(dataDir2, 'workspaces', 'skills', 'environment.md');
+  fs.mkdirSync(dataDir2, { recursive: true });
+  fs.writeFileSync(path.join(dataDir2, 'am-config.json'), JSON.stringify({ artifacts: { enabled: false } }));
+  second = spawn(process.execPath, ['src/index.js'], { env: { ...env, DATA_DIR: dataDir2 }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let output2 = '';
+  second.stdout.on('data', (chunk) => { output2 += chunk; });
+  second.stderr.on('data', (chunk) => { output2 += chunk; });
+  for (let i = 0; i < 600 && !fs.existsSync(generated2); i++) {
+    if (second.exitCode != null) throw new Error(`server exited ${second.exitCode}: ${output2.slice(-2_000)}`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(fs.existsSync(generated2), `environment skill was not generated on the second boot: ${output2.slice(-300)}`);
+  const withoutArtifacts = fs.readFileSync(generated2, 'utf8');
+  assert.doesNotMatch(withoutArtifacts, /## Publishing results as web pages/);
+  linkRule(withoutArtifacts);
+
   const docs = fs.readFileSync(path.resolve('..', 'docs', 'api-audit-log.md'), 'utf8');
   assert.match(docs, /full non-secret\s+request, prompt, file-write, result and error content/);
   assert.match(docs, /not an export-safe artifact/);
@@ -136,7 +174,9 @@ try {
   console.log('audit-instructions: generated and long-form policy describe retained, filtered, prospective private logs');
   console.log('env-skill: every dispatch section arms the watch and owns the result');
   console.log('env-skill: artifact pages are linked through the Hub page, with the ?p= router in the index');
+  console.log('env-skill: every Space link for the operator is its Hub page, with artifacts on or off');
 } finally {
+  second?.kill('SIGTERM');
   server.kill('SIGTERM');
   await Promise.race([
     new Promise((resolve) => server.once('exit', resolve)),
