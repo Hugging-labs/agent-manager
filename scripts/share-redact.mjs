@@ -35,14 +35,19 @@ export const PATTERNS = [
   ['github-token', /\bgithub_pat_[A-Za-z0-9_]{22,}/g],
   ['github-token', /\bgh[pousr]_[A-Za-z0-9]{30,}\b/g],
 
-  // Access key ids carry a fixed four-letter prefix by key type.
-  ['aws-key-id', /\b(?:AKIA|ASIA|ABIA|ACCA|AGPA|AIDA|AIPA|ANPA|ANVA|APKA|AROA)[0-9A-Z]{16}\b/g],
+  // Access key ids only: AKIA (long-term) and ASIA (temporary). The other
+  // four-letter prefixes (AIDA user, AGPA group, AROA role, AIPA instance
+  // profile, ANPA/ANVA policy, …) are plain identifiers that fill ordinary AWS
+  // output, and every hit here blocks a share.
+  ['aws-key-id', /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g],
   // Secret keys are 40 chars of base64 with no prefix, so only take one that is
   // labelled as such (`aws_secret_access_key = …`, `"SecretAccessKey": "…"`).
   // The label is kept; only the value is replaced.
   ['aws-secret-key', /((?:aws_?)?secret_?access_?key)([\s'"\\:=]{1,8})([A-Za-z0-9/+]{40})(?![A-Za-z0-9/+])/gi],
 
   ['slack-token', /\bxox[abposre]-\d+-[0-9A-Za-z-]{8,}/g],
+  // App-level tokens: xapp-<n>-<app id>-<n>-<hex>.
+  ['slack-token', /\bxapp-\d+-[A-Za-z0-9]+-\d+-[A-Za-z0-9]{16,}/g],
   ['stripe-key', /\b[sr]k_live_[0-9A-Za-z]{16,}/g],
   ['npm-token', /\bnpm_[A-Za-z0-9]{36}\b/g],
   ['google-key', /\bAIza[0-9A-Za-z_-]{35}/g],

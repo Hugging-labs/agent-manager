@@ -543,6 +543,113 @@ export async function buildBundle(session, { title, visibility, allSessions = []
 }
 
 // ---------- publishing ----------
+
+/** A raw authenticated Hub request (hfApi is JSON-only). Throws with `status`. */
+async function hubRequest(url, { method = 'GET', headers = {}, body, auth = true, timeoutMs = 300_000 } = {}) {
+  const token = hfToken();
+  // Headers, not an object spread: names are case-insensitive, and two spellings
+  // of `authorization` would otherwise both be sent (the Hub then answers 401).
+  const h = new Headers({ 'user-agent': 'agent-manager' });
+  if (auth && token) h.set('authorization', `Bearer ${token}`);
+  for (const [k, v] of Object.entries(headers)) h.set(k, v);
+  const r = await fetch(url.startsWith('http') ? url : `${HF}${url}`, {
+    method,
+    headers: h,
+    ...(body !== undefined ? { body } : {}),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!r.ok) {
+    const text = await r.text().catch(() => '');
+    let msg = text.slice(0, 200) || r.statusText;
+    try { const j = JSON.parse(text); msg = j.error || j.message || msg; } catch { /* not JSON */ }
+    throw Object.assign(new Error(`HF ${r.status}: ${msg}`), { status: r.status });
+  }
+  return r;
+}
+
+const LFS_JSON = 'application/vnd.git-lfs+json';
+
+/** Every file under dir, as repo-relative posix paths. */
+async function listFiles(dir, prefix = '') {
+  const out = [];
+  for (const e of await fsp.readdir(path.join(dir, prefix), { withFileTypes: true })) {
+    const rel = prefix ? `${prefix}/${e.name}` : e.name;
+    if (e.isDirectory()) out.push(...await listFiles(dir, rel));
+    else if (e.isFile()) out.push(rel);
+  }
+  return out.sort();
+}
+
+/**
+ * Commit every file in `dir` to the root of an EXISTING dataset repo, in one
+ * commit on main whose parent must be `parentCommit`. Small text files go
+ * inline; anything the Hub asks for as LFS is uploaded through the LFS batch
+ * API first (basic or multipart). Nothing here creates a repo: every endpoint
+ * 404s for one that is not there.
+ */
+export async function commitDir(repo, dir, { parentCommit, summary }) {
+  if (!parentCommit) throw new Error('commitDir needs the verified parent commit');
+  const files = [];
+  for (const rel of await listFiles(dir)) {
+    const buf = await fsp.readFile(path.join(dir, rel));
+    files.push({ path: rel, buf, size: buf.length, oid: crypto.createHash('sha256').update(buf).digest('hex') });
+  }
+
+  const pre = await (await hubRequest(`/api/datasets/${repo}/preupload/main`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ files: files.map((f) => ({ path: f.path, size: f.size, sample: f.buf.subarray(0, 512).toString('base64') })) }),
+  })).json();
+  const mode = new Map((pre.files || []).map((f) => [f.path, f.uploadMode]));
+  const lfs = files.filter((f) => mode.get(f.path) === 'lfs');
+
+  if (lfs.length) {
+    const batch = await (await hubRequest(`${HF}/datasets/${repo}.git/info/lfs/objects/batch`, {
+      method: 'POST', headers: { accept: LFS_JSON, 'content-type': LFS_JSON },
+      body: JSON.stringify({ operation: 'upload', transfers: ['basic', 'multipart'], hash_algo: 'sha256',
+        objects: lfs.map((f) => ({ oid: f.oid, size: f.size })) }),
+    })).json();
+    for (const obj of batch.objects || []) {
+      const f = lfs.find((x) => x.oid === obj.oid);
+      if (!f) continue;
+      if (obj.error) throw new Error(`LFS refused ${f.path}: ${obj.error.message || obj.error.code}`);
+      const up = obj.actions && obj.actions.upload;
+      if (!up) continue; // already stored
+      const hdr = up.header || {};
+      // Presigned storage URLs: their own headers only, never our token.
+      if (hdr.chunk_size) {
+        const size = Number(hdr.chunk_size);
+        const parts = [];
+        for (const key of Object.keys(hdr).filter((k) => /^\d+$/.test(k)).sort((a, b) => a - b)) {
+          const n = Number(key);
+          const r = await hubRequest(hdr[key], { method: 'PUT', auth: false, body: f.buf.subarray((n - 1) * size, n * size) });
+          parts.push({ partNumber: n, etag: r.headers.get('etag') });
+        }
+        await hubRequest(up.href, { method: 'POST', headers: { accept: LFS_JSON, 'content-type': LFS_JSON },
+          body: JSON.stringify({ oid: f.oid, parts }) });
+      } else {
+        await hubRequest(up.href, { method: 'PUT', auth: false, headers: hdr, body: f.buf });
+      }
+      const verify = obj.actions.verify;
+      if (verify) {
+        // Our token, not the action's own Authorization header.
+        const extra = Object.fromEntries(Object.entries(verify.header || {}).filter(([k]) => k.toLowerCase() !== 'authorization'));
+        await hubRequest(verify.href, { method: 'POST', headers: { accept: LFS_JSON, 'content-type': LFS_JSON, ...extra },
+          body: JSON.stringify({ oid: f.oid, size: f.size }) });
+      }
+    }
+  }
+
+  const lines = [{ key: 'header', value: { summary, description: '', parentCommit } }];
+  for (const f of files) {
+    lines.push(mode.get(f.path) === 'lfs'
+      ? { key: 'lfsFile', value: { path: f.path, algo: 'sha256', oid: f.oid, size: f.size } }
+      : { key: 'file', value: { path: f.path, content: f.buf.toString('base64'), encoding: 'base64' } });
+  }
+  return (await hubRequest(`/api/datasets/${repo}/commit/main`, {
+    method: 'POST', headers: { 'content-type': 'application/x-ndjson' },
+    body: lines.map((l) => JSON.stringify(l)).join('\n'),
+  })).json();
+}
 // Every Hub call a share makes, behind one seam so the whole sequence can run
 // against a fake Hub (server/test/share-publish.test.mjs). Each method throws on
 // failure; `info` throws an error with `status: 404` for a repo that is not there.
@@ -557,8 +664,13 @@ export const hub = {
   setGated: (repo) => hfApi(`/api/datasets/${repo}/settings`, { method: 'PUT', body: { gated: 'manual' } }),
   setPrivate: (repo) => hfApi(`/api/datasets/${repo}/settings`, { method: 'PUT', body: { private: true } }),
   deleteRepo: (repo) => hfApi('/api/repos/delete', { method: 'DELETE', body: { type: 'dataset', ...repoParts(repo) } }),
-  upload: (repo, dir) => run('hf', ['upload', repo, dir, '.', '--repo-type', 'dataset',
-    '--commit-message', 'Add Agent Manager session trace']),
+  // A commit, not `hf upload`: that one runs its own create_repo(exist_ok) first,
+  // so it would happily create (or reuse) a repo nobody gated. The commit API
+  // only writes to a repo that exists, and `parentCommit` makes the Hub refuse
+  // it unless the head is still the commit we verified.
+  upload: (repo, dir, { parentCommit }) => commitDir(repo, dir, {
+    parentCommit, summary: 'Add Agent Manager session trace',
+  }),
   grant: (repo, user) => hfApi(`/api/datasets/${repo}/user-access-request/grant`, { method: 'POST', body: { user } }),
   sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
 };
@@ -587,7 +699,10 @@ function shareError(status, code, message, share) {
  *   2. create the repo, public and EMPTY; a taken name is refused;
  *   3. gated: set `gated: manual`, then re-read it and check it took. If not,
  *      delete the still-empty repo and stop — nothing has been uploaded;
- *   4. upload; 5. grant users; 6. re-read and check the result.
+ *   4. re-check it is the same repo (id, head commit, gate, still empty), then
+ *      commit the bundle with that head as `parentCommit`, so the Hub refuses
+ *      the commit if the repo was replaced in between;
+ *   5. grant users; 6. re-read and check the result.
  *
  * Fail closed: anything that fails after the upload starts rolls the repo back
  * to private, or failing that deletes it, and the error says which. If even
@@ -641,12 +756,16 @@ export async function shareSession(session, { visibility = 'public', name, grant
     }
 
     // 3. Gate the empty repo and prove it took before a single trace byte goes up.
+    //    The verified read also pins WHICH repo this is (its id and head commit):
+    //    the upload is bound to exactly that.
+    let bound = null;
     if (gated) {
       let why = null;
       try {
         await h.setGated(repo);
         const info = await readBack(h, repo, verifyDelayMs, (i) => i && i.gated === 'manual');
         if (!info || info.gated !== 'manual') why = 'the Hub did not report the dataset as gated';
+        else bound = info;
       } catch (e) {
         console.error(`[share] gating ${repo} failed: ${e.message}`);
         why = 'the access gate could not be turned on';
@@ -658,13 +777,34 @@ export async function shareSession(session, { visibility = 'public', name, grant
           : `Not shared: ${why}. Nothing was uploaded, but an empty dataset is left at ${url} — delete it on the Hub.`,
         { stage: 'gate', outcome: gone ? 'deleted' : 'left-empty', url });
       }
+    } else {
+      bound = await h.info(repo).catch(() => null);
+    }
+
+    // 3b. Right before the upload, check it is still that repo, still empty, and
+    //     (gated) still gated. If it is gone or replaced, it is not ours to
+    //     touch; if it is ours but changed, delete it. Either way nothing went up.
+    {
+      const now = await h.info(repo).catch((e) => (e.status === 404 ? null : undefined));
+      const ours = bound && now && bound._id && now._id === bound._id;
+      const intact = ours && bound.sha && now.sha === bound.sha && (!gated || now.gated === 'manual')
+        && (now.siblings || []).every((f) => f.rfilename === '.gitattributes');
+      if (!intact) {
+        const gone = ours ? await deleteAndConfirm(h, repo) : false;
+        const what = now === null ? 'the dataset disappeared before the upload'
+          : ours ? 'the dataset changed before the upload' : 'the dataset could not be confirmed as the one just created';
+        throw shareError(424, 'share-bind-failed', ours
+          ? `Not shared: ${what}. Nothing was uploaded${gone ? ', and the dataset was deleted' : `; check ${url} on the Hub`}.`
+          : `Not shared: ${what}. Nothing was uploaded, and no other dataset was touched.`,
+        { stage: 'bind', outcome: ours ? (gone ? 'deleted' : 'left-empty') : 'not-uploaded', url });
+      }
     }
 
     // From here on the repo may hold trace bytes: any failure rolls back.
     let stage = 'upload';
     const granted = [];
     try {
-      await h.upload(repo, dir);
+      await h.upload(repo, dir, { parentCommit: bound.sha });
 
       stage = 'grant';
       const failedUsers = [];
@@ -708,7 +848,7 @@ export async function shareSession(session, { visibility = 'public', name, grant
     } catch (e) {
       if (!e.why) console.error(`[share] ${stage} for ${repo} failed: ${e.message}`);
       const why = e.why || (stage === 'upload' ? 'the upload failed' : stage === 'grant' ? 'granting access failed' : 'the final check failed');
-      throw await rollBack(h, repo, url, stage, why, verifyDelayMs);
+      throw await rollBack(h, repo, url, stage, why, verifyDelayMs, bound._id);
     }
   } finally {
     // The bundle is a copy; the session's own transcript is untouched.
@@ -733,8 +873,8 @@ async function deleteAndConfirm(h, repo) {
     await h.deleteRepo(repo);
   } catch (e) {
     console.error(`[share] delete ${repo} failed: ${e.message}`);
-    return false;
   }
+  // Judge by what the Hub says now, not by whether the delete call answered.
   try { await h.info(repo); return false; } catch (e) { return e.status === 404; }
 }
 
@@ -743,7 +883,20 @@ async function deleteAndConfirm(h, repo) {
  * private (and check), else delete it (and check), and return the error that
  * says which — or, if neither worked, that the trace may be public right now.
  */
-async function rollBack(h, repo, url, stage, why, delayMs) {
+async function rollBack(h, repo, url, stage, why, delayMs, boundId) {
+  // Only ever roll back the repo this share created. If it is gone, or the name
+  // now belongs to a different repo, the commit had nowhere to land (it was
+  // bound to our repo's head), so there is nothing of ours to undo.
+  const now = await h.info(repo).catch((e) => (e.status === 404 ? null : undefined));
+  if (now === null) {
+    return shareError(424, 'share-rolled-back', `Not shared: ${why}. The dataset no longer exists.`,
+      { stage, outcome: 'deleted', url });
+  }
+  if (now && now._id !== boundId) {
+    return shareError(424, 'share-rolled-back',
+      `Not shared: ${why}. The dataset was replaced by another one before the upload; nothing was written to it, and it was not touched.`,
+      { stage, outcome: 'not-uploaded', url });
+  }
   let madePrivate = false;
   try {
     await h.setPrivate(repo);

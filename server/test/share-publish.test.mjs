@@ -39,8 +39,12 @@ const err = (status, message) => Object.assign(new Error(`HF ${status}: ${messag
  * A Hub with just enough state to judge a share. `fail` names methods that
  * throw; `lie` makes a call "succeed" without taking effect.
  */
-function fakeHub({ fail = {}, lie = {}, ungateOnUpload = false, dropUpload = false } = {}) {
+function fakeHub({ fail = {}, lie = {}, ungateOnUpload = false, dropUpload = false, onInfo, beforeCommit } = {}) {
   const repos = new Map();
+  let serial = 0;
+  const fresh = (created) => ({ _id: `id${++serial}`, sha: `sha${serial}`, private: false, gated: false,
+    files: ['.gitattributes'], uploaded: {}, created });
+  let infoCalls = 0;
   const calls = [];
   const state = { anonymousCouldRead: false, wroteToExisting: false, uploadedWhileUngated: false };
   const check = () => {
@@ -58,15 +62,16 @@ function fakeHub({ fail = {}, lie = {}, ungateOnUpload = false, dropUpload = fal
     whoami: async () => ({ name: 'tester' }),
     info: async (repo) => {
       calls.push(['info', repo]);
+      if (onInfo) onInfo(++infoCalls, repo, h);
       maybeFail('info', repo);
       const r = get(repo);
-      return { id: repo, private: r.private, gated: r.gated, sha: 'sha1', siblings: r.files.map((rfilename) => ({ rfilename })) };
+      return { id: repo, _id: r._id, private: r.private, gated: r.gated, sha: r.sha, siblings: r.files.map((rfilename) => ({ rfilename })) };
     },
     createRepo: async (repo) => {
       calls.push(['create', repo]);
       maybeFail('createRepo', repo);
       if (repos.has(repo)) throw err(409, 'You already created this dataset repo');
-      repos.set(repo, { private: false, gated: false, files: ['.gitattributes'], uploaded: {}, created: true });
+      repos.set(repo, fresh(true));
     },
     setGated: async (repo) => {
       calls.push(['gate', repo]);
@@ -83,9 +88,13 @@ function fakeHub({ fail = {}, lie = {}, ungateOnUpload = false, dropUpload = fal
       maybeFail('deleteRepo', repo);
       if (!lie.deleteRepo) repos.delete(repo);
     },
-    upload: async (repo, dir) => {
-      calls.push(['upload', repo]);
+    // Modelled on the Hub commit API: never creates a repo (404 if missing), and
+    // refuses a commit whose parent is not the current head.
+    upload: async (repo, dir, { parentCommit } = {}) => {
+      calls.push(['upload', repo, parentCommit]);
+      if (beforeCommit) beforeCommit(repo, h);
       const r = get(repo);
+      if (parentCommit && parentCommit !== r.sha) throw err(412, 'parent commit is not the head of main');
       if (!r.created) state.wroteToExisting = true;
       if (r.gated !== 'manual') state.uploadedWhileUngated = true;
       const walk = (d, pre = '') => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) =>
@@ -94,6 +103,7 @@ function fakeHub({ fail = {}, lie = {}, ungateOnUpload = false, dropUpload = fal
       // A failed upload can still leave some files behind.
       if (fail.upload) { r.files.push(files.find((f) => f.endsWith('.jsonl'))); check(); throw err(500, 'upload broke'); }
       if (!dropUpload) for (const f of files) { r.files.push(f); r.uploaded[f] = fs.readFileSync(path.join(dir, f), 'utf8'); }
+      r.sha = `${r.sha}+commit`;
       if (ungateOnUpload) r.gated = false;
       check();
     },
@@ -109,6 +119,8 @@ function fakeHub({ fail = {}, lie = {}, ungateOnUpload = false, dropUpload = fal
     const f = h[k];
     h[k] = async (...a) => { try { return await f(...a); } finally { check(); } };
   }
+  // Someone else's repo appears under the same name.
+  h.replace = (repo) => { repos.set(repo, fresh(false)); };
   return h;
 }
 
@@ -128,7 +140,8 @@ test('gated: created empty, gated and verified BEFORE the upload; never anonymou
   const h = fakeHub();
   const out = await share(h, { grantTo: ['alice', 'bob'] });
   const k = kinds(h);
-  assert.deepEqual(k.slice(0, 4), ['create', 'gate', 'info', 'upload'], k.join(' '));
+  assert.deepEqual(k.slice(0, 5), ['create', 'gate', 'info', 'info', 'upload'], k.join(' '));
+  assert.equal(h.calls.find((c) => c[0] === 'upload')[2], 'sha1', 'the commit is bound to the verified head');
   assert.ok(k.indexOf('grant') > k.indexOf('upload'));
   assert.equal(k.at(-1), 'info', 'ends with a final check');
   assert.equal(h.state.uploadedWhileUngated, false);
@@ -269,11 +282,54 @@ test('final check fails: rolled back', async () => {
   assert.equal(e3.data.share.stage, 'verify');
 });
 
+test('repo disappears between the last check and the commit: no bytes land anywhere', async () => {
+  transcript('hello');
+  for (const visibility of ['gated', 'public']) {
+    const h = fakeHub({ beforeCommit: (repo, hub) => hub.repos.delete(repo) });
+    const e = await rejectsWith(share(h, { visibility }), 'share-rolled-back', 'deleted');
+    assert.match(e.message, /no longer exists/);
+    assert.equal(h.repos.size, 0, `${visibility}: the upload created a repo`);
+    assert.ok(!kinds(h).includes('private') && !kinds(h).includes('delete'));
+  }
+});
+
+test('repo replaced between the last check and the commit: the commit is refused, the other repo untouched', async () => {
+  transcript('hello');
+  for (const visibility of ['gated', 'public']) {
+    const h = fakeHub({ beforeCommit: (repo, hub) => hub.replace(repo) });
+    const e = await rejectsWith(share(h, { visibility }), 'share-rolled-back', 'not-uploaded');
+    assert.match(e.message, /replaced by another one before the upload; nothing was written to it/);
+    const [other] = h.repos.values();
+    assert.deepEqual(other.files, ['.gitattributes'], `${visibility}: trace bytes reached the replacement`);
+    assert.equal(other.private, false);
+    assert.equal(h.state.wroteToExisting, false);
+    assert.ok(!kinds(h).includes('private') && !kinds(h).includes('delete'), 'rollback touched a repo that is not ours');
+  }
+});
+
+test('repo gone, replaced, ungated or not empty at the pre-upload check: nothing uploaded', async () => {
+  transcript('hello');
+  // Gated flow: info #1 is the gate verify, #2 the pre-upload check. Public: #1 bind, #2 check.
+  const cases = [
+    ['gone', (n, repo, hub) => { if (n === 2) hub.repos.delete(repo); }, 'not-uploaded', /disappeared before the upload/],
+    ['replaced', (n, repo, hub) => { if (n === 2) hub.replace(repo); }, 'not-uploaded', /could not be confirmed.*no other dataset was touched/],
+    ['ungated', (n, repo, hub) => { if (n === 2) hub.repos.get(repo).gated = false; }, 'deleted', /changed before the upload\. Nothing was uploaded, and the dataset was deleted/],
+    ['not empty', (n, repo, hub) => { if (n === 2) hub.repos.get(repo).files.push('x.jsonl'); }, 'deleted', /changed before the upload/],
+  ];
+  for (const [label, onInfo, outcome, msg] of cases) {
+    const h = fakeHub({ onInfo });
+    const e = await rejectsWith(share(h), 'share-bind-failed', outcome);
+    assert.match(e.message, msg, label);
+    assert.ok(!kinds(h).includes('upload'), `${label}: uploaded anyway`);
+    if (outcome === 'not-uploaded') assert.ok(!kinds(h).includes('delete'), `${label}: deleted a repo that is not ours`);
+  }
+});
+
 test('public upload fails: rolled back the same way', async () => {
   transcript('hello');
   const h = fakeHub({ fail: { upload: true } });
   await rejectsWith(share(h, { visibility: 'public' }), 'share-rolled-back', 'made-private');
-  assert.deepEqual(kinds(h).slice(0, 2), ['create', 'upload'], 'public: no gate step');
+  assert.deepEqual(kinds(h).slice(0, 4), ['create', 'info', 'info', 'upload'], 'public: no gate step');
 });
 
 test('a secret blocks a GATED share too, before the Hub is touched', async () => {

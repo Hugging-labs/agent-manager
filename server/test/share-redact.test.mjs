@@ -26,6 +26,7 @@ const SECRETS = [
   ['aws-key-id', j('AS', 'IA', upper(16))],
   ['slack-token', j('xo', 'xb-', '1234567890', '-', '9876543210', '-', alnum(24))],
   ['slack-token', j('xo', 'xp-', '1234567890', '-', '1234567890123', '-', alnum(32))],
+  ['slack-token', j('xa', 'pp-', '1', '-', 'A0123BCDEFG', '-', '1234567890123', '-', rep('0f9e', 16))],
   ['stripe-key', j('sk', '_live_', alnum(24))],
   ['stripe-key', j('rk', '_live_', alnum(24))],
   ['npm-token', j('np', 'm_', alnum(36))],
@@ -118,6 +119,10 @@ test('ordinary text does not trip a secret rule', () => {
     'the disk_live_metrics table; ask_live_question(); sk_test_ is for tests',
     'xoxo-hugs and xoxb- is the Slack bot prefix',
     'AKIA is the access-key prefix; AKIAEXAMPLE is too short',
+    // IAM unique ids at full length: identifiers, not credentials.
+    ...['AIDA', 'AGPA', 'AROA', 'AIPA', 'ANPA', 'ANVA', 'APKA', 'ABIA', 'ACCA'].map((p) =>
+      JSON.stringify({ UserId: `${p}${upper(16)}`, Arn: 'arn:aws:iam::123456789012:role/x' })),
+    'xapp is the Slack app-token prefix; xapp-1 alone is not a token',
     'aws_secret_access_key = <your secret here>',
     'base64 of a random blob: ' + b64(40),
     'eyJhbGciOiJIUzI1NiJ9 is only a JWT header',
