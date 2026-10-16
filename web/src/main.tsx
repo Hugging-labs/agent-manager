@@ -4,7 +4,8 @@ import type { ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App';
 import { requestFromHash } from './lib/fileLinks';
-import { defaultTrusted, frameVerdict, standaloneUrl, type FrameVerdict } from './lib/framing';
+import { appRootUrl } from './lib/appUrl';
+import { defaultTrusted, frameVerdict, type FrameVerdict } from './lib/framing';
 import './styles.css';
 import './conversation.css';
 
@@ -52,7 +53,7 @@ function Entry() {
 // Inside a frame, render nothing until every ancestor is known to be trusted
 // (lib/framing.ts). Top-level loads and the Hub's own embed decide synchronously.
 function FrameGate({ children }: { children: ReactNode }) {
-  const env = { win: window, referrer: document.referrer };
+  const env = { win: window };
   const [verdict, setVerdict] = useState<FrameVerdict | 'checking'>(() => {
     const first = frameVerdict(env, defaultTrusted(window));
     return first === 'untrusted' ? 'checking' : first;
@@ -86,7 +87,9 @@ function FramedElsewhere() {
         </p>
         <button
           style={{ padding: '8px 16px', font: 'inherit', fontSize: 13, fontWeight: 600, cursor: 'pointer', borderRadius: 6, border: '1px solid #8884', background: 'transparent', color: 'inherit' }}
-          onClick={() => window.open(standaloneUrl(location.href), '_blank', 'noopener,noreferrer')}
+          // The app's root, nothing from this address: whoever framed us chose
+          // its path, parameters and hash.
+          onClick={() => window.open(appRootUrl(), '_blank', 'noopener,noreferrer')}
         >Open Agent Manager</button>
       </div>
     </div>

@@ -86,12 +86,14 @@ break the Hub's own embed.
 
 **Page (`web/src/lib/framing.ts`).** If the header is stripped or ignored, the
 app still refuses to render inside a page it doesn't trust and shows only an
-**Open Agent Manager** button that opens it in its own tab. Trusted: the app's
-own origin, the Hub for `*.hf.space`, and the server's list (`frameAncestors` in
-`/api/info`). Every ancestor must be trusted (`location.ancestorOrigins`). Where
-that list is missing, same-origin ancestors are read directly, and a
-cross-origin one is accepted only as the direct parent that is also the top and
-named by the referrer; anything else is untrusted. A frame sandboxed without
+**Open Agent Manager** button, which opens the app's root (nothing of the framed
+address) in its own tab. Trusted: the app's own origin, the Hub for `*.hf.space`,
+and the server's list (`frameAncestors` in `/api/info`). Every ancestor must be
+trusted (`location.ancestorOrigins`). Where that list is missing, same-origin
+ancestors are read directly and any cross-origin ancestor is unverifiable, so
+the page fails closed: in such browsers the Hub's own embed also shows the
+button. `document.referrer` is never used, since it names whoever navigated the
+frame, not its parent. A frame sandboxed without
 `allow-same-origin` (opaque origin) never renders: the Hub's Space page allows
 same-origin, but Hub-hosted user content that frames Spaces does not.
 

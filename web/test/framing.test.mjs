@@ -12,7 +12,10 @@ import { build } from 'esbuild';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const out = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'framing-')), 'framing.mjs');
 await build({ entryPoints: [path.join(HERE, '../src/lib/framing.ts')], outfile: out, format: 'esm', bundle: false, logLevel: 'error' });
-const { ancestorOrigins, defaultTrusted, frameVerdict, standaloneUrl, HUB_ORIGIN } = await import(pathToFileURL(out).href);
+const { ancestorOrigins, defaultTrusted, frameVerdict, HUB_ORIGIN } = await import(pathToFileURL(out).href);
+const appUrlOut = path.join(path.dirname(out), 'appUrl.mjs');
+await build({ entryPoints: [path.join(HERE, '../src/lib/appUrl.ts')], outfile: appUrlOut, format: 'esm', bundle: false, logLevel: 'error' });
+const { appRootUrl } = await import(pathToFileURL(appUrlOut).href);
 
 const APP = 'https://owner-space.hf.space';
 const crossOrigin = () => { throw new DOMException('Blocked a frame', 'SecurityError'); };
@@ -41,15 +44,15 @@ const chain = (...origins) => {
 // Top-level: always the app.
 {
   const w = win(APP);
-  assert.deepEqual(ancestorOrigins({ win: w, referrer: '' }), []);
-  assert.equal(frameVerdict({ win: w, referrer: '' }, defaultTrusted(w)), 'top');
+  assert.deepEqual(ancestorOrigins({ win: w }), []);
+  assert.equal(frameVerdict({ win: w }, defaultTrusted(w)), 'top');
 }
 // Defaults: the Hub is trusted for *.hf.space only.
 assert.deepEqual(defaultTrusted(win(APP)), [APP, HUB_ORIGIN]);
 assert.deepEqual(defaultTrusted(win('http://127.0.0.1:7860')), ['http://127.0.0.1:7860']);
 assert.deepEqual(defaultTrusted(win('https://hf.space.evil.example')), ['https://hf.space.evil.example']);
 
-const verdict = (w, referrer = '', trusted = defaultTrusted(w)) => frameVerdict({ win: w, referrer }, trusted);
+const verdict = (w, trusted = defaultTrusted(w)) => frameVerdict({ win: w }, trusted);
 
 // Engines that list ancestors (Chromium, WebKit, current Firefox).
 assert.equal(verdict(chain({ origin: HUB_ORIGIN }, { origin: APP, listed: [HUB_ORIGIN] })), 'trusted', 'the Hub Space page');
@@ -62,26 +65,31 @@ assert.equal(verdict(chain({ origin: 'https://evil.example' }, { origin: HUB_ORI
 assert.equal(verdict(chain({ origin: HUB_ORIGIN }, { origin: APP, listed: ['null'] })), 'untrusted', 'a masked ancestor is unidentified');
 assert.equal(verdict(chain({ origin: HUB_ORIGIN }, { origin: APP, listed: [HUB_ORIGIN], opaque: true })), 'untrusted',
   'a sandboxed (opaque-origin) frame never renders, even on the Hub');
-assert.equal(verdict(chain({ origin: 'https://portal.example' }, { origin: APP, listed: ['https://portal.example'] }), '',
+assert.equal(verdict(chain({ origin: 'https://portal.example' }, { origin: APP, listed: ['https://portal.example'] }),
   [APP, HUB_ORIGIN, 'https://portal.example']), 'trusted', 'server-configured extra origin');
 assert.equal(verdict(chain({ origin: 'https://huggingface.co.evil.example' }, { origin: APP, listed: ['https://huggingface.co.evil.example'] })), 'untrusted');
 
-// Engines without ancestorOrigins: readable same-origin ancestors are identified;
-// a cross-origin one only as the direct parent that is also the top and loaded us.
+// Engines without ancestorOrigins: only same-origin ancestors can be verified.
+// Any cross-origin ancestor fails closed, whatever document.referrer says (it
+// names whoever navigated the frame, not its parent) — the Hub embed included.
 {
-  const hub = chain({ origin: HUB_ORIGIN }, { origin: APP });
-  assert.deepEqual(ancestorOrigins({ win: hub, referrer: 'https://huggingface.co/' }), [HUB_ORIGIN]);
-  assert.equal(verdict(hub, 'https://huggingface.co/'), 'trusted', 'the Hub embed keeps working');
-  assert.equal(verdict(hub, ''), 'untrusted', 'no referrer: unidentified');
-  assert.equal(verdict(hub, `${APP}/somewhere`), 'untrusted', 'self-referrer says nothing about the parent');
-  assert.equal(verdict(hub, 'not a url'), 'untrusted');
-  const evil = chain({ origin: 'https://evil.example' }, { origin: APP });
-  assert.equal(verdict(evil, 'https://evil.example/page'), 'untrusted');
-  assert.equal(verdict(evil, ''), 'untrusted');
-  const nested = chain({ origin: HUB_ORIGIN }, { origin: 'https://evil-x.hf.space' }, { origin: APP });
-  assert.equal(verdict(nested, 'https://huggingface.co/'), 'untrusted', 'deeper cross-origin chains stay unidentified');
+  for (const referrer of ['', 'https://huggingface.co/', 'https://evil.example/', `${APP}/`]) {
+    const evil = chain({ origin: 'https://evil.example' }, { origin: APP });
+    // Offered the way an earlier version read it (env.referrer); it must not count.
+    const env = { win: evil, referrer };
+    assert.equal(ancestorOrigins(env), null, `foreign parent, referrer ${JSON.stringify(referrer)}: unverified`);
+    assert.equal(frameVerdict(env, defaultTrusted(evil)), 'untrusted', `foreign parent, referrer ${JSON.stringify(referrer)}: fails closed`);
+    assert.equal(frameVerdict(env, [APP, HUB_ORIGIN, 'https://evil.example']), 'untrusted',
+      'even an allowed origin cannot be verified without ancestorOrigins');
+  }
+  assert.equal(verdict(chain({ origin: HUB_ORIGIN }, { origin: APP })), 'untrusted',
+    'the Hub embed fails closed here too (the fallback button opens the app in its own tab)');
+  assert.equal(verdict(chain({ origin: HUB_ORIGIN }, { origin: 'https://evil-x.hf.space' }, { origin: APP })), 'untrusted');
   const self = chain({ origin: APP }, { origin: APP });
-  assert.equal(verdict(self, ''), 'trusted', 'same-origin parents are read directly');
+  assert.deepEqual(ancestorOrigins({ win: self }), [APP]);
+  assert.equal(verdict(self), 'trusted', 'same-origin parents are read directly');
+  const selfInEvil = chain({ origin: 'https://evil.example' }, { origin: APP }, { origin: APP });
+  assert.equal(verdict(selfInEvil), 'untrusted', 'a same-origin parent inside a foreign top');
 }
 
 // A throwing window.top (paranoid engines) is treated as framed.
@@ -91,6 +99,12 @@ assert.equal(verdict(chain({ origin: 'https://huggingface.co.evil.example' }, { 
   assert.equal(verdict(w), 'untrusted');
 }
 
-assert.equal(standaloneUrl(`${APP}/?__sign=secret&x=1#h`), `${APP}/?x=1#h`);
-assert.equal(standaloneUrl(`${APP}/`), `${APP}/`);
+// The fallback's link: the app root, nothing from the framed address.
+for (const href of [`${APP}/?__sign=secret&x=1#h`, `${APP}/deep/path?vvdebug=1&token=abc&__sign=s#file=a.md`,
+  `${APP}/?a=1&a=2&%F0%9F=x&redirect=https://evil.example`, `${APP}//evil.example/x?y`]) {
+  const url = new URL(href);
+  globalThis.location = { origin: url.origin, pathname: url.pathname, search: url.search, hash: url.hash, href: url.href };
+  assert.equal(appRootUrl(), `${APP}/`, `fallback link from ${href}`);
+}
+delete globalThis.location;
 console.log('framing: all checks passed');

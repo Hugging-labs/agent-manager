@@ -12,52 +12,35 @@ export const HUB_ORIGIN = 'https://huggingface.co';
 
 type FrameWindow = Pick<Window, 'self' | 'top' | 'parent' | 'location' | 'origin'>;
 
-export type FrameEnv = {
-  win: FrameWindow;
-  /** document.referrer: who loaded this frame, used only when nothing better exists. */
-  referrer: string;
-};
-
-const originOf = (url: string): string | null => {
-  try { const o = new URL(url).origin; return o === 'null' ? null : o; } catch { return null; }
-};
+export type FrameEnv = { win: FrameWindow };
 
 export const isFramed = (win: FrameWindow): boolean => {
   try { return win.top !== win.self; } catch { return true; }
 };
 
-// The ancestors' origins, nearest first. null = at least one couldn't be identified.
-export function ancestorOrigins({ win, referrer }: FrameEnv): string[] | null {
+// The ancestors' origins, nearest first. null = at least one can't be verified.
+export function ancestorOrigins({ win }: FrameEnv): string[] | null {
   if (!isFramed(win)) return [];
-  // Chromium and WebKit list every ancestor's origin ("null" for opaque ones).
+  // Chromium, WebKit and current Firefox list every ancestor's origin ("null"
+  // for opaque ones), as the browser itself knows them.
   const listed = (win.location as Location & { ancestorOrigins?: DOMStringList }).ancestorOrigins;
   if (listed && typeof listed.length === 'number') return Array.from({ length: listed.length }, (_, i) => listed.item(i) || 'null');
-  // Elsewhere (older Firefox): same-origin ancestors can be read directly.
-  try { return readableAncestors(win, referrer); } catch { return null; }
+  // Elsewhere only same-origin ancestors can be read. A cross-origin one can't
+  // be identified by anything the page sees (document.referrer names whoever
+  // navigated the frame, not its parent), so the ancestry is unverified and the
+  // caller fails closed. That includes the Hub's embed in such browsers: it
+  // shows the "Open Agent Manager" button, which still works.
+  try { return readableAncestors(win); } catch { return null; }
 }
 
-function readableAncestors(win: FrameWindow, referrer: string): string[] | null {
+function readableAncestors(win: FrameWindow): string[] | null {
   const out: string[] = [];
   let w: FrameWindow = win;
   for (let depth = 0; depth < 32 && w !== w.top; depth++) {
     const parent = w.parent as FrameWindow;
-    try {
-      const origin = parent.location.origin;
-      if (typeof origin !== 'string') throw new Error('unreadable');
-      out.push(origin);
-    } catch {
-      // A cross-origin ancestor can't be read. One case is identifiable anyway,
-      // the Hub's own embed: our direct parent is the top, and it loaded us.
-      // Only a page sharing an origin with one of a frame's ancestors may
-      // navigate it, so with a single ancestor the referrer names that parent,
-      // ourselves, or nobody. Ourselves or nobody, and anything deeper, stay
-      // unidentified.
-      if (w !== win || parent !== win.top) return null;
-      const from = originOf(referrer);
-      if (!from || from === win.location.origin) return null;
-      out.push(from);
-      return out;
-    }
+    const origin = parent.location.origin; // throws for a cross-origin ancestor
+    if (typeof origin !== 'string') return null;
+    out.push(origin);
     w = parent;
   }
   return w === w.top ? out : null;
@@ -83,13 +66,4 @@ export function frameVerdict(env: FrameEnv, trusted: readonly string[]): FrameVe
   if (!ancestors) return 'untrusted';
   const allowed = new Set(trusted);
   return ancestors.every((origin) => allowed.has(origin)) ? 'trusted' : 'untrusted';
-}
-
-// The same page as a top-level tab, minus any one-time Hub sign-in token.
-export function standaloneUrl(href: string): string {
-  try {
-    const url = new URL(href);
-    url.searchParams.delete('__sign');
-    return url.toString();
-  } catch { return href; }
 }

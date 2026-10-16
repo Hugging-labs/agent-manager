@@ -5,7 +5,8 @@
 //   - with that header stripped, the app itself refuses to render and shows only
 //     an "Open Agent Manager" button;
 //   - top-level loads, the app framing itself, and the Hub's Space page still work;
-//     Hub-hosted content that frames a Space sandboxed (no same-origin) does not.
+//     Hub-hosted content that frames a Space sandboxed (no same-origin) does not;
+//   - where location.ancestorOrigins is missing, unverifiable ancestry fails closed.
 // The Hub and Spaces are emulated with request routing (no network): their pages
 // are fixtures, and *.hf.space requests are served by a local Space-mode server.
 // Chromium always runs. Firefox and WebKit run when Playwright can launch them
@@ -16,6 +17,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import http from 'node:http';
 import { build } from 'vite';
+import { build as esbuild } from 'esbuild';
 import { chromium, firefox, webkit } from 'playwright';
 import { chromiumLaunchOptions } from '../../scripts/test-chromium.mjs';
 import { framingServers } from '../../server/test/fixtures/framing-server.mjs';
@@ -32,10 +34,17 @@ const EVIL = 'https://evil.example';
 // routed "public" one by Chromium's local-network rules, both before
 // frame-ancestors is ever consulted.
 let EVIL_HTTP;
+// What the attacker frames: a deep path, foreign parameters (one shaped like the
+// Hub's sign-in token, one allowlisted app parameter) and a hash. The fallback's
+// link must carry none of it.
+const FOREIGN_ADDRESS = '/deep/path?__sign=SECRET&other=SECRET2&redirect=https%3A%2F%2Fevil.example&vvdebug=1#file=a.md';
 const marker = { ...REQUEST_HEADERS, 'x-am-origin': 'operator', 'content-type': 'application/json' };
 
 let local, space, evilServer;
 const failures = [];
+// The shipped ancestry helper as a script, for case 9.
+const FRAMING_IIFE = (await esbuild({ entryPoints: [path.join(web, 'src/lib/framing.ts')], bundle: true, write: false,
+  format: 'iife', globalName: 'framing', logLevel: 'silent' })).outputFiles[0].text;
 try {
   await build({ root: web, logLevel: 'silent', build: { outDir: fixture.publicDir, emptyOutDir: true } });
   // A page of the app's own origin that frames the app (same-origin framing).
@@ -44,7 +53,7 @@ try {
   local = await fixture.start('local');
   evilServer = http.createServer((_req, res) => {
     res.writeHead(200, { 'content-type': 'text/html' });
-    res.end(`<!doctype html><body style="margin:0"><p>Click Start, then type your nickname</p><iframe id="app" src="${local.base}/" style="position:absolute;left:0;top:0;border:0;width:1200px;height:700px;opacity:0.01"></iframe></body>`);
+    res.end(`<!doctype html><body style="margin:0"><p>Click Start, then type your nickname</p><iframe id="app" src="${local.base}${FOREIGN_ADDRESS}" style="position:absolute;left:0;top:0;border:0;width:1200px;height:700px;opacity:0.01"></iframe></body>`);
   });
   await new Promise((r) => evilServer.listen(0, '127.0.0.1', r));
   EVIL_HTTP = `http://localhost:${evilServer.address().port}`;
@@ -131,8 +140,9 @@ async function runEngine(engine, browser) {
   // Blocked by frame-ancestors: the frame asked for the app document and got
   // nothing else of it (no script, style or API read ever ran).
   const assertBlocked = (seen, label) => {
-    assert.ok(seen.requests.includes('/'), `${label}: the frame did ask for the app (and was refused)`);
-    assert.deepEqual(seen.requests.filter((p) => p !== '/'), [], `${label}: blocked frame loaded nothing of the app: ${seen.requests}`);
+    const [document, ...rest] = seen.requests;
+    assert.ok(['/', new URL(FOREIGN_ADDRESS, local.base).pathname].includes(document), `${label}: the frame did ask for the app (and was refused): ${seen.requests}`);
+    assert.deepEqual(rest.filter((p) => p !== document), [], `${label}: blocked frame loaded nothing of the app: ${seen.requests}`);
   };
   const pass = (what) => console.log(`PASS ${engine}: ${what}`);
 
@@ -206,11 +216,11 @@ async function runEngine(engine, browser) {
     assert.deepEqual(seen.sockets, [], 'no terminal socket from the fallback');
     const apiReads = seen.requests.filter((p) => p.startsWith('/api/'));
     assert.deepEqual([...new Set(apiReads)], ['/api/info'], `fallback reads only /api/info: ${apiReads}`);
-    // The button opens the app in its own tab, without any one-time Hub token.
+    // The button opens the app's root in its own tab: nothing of the framed address.
     if (engine === 'chromium') {
       const [popup] = await Promise.all([ctx.waitForEvent('page'), page.frameLocator('#app').getByRole('button', { name: 'Open Agent Manager' }).click({ force: true })]);
       await popup.waitForLoadState();
-      assert.equal(new URL(popup.url()).origin, local.base);
+      assert.equal(popup.url(), `${local.base}/`, 'fallback opens the bare app root');
     }
     await ctx.close(); pass('header stripped: in-app fallback only, input reaches nothing');
   }
@@ -257,5 +267,29 @@ async function runEngine(engine, browser) {
     await page.waitForTimeout(4000);
     assert.ok(!(await showsApp(appFrame(page), 'space-probe')), 'sandboxed embed shows no app');
     await ctx.close(); pass('sandboxed Hub embed renders no interface');
+  }
+
+  // 9. Engines without location.ancestorOrigins. Pages can't remove it from a
+  //    real Location, so the shipped helper runs inside the real frames with the
+  //    frame's own parent/top windows (real cross-origin errors) and a location
+  //    view that lacks the list. Unverifiable ancestry must fail closed.
+  {
+    const ctx = await context({ stripCsp: true }); const page = await ctx.newPage();
+    const verdictWithoutList = (frame) => frame.evaluate((helper) => {
+      const framing = new Function(`${helper}; return framing;`)();
+      const win = { self: window, top: window.top, parent: window.parent, origin: self.origin,
+        location: { origin: location.origin, hostname: location.hostname } };
+      return framing.frameVerdict({ win }, [location.origin, framing.HUB_ORIGIN]);
+    }, FRAMING_IIFE);
+    await page.goto(`${local.base}/frame-self.html`);
+    await page.frameLocator('#app').getByText('framing-shell', { exact: true }).first().waitFor();
+    assert.equal(await verdictWithoutList(appFrame(page)), 'trusted', 'same-origin parent: verified directly');
+    await page.goto(`${EVIL_HTTP}/frame-local`);
+    await fallbackIn(page.frameLocator('#app')).waitFor();
+    assert.equal(await verdictWithoutList(appFrame(page)), 'untrusted', 'foreign parent: fails closed');
+    await page.goto(`${HUB}/spaces/owner/space`);
+    await page.frameLocator('#app').getByText('space-probe', { exact: true }).first().waitFor();
+    assert.equal(await verdictWithoutList(appFrame(page)), 'untrusted', 'Hub parent: unverifiable without the list, so the button');
+    await ctx.close(); pass('without ancestorOrigins: same-origin trusted, foreign parent and Hub fail closed');
   }
 }
