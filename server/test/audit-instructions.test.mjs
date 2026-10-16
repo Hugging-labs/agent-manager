@@ -20,6 +20,11 @@ const dataDir = path.join(TMP, 'data');
 const homeDir = path.join(TMP, 'home');
 const generated = path.join(dataDir, 'workspaces', 'skills', 'environment.md');
 fs.mkdirSync(homeDir, { recursive: true });
+// An artifacts Space, so the publishing section is rendered (SPACE_ID, which
+// would otherwise name a default one, is deleted below).
+fs.mkdirSync(dataDir, { recursive: true });
+fs.writeFileSync(path.join(dataDir, 'am-config.json'),
+  JSON.stringify({ artifacts: { enabled: true, space: 'someone/pages', visibility: 'private' } }));
 
 // Do not let a local test child inherit actual configured credential values.
 // The request policy validates PORT at startup (#130), so an ephemeral 0 is refused.
@@ -34,6 +39,7 @@ env.AUDIT_TEST_SECRET = 'synthetic-configured-value';
 
 const server = spawn(process.execPath, ['src/index.js'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
 let output = '';
+let second = null;   // the boot with artifacts disabled, below
 server.stdout.on('data', (chunk) => { output += chunk; });
 server.stderr.on('data', (chunk) => { output += chunk; });
 
@@ -96,13 +102,81 @@ try {
   assert.match(watch, /Read `tail` afterwards and judge the\s+work, not the state/);
   assert.doesNotMatch(watch, /`matched: true`\s+is finished/);
 
+  // Artifact links go through the Hub page, whatever the visibility: a direct
+  // *.static.hf.space link to a private Space only works right after visiting
+  // its hf.co page. The Hub hands only ?query and #hash to the static site, so
+  // a page is ?p=<name>.html and the index carries the router that opens it —
+  // byte for byte the operator's snippet, which forwards nothing else.
+  const artifacts = section('## Publishing results as web pages (artifacts)');
+  assert.match(artifacts, /`https:\/\/huggingface\.co\/spaces\/someone\/pages\?p=<name>\.html`/);
+  assert.doesNotMatch(artifacts, /https:\/\/[^\s`]*static\.hf\.space/, 'no page is linked on the static host');
+  const router = [
+    '<script>',
+    '// Deep links through the Hub page: huggingface.co/spaces/<owner>/<space>?p=<page>.html',
+    '(function () {',
+    "  var p = new URLSearchParams(location.search).get('p');",
+    "  if (p && /^[A-Za-z0-9][A-Za-z0-9._-]*(\\/[A-Za-z0-9][A-Za-z0-9._-]*)*\\.(html|png|svg|csv|json|md)$/.test(p) && p.indexOf('..') < 0) {",
+    '    location.replace(p + location.hash);',
+    '  }',
+    '})();',
+    '</script>',
+  ];
+  const fenced = artifacts.match(/```html\n([\s\S]*?)\n\s*```/);
+  assert.ok(fenced, 'the index instruction carries the router as an html block');
+  assert.deepEqual(fenced[1].split('\n').map((line) => line.replace(/^  /, '')), router);
+  assert.doesNotMatch(fenced[1], /__sign/, 'the router forwards no other query parameter');
+  assert.match(artifacts, /right after\s+`<body>`/);
+  assert.match(artifacts, /keep it whenever you re-upload the index/);
+  assert.match(artifacts, /`hf repo create someone\/pages --repo-type space --space-sdk static --private`/,
+    'visibility stays as configured');
+
+  // The linking rule covers EVERY Space — this instance, am-dev-*, demos —
+  // so it is its own section, not part of the artifacts one.
+  const linkRule = (doc) => {
+    const start = doc.indexOf('\n## Linking a Space for the operator');
+    assert.ok(start >= 0, 'the generated skill has the Space-linking rule');
+    const rest = doc.slice(start + 1);
+    const body = rest.slice(0, rest.indexOf('\n## ', 1) < 0 ? undefined : rest.indexOf('\n## ', 1));
+    assert.match(body, /Hub page `https:\/\/huggingface\.co\/spaces\/<owner>\/<name>`/);
+    assert.match(body, /\*\*never\*\* the direct `https:\/\/<owner>-<name>\.hf\.space` or `\*\.static\.hf\.space` URL/);
+    assert.match(body, /`am-dev-\*`/);
+    assert.match(body, /programmatic access with a token \(curl, health checks\)/);
+    return body;
+  };
+  linkRule(text);
+
+  // …and it is there with artifacts switched off, when no artifacts section is.
+  server.kill('SIGTERM');
+  await new Promise((resolve) => (server.exitCode != null ? resolve() : server.once('exit', resolve)));
+  // A fresh data tree: the generated skill is a managed file, and the first
+  // boot's ownership record would rightly stop it being recreated in place.
+  const dataDir2 = path.join(TMP, 'data-no-artifacts');
+  const generated2 = path.join(dataDir2, 'workspaces', 'skills', 'environment.md');
+  fs.mkdirSync(dataDir2, { recursive: true });
+  fs.writeFileSync(path.join(dataDir2, 'am-config.json'), JSON.stringify({ artifacts: { enabled: false } }));
+  second = spawn(process.execPath, ['src/index.js'], { env: { ...env, DATA_DIR: dataDir2 }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let output2 = '';
+  second.stdout.on('data', (chunk) => { output2 += chunk; });
+  second.stderr.on('data', (chunk) => { output2 += chunk; });
+  for (let i = 0; i < 600 && !fs.existsSync(generated2); i++) {
+    if (second.exitCode != null) throw new Error(`server exited ${second.exitCode}: ${output2.slice(-2_000)}`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(fs.existsSync(generated2), `environment skill was not generated on the second boot: ${output2.slice(-300)}`);
+  const withoutArtifacts = fs.readFileSync(generated2, 'utf8');
+  assert.doesNotMatch(withoutArtifacts, /## Publishing results as web pages/);
+  linkRule(withoutArtifacts);
+
   const docs = fs.readFileSync(path.resolve('..', 'docs', 'api-audit-log.md'), 'utf8');
   assert.match(docs, /full non-secret\s+request, prompt, file-write, result and error content/);
   assert.match(docs, /not an export-safe artifact/);
   assert.match(docs, /existing JSONL bytes and backups are not inspected, rewritten/);
   console.log('audit-instructions: generated and long-form policy describe retained, filtered, prospective private logs');
   console.log('env-skill: every dispatch section arms the watch and owns the result');
+  console.log('env-skill: artifact pages are linked through the Hub page, with the ?p= router in the index');
+  console.log('env-skill: every Space link for the operator is its Hub page, with artifacts on or off');
 } finally {
+  second?.kill('SIGTERM');
   server.kill('SIGTERM');
   await Promise.race([
     new Promise((resolve) => server.once('exit', resolve)),

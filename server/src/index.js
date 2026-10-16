@@ -1915,11 +1915,29 @@ api.post('/api/backup/run', async (_req, res) => {
 
 // The artifacts section teaches agents to publish rich HTML results to a
 // central static Space instead of dumping walls of text in the terminal.
+//
+// Links always go through the Hub page, whatever the Space's visibility (the
+// operator's rule): a direct *.static.hf.space link to a PRIVATE Space only
+// works right after visiting its hf.co page, so it is useless to them. The
+// Hub forwards only the query string and #hash to the embedded site on first
+// load — not the path — so a page is addressed as ?p=<name>.html and the
+// index routes it. The router deliberately forwards nothing else (no __sign,
+// no other parameters).
+const ARTIFACT_ROUTER = `<script>
+// Deep links through the Hub page: huggingface.co/spaces/<owner>/<space>?p=<page>.html
+(function () {
+  var p = new URLSearchParams(location.search).get('p');
+  if (p && /^[A-Za-z0-9][A-Za-z0-9._-]*(\\/[A-Za-z0-9][A-Za-z0-9._-]*)*\\.(html|png|svg|csv|json|md)$/.test(p) && p.indexOf('..') < 0) {
+    location.replace(p + location.hash);
+  }
+})();
+</script>`;
+
 function artifactsSection(cfg) {
   if (!cfg.artifacts.enabled || !cfg.artifacts.space) return '';
   const space = cfg.artifacts.space;
   const priv = cfg.artifacts.visibility === 'private';
-  const host = `${space.replace('/', '-').toLowerCase()}.static.hf.space`;
+  const router = ARTIFACT_ROUTER.split('\n').map((line) => (line ? `  ${line}` : line)).join('\n');
   return `
 ## Publishing results as web pages (artifacts)
 When a result is easier to READ than raw terminal text — reports, comparisons,
@@ -1933,9 +1951,17 @@ to the operator's artifacts Space: \`${space}\` (${priv ? 'private' : 'public'},
   \`hf upload ${space} ./report.html report.html --repo-type space\`
 - Keep an \`index.html\` at the Space root that links every page: download it
   (\`hf download ${space} index.html --repo-type space --local-dir .\`), add your
-  entry, re-upload. Create it on first use.
-- Every page gets a direct link: \`https://${host}/<name>.html\` — put that link
-  in your final answer so the operator can open or share it.
+  entry, re-upload. Create it on first use, with this script right after
+  \`<body>\` — and keep it whenever you re-upload the index, because it is what
+  makes page links work:
+  \`\`\`html
+${router}
+  \`\`\`
+- Link every page through the Hub page, never the \`*.static.hf.space\` host:
+  \`https://huggingface.co/spaces/${space}?p=<name>.html\` — put that link in your
+  final answer so the operator can open or share it. (The Hub passes only the
+  \`?query\` and \`#hash\` to the static site, so the index script above opens
+  the page named by \`p\`.)
 - For interactive demos beyond a static page, create a separate Space (e.g.
   \`--space-sdk gradio\`) under the same namespace and link it from the index.
 `;
@@ -2428,6 +2454,9 @@ immediately (long-running foreground execs can destabilize some sessions):
 - \`$AM_LOCAL\` is a **fast local disk** for tools, envs, caches and git checkouts. Build Python envs there, **never** as a \`.venv\` on the \`/data\` bucket (object storage is slow and can't lock/mmap well). From a workspace:
   \`UV_PROJECT_ENVIRONMENT="$AM_LOCAL/envs/<name>" uv sync\`
 - Keep \`pyproject.toml\` / \`uv.lock\` / \`requirements.txt\` in the workspace — they're the durable source of truth; the env rebuilds from them in seconds after a restart.
+
+## Linking a Space for the operator
+Any Space link meant for the operator to click — this instance, an \`am-dev-*\` Space, the artifacts Space, a demo — is its **Hub page \`https://huggingface.co/spaces/<owner>/<name>\`** (plus \`?p=<page>.html\` for one page of the artifacts Space), **never** the direct \`https://<owner>-<name>.hf.space\` or \`*.static.hf.space\` URL, which fails on a private Space unless they have just opened its hf.co page. Direct \`*.hf.space\` URLs remain fine for programmatic access with a token (curl, health checks).
 ${artifactsSection(amCfg)}${jobsSection(amCfg)}
 ## Environment variables
 These are configured in the Space and available to every agent. Read a value
