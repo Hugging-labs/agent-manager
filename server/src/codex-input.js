@@ -160,6 +160,36 @@ export class CodexInput {
       return { client, context };
     } catch (e) { client.close(); throw e; }
   }
+  // Agent-to-agent delivery is already an explicitly authorized operation and
+  // carries a durable, source-scoped request id.  If its exact shared task is
+  // merely unloaded, restore it with the same verified recovery plan used by
+  // the operator UI before attempting delivery.  This happens before a send
+  // receipt is written: recovery never contains user input, while the later
+  // queue/add remains the single acknowledgement boundary for the message.
+  async attachForAgent(id, { signal, verifySource = () => {} } = {}) {
+    try { return await this.attach(id); }
+    catch (error) {
+      if (error?.code !== 'codex-not-loaded') throw error;
+      if (signal?.aborted) throw fail('codex-send-cancelled', 'The message was not submitted.');
+      const state = await this.status(id);
+      if (state.status !== 'unloaded') return this.attach(id);
+      if (!state.recoveryKey) throw fail('codex-recovery-review', state.recoveryError ||
+        'Saved settings could not be reconstructed without review. The message was not submitted.');
+      verifySource();
+      try { await this.reconnect(id, { recoveryKey: state.recoveryKey }, { signal }); }
+      catch (recoveryError) {
+        // A competing trusted client may have loaded the exact task after our
+        // observation, or the resume acknowledgement may have been lost. It is
+        // safe to continue only when a fresh verified attach proves it loaded;
+        // reconnect itself never submits the message.
+        if (!['codex-recovery-stale', 'codex-recovery-uncertain'].includes(recoveryError?.code)) throw recoveryError;
+        try { const attached = await this.attach(id); verifySource(); return attached; }
+        catch { throw recoveryError; }
+      }
+      verifySource();
+      return this.attach(id);
+    }
+  }
   receiptFile(requestId) { return path.join(this.receipts, requestId + '.json'); }
   readReceipt(requestId) {
     let fd;
@@ -196,7 +226,13 @@ export class CodexInput {
     };
     const name = String(source.name || source.id).replace(/[\x00-\x1f\x7f\[\]]/g, ' ');
     const attribution = JSON.stringify({amSessionId:source.id, threadId:source.threadId});
-    return this.send(id, {text:`[message from ${name}:] [AM source ${attribution}]\n${text}`, requestId},
+    const attributedText = `[message from ${name}:] [AM source ${attribution}]\n${text}`;
+    // Let send() resolve an already durable acknowledgement before waking the
+    // target. This keeps retries after an accepted delivery entirely passive.
+    if (this.readReceipt(requestId)) return this.send(id, {text:attributedText, requestId},
+      {signal, source, verifySource});
+    await this.attachForAgent(id, {signal, verifySource});
+    return this.send(id, {text:attributedText, requestId},
       {signal, source, verifySource});
   }
   async send(id, { text, requestId, attachments = [] }, { signal, source = null, verifySource = () => {} } = {}) {

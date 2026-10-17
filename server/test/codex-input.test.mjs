@@ -171,6 +171,32 @@ test('agent delivery uses the native queue with durable source-scoped receipts a
  await assert.rejects(f.hub.sendFromAgent('am',{...input,text:'different'},'sender'),{code:'codex-request-conflict'});
  await assert.rejects(f.hub.send('am',{text:sent[0].params.input[0].text,requestId:input.requestId}),{code:'codex-request-conflict'});
 });
+test('authorized agent delivery restores an unloaded exact task before queueing once',async()=>{
+ const f=fixture();withSender(f);f.thread.status={type:'notLoaded'};let recoveries=0;
+ f.hub.status=async()=>({status:'unloaded',recoveryKey:'a'.repeat(64)});
+ f.hub.reconnect=async(_id,{recoveryKey})=>{recoveries++;assert.equal(recoveryKey,'a'.repeat(64));f.thread.status={type:'idle'};f.client.closed=false;return {ok:true};};
+ const input={text:'resume and deliver',requestId:randomUUID()};
+ const result=await f.hub.sendFromAgent('am',input,'sender');
+ assert.equal(recoveries,1);assert.equal(result.queued,true);
+ assert.equal(f.calls.filter(c=>c.method==='thread/queue/add').length,1);
+ f.thread.status={type:'notLoaded'};
+ assert.equal((await f.hub.sendFromAgent('am',input,'sender')).repeated,true);
+ assert.equal(recoveries,1);assert.equal(f.calls.filter(c=>c.method==='thread/queue/add').length,1);
+});
+test('agent auto-recovery refuses unreconstructible settings and ordinary sends remain manual',async()=>{
+ const f=fixture();withSender(f);f.thread.status={type:'notLoaded'};
+ f.hub.status=async()=>({status:'unloaded',recoveryKey:null,recoveryError:'exact settings unavailable'});
+ await assert.rejects(f.hub.sendFromAgent('am',{text:'agent',requestId:randomUUID()},'sender'),{code:'codex-recovery-review'});
+ await assert.rejects(f.hub.send('am',{text:'operator',requestId:randomUUID()}),{code:'codex-not-loaded'});
+ assert.equal(f.calls.filter(c=>c.method==='thread/queue/add').length,0);
+});
+test('lost recovery acknowledgement proceeds only after a fresh verified attach',async()=>{
+ const f=fixture();withSender(f);f.thread.status={type:'notLoaded'};
+ f.hub.status=async()=>({status:'unloaded',recoveryKey:'a'.repeat(64)});
+ f.hub.reconnect=async()=>{f.thread.status={type:'idle'};f.client.closed=false;const error=new Error('lost');error.code='codex-recovery-uncertain';throw error;};
+ await f.hub.sendFromAgent('am',{text:'once',requestId:randomUUID()},'sender');
+ assert.equal(f.calls.filter(c=>c.method==='thread/queue/add').length,1);
+});
 test('agent delivery rejects known active targets, stale senders, cancellation and uncertain retries',async()=>{
  for(const mode of ['active','archived','changed','cancelled']){
   const f=fixture(),source=withSender(f);const call=f.client.call.bind(f.client);
