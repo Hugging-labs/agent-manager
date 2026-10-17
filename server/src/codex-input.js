@@ -78,7 +78,7 @@ export class CodexInput {
     const file=await sharedCodexRollout(this.getSession(id),{bindings:this.bindings,config:context.endpoint});
     return recoveryPlan(file,context,thread,latestTurn);
   }
-  async reconnect(id,{recoveryKey},{signal}={}) {
+  async reconnect(id,{recoveryKey},{signal,verifyCaller=()=>{}}={}) {
     if(typeof recoveryKey!=='string'||!/^[a-f0-9]{64}$/.test(recoveryKey))throw new ApiError(400,'invalid-input','A current recovery key is required.');
     if(this.attaching.has(id)||this.busy.has(id))throw fail('codex-recovery-busy','The task is already connecting. Refresh before trying again.');
     this.busy.add(id); this.reconnecting.add(id);
@@ -98,6 +98,7 @@ export class CodexInput {
       if(owner.activeGoal!==false || owner.queuedInput!==false || this.getSession(id)?.pendingPrompt || this.getSession(id)?.pendingImagePaths?.length)throw fail('codex-recovery-pending','This task has pending work. Review it before reopening; nothing was replayed.');
       this.check(id,context);this.assertWritable();
       if(signal?.aborted)throw fail('codex-recovery-cancelled','The task was not reopened.');
+      verifyCaller(); // Revalidate the authorizing source after asynchronous owner/settings checks.
       client.recoveryParams=params; // exact one-shot allowlist, never caller-supplied settings
       let resumed;
       try {resumed=await client.call('thread/resume',params);}
@@ -167,28 +168,30 @@ export class CodexInput {
   // receipt is written: recovery never contains user input, while the later
   // queue/add remains the single acknowledgement boundary for the message.
   async attachForAgent(id, { signal, verifySource = () => {} } = {}) {
-    try { return await this.attach(id); }
-    catch (error) {
+    verifySource();
+    try {
+      const attached = await this.attach(id);
+      const thread = await this.metadata(attached.client, attached.context);
+      if (thread.status?.type !== 'notLoaded') return attached;
+      // An open subscription can outlive a native unload. Discard only AM's
+      // own cached connection; never stop another client or the shared daemon.
+      attached.client.close(); this.clients.delete(id);
+    } catch (error) {
       if (error?.code !== 'codex-not-loaded') throw error;
-      if (signal?.aborted) throw fail('codex-send-cancelled', 'The message was not submitted.');
-      const state = await this.status(id);
-      if (state.status !== 'unloaded') return this.attach(id);
-      if (!state.recoveryKey) throw fail('codex-recovery-review', state.recoveryError ||
-        'Saved settings could not be reconstructed without review. The message was not submitted.');
-      verifySource();
-      try { await this.reconnect(id, { recoveryKey: state.recoveryKey }, { signal }); }
-      catch (recoveryError) {
-        // A competing trusted client may have loaded the exact task after our
-        // observation, or the resume acknowledgement may have been lost. It is
-        // safe to continue only when a fresh verified attach proves it loaded;
-        // reconnect itself never submits the message.
-        if (!['codex-recovery-stale', 'codex-recovery-uncertain'].includes(recoveryError?.code)) throw recoveryError;
-        try { const attached = await this.attach(id); verifySource(); return attached; }
-        catch { throw recoveryError; }
-      }
-      verifySource();
-      return this.attach(id);
     }
+    verifySource();
+    const state = await this.status(id);
+    verifySource();
+    if (state.status !== 'unloaded') return this.attach(id);
+    if (state.lastTurnStatus && !['completed','interrupted','failed'].includes(state.lastTurnStatus))
+      throw fail('codex-recovery-pending', 'The last turn is not confirmed finished. Review the task before reopening it.');
+    if (!state.recoveryKey) throw fail('codex-recovery-review', state.recoveryError ||
+      'Saved settings could not be reconstructed without review. The message was not submitted.');
+    // A stale or uncertain recovery is surfaced rather than treating a loaded
+    // thread as proof that the saved permission/model settings were restored.
+    await this.reconnect(id, { recoveryKey: state.recoveryKey }, { signal, verifyCaller: verifySource });
+    verifySource();
+    return this.attach(id);
   }
   receiptFile(requestId) { return path.join(this.receipts, requestId + '.json'); }
   readReceipt(requestId) {
@@ -218,15 +221,19 @@ export class CodexInput {
   }
   async sendFromAgent(id, {text, requestId}, sourceId, {signal, cancelled = () => {}} = {}) {
     if (id === sourceId) throw fail('codex-self-message', 'An agent cannot message itself.');
-    if (typeof text !== 'string' || !text.trim()) throw new ApiError(400, 'invalid-input', 'Message text is required.');
-    const source = this.agentSource(sourceId), stamp = JSON.stringify(source);
+    if (!uuid(requestId) || typeof text !== 'string' || !text.trim()) throw new ApiError(400, 'invalid-input', 'A message and unique requestId are required.');
+    const source = this.agentSource(sourceId), stamp = JSON.stringify(source), target = this.context(id);
     const verifySource = () => {
       cancelled();
+      if (signal?.aborted) throw fail('codex-send-cancelled', 'The message was not submitted.');
+      this.check(id, target); this.assertWritable();
       if (JSON.stringify(this.agentSource(sourceId)) !== stamp) throw fail('codex-sender-stale', 'The sender changed before delivery.');
     };
     const name = String(source.name || source.id).replace(/[\x00-\x1f\x7f\[\]]/g, ' ');
     const attribution = JSON.stringify({amSessionId:source.id, threadId:source.threadId});
     const attributedText = `[message from ${name}:] [AM source ${attribution}]\n${text}`;
+    if (attributedText.length > 50000) throw new ApiError(400, 'invalid-input', 'Message including attribution is too long.');
+    verifySource();
     // Let send() resolve an already durable acknowledgement before waking the
     // target. This keeps retries after an accepted delivery entirely passive.
     if (this.readReceipt(requestId)) return this.send(id, {text:attributedText, requestId},

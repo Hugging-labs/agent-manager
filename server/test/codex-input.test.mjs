@@ -190,12 +190,12 @@ test('agent auto-recovery refuses unreconstructible settings and ordinary sends 
  await assert.rejects(f.hub.send('am',{text:'operator',requestId:randomUUID()}),{code:'codex-not-loaded'});
  assert.equal(f.calls.filter(c=>c.method==='thread/queue/add').length,0);
 });
-test('lost recovery acknowledgement proceeds only after a fresh verified attach',async()=>{
+test('lost recovery acknowledgement does not queue without verified restored settings',async()=>{
  const f=fixture();withSender(f);f.thread.status={type:'notLoaded'};
  f.hub.status=async()=>({status:'unloaded',recoveryKey:'a'.repeat(64)});
  f.hub.reconnect=async()=>{f.thread.status={type:'idle'};f.client.closed=false;const error=new Error('lost');error.code='codex-recovery-uncertain';throw error;};
- await f.hub.sendFromAgent('am',{text:'once',requestId:randomUUID()},'sender');
- assert.equal(f.calls.filter(c=>c.method==='thread/queue/add').length,1);
+ await assert.rejects(f.hub.sendFromAgent('am',{text:'once',requestId:randomUUID()},'sender'),{code:'codex-recovery-uncertain'});
+ assert.equal(f.calls.filter(c=>c.method==='thread/queue/add').length,0);
 });
 test('agent delivery rejects known active targets, stale senders, cancellation and uncertain retries',async()=>{
  for(const mode of ['active','archived','changed','cancelled']){
@@ -217,5 +217,49 @@ test('reconnect never resumes a held writer, queued input or active goal',async(
  for(const owner of [{state:'held',activeGoal:false,queuedInput:false},{state:'unknown'},{state:'free',activeGoal:true,queuedInput:false},{state:'free',activeGoal:false,queuedInput:true}]){
   const f=fixture();f.thread.status={type:'notLoaded'};f.hub.owner=async()=>owner;f.hub.recovery=async()=>({key:'a'.repeat(64),settings:{params:{},expected:{}}});
   await assert.rejects(f.hub.reconnect('am',{recoveryKey:'a'.repeat(64)}));assert.equal(f.calls.some(c=>c.method==='thread/resume'),false);
+ }
+});
+
+test('invalid, cancelled or stale-source deliveries never inspect receipt paths or wake a task',async()=>{
+ for(const mode of ['uuid','oversize','cancelled','source']) {
+  const f=fixture();const sender=withSender(f);f.thread.status={type:'notLoaded'};
+  f.hub.readReceipt=()=>{throw Error('receipt accessed before validation');};
+  const input={text:mode==='oversize'?'x'.repeat(50000):'hello',requestId:mode==='uuid'?'../../outside':randomUUID()};
+  const options=mode==='cancelled'?{signal:AbortSignal.abort()}:mode==='source'?{cancelled:()=>{sender.archivedAt='now';}}:{};
+  await assert.rejects(f.hub.sendFromAgent('am',input,'sender',options),e=>['invalid-input','codex-send-cancelled','codex-sender-stale'].includes(e.code));
+  assert.equal(f.calls.length,0);
+ }
+});
+
+test('sender is revalidated after writer inspection and before the actual recovery RPC',async()=>{
+ const f=fixture(),source=withSender(f);f.thread.status={type:'notLoaded'};f.turn.status='completed';
+ f.hub.recovery=async()=>({key:'a'.repeat(64),settings:{params:{},expected:{}}});
+ f.hub.owner=async()=>{source.archivedAt='now';return {state:'free',activeGoal:false,queuedInput:false};};
+ await assert.rejects(f.hub.sendFromAgent('am',{text:'hello',requestId:randomUUID()},'sender'),{code:'codex-sender-stale'});
+ assert.equal(f.calls.filter(c=>['thread/resume','thread/queue/add'].includes(c.method)).length,0);
+});
+
+test('cached subscription to an unloaded task recovers, concurrent recovery never duplicates resume',async()=>{
+ const f=fixture();withSender(f);await f.hub.attach('am');f.thread.status={type:'notLoaded'};f.turn.status='completed';
+ let resumes=0;const call=f.client.call.bind(f.client);
+ f.hub.recovery=async()=>({key:'a'.repeat(64),settings:{params:{model:'fixture-model'},expected:{model:'fixture-model'}}});
+ f.client.call=async(method,params)=>{
+  if(method==='thread/resume' && params.model){resumes++;f.thread.status={type:'idle'};f.client.closed=false;return {thread:f.thread,model:'fixture-model'};}
+  return call(method,params);
+ };
+ const input={text:'once',requestId:randomUUID()};
+ const results=await Promise.allSettled([f.hub.sendFromAgent('am',input,'sender'),f.hub.sendFromAgent('am',input,'sender')]);
+ assert(results.some(r=>r.status==='fulfilled'));assert.equal(resumes,1);
+ assert.equal(f.calls.filter(c=>c.method==='thread/queue/add').length,1);
+ assert.equal((await f.hub.sendFromAgent('am',input,'sender')).repeated,true);
+});
+
+
+test('automatic recovery refuses a nonterminal last turn even on an unloaded task',async()=>{
+ for(const status of ['inProgress','unknown-future-status']) {
+  const f=fixture();withSender(f);f.thread.status={type:'notLoaded'};
+  f.hub.status=async()=>({status:'unloaded',lastTurnStatus:status,recoveryKey:'a'.repeat(64)});
+  await assert.rejects(f.hub.sendFromAgent('am',{text:'next task',requestId:randomUUID()},'sender'),{code:'codex-recovery-pending'});
+  assert.equal(f.calls.some(c=>['thread/resume','thread/queue/add'].includes(c.method)),false);
  }
 });
