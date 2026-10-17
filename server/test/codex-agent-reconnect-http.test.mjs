@@ -15,7 +15,8 @@ with sqlite3.connect(sys.argv[1]) as db:
 const tid=randomUUID(),turnId=randomUUID(),at=new Date().toISOString();
 const target={id:'target',name:'Radar fixture',cli:'codex',path:'target',sessionUuid:randomUUID(),codexSessionId:tid,codexSharedOnly:true,createdAt:at};
 const source={id:'source',name:'Scanner fixture',cli:'claude',path:'target',sessionUuid:randomUUID(),createdAt:at};
-fs.writeFileSync(path.join(data,'sessions.json'),JSON.stringify([target,source]));
+const worker={...target,id:'worker',name:'Delegate fixture',sessionUuid:randomUUID(),codexSessionId:randomUUID()};
+fs.writeFileSync(path.join(data,'sessions.json'),JSON.stringify([target,source,worker]));
 const saved={turn_id:turnId,cwd:work,model:'fixture-model',approval_policy:'on-request',approvals_reviewer:'auto_review',effort:'high',
  collaboration_mode:{mode:'default',settings:{reasoning_effort:'high',developer_instructions:null}},sandbox_policy:{type:'read-only'},
  permission_profile:{type:'managed',file_system:{type:'restricted',entries:[{path:{type:'special',value:{kind:'root'}},access:'read'}]},network:'restricted'}};
@@ -23,21 +24,35 @@ const rollout=path.join(home,'sessions',`rollout-${tid}.jsonl`);
 fs.writeFileSync(rollout,[{type:'session_meta',timestamp:at,payload:{id:tid,cwd:work,source:'cli'}},{type:'turn_context',payload:saved},{type:'event_msg',payload:{type:'task_complete',turn_id:turnId}}].map(JSON.stringify).join('\n')+'\n');
 const fingerprint=()=>createHash('sha256').update(fs.readFileSync(rollout)).digest('hex'),originalHash=fingerprint();
 const thread={id:tid,cwd:work,path:rollout,modelProvider:'fixture',status:{type:'notLoaded'},canAcceptDirectInput:true,parentThreadId:null};
+const workerRollout=path.join(home,'sessions',`rollout-${worker.codexSessionId}.jsonl`);fs.writeFileSync(workerRollout,fs.readFileSync(rollout,'utf8').replaceAll(tid,worker.codexSessionId));
+const workerThread={...thread,id:worker.codexSessionId,path:workerRollout,status:{type:'idle'}};
 const settings=recoverySettings(saved,thread,work),calls=[],native=http.createServer(),wss=new WebSocketServer({server:native});
 wss.on('connection',ws=>ws.on('message',raw=>{
- const m=JSON.parse(raw);if(m.id===undefined)return;calls.push(m);let result;
+ const m=JSON.parse(raw);if(m.id===undefined)return;calls.push(m);let result;const selected=m.params?.threadId===workerThread.id?workerThread:thread;
  if(m.method==='initialize')result={codexHome:home,userAgent:'fixture/0.162.1'};
- else if(m.method==='thread/read')result={thread};
+ else if(m.method==='thread/read')result={thread:selected};
  else if(m.method==='thread/turns/list')result={data:[{id:turnId,status:'completed',items:[]}]};
  else if(m.method==='thread/resume'){
   if(m.params.model){assert.deepEqual(m.params,{threadId:tid,excludeTurns:true,...settings.params});thread.status={type:'idle'};}
-  result={thread,...settings.expected};
- }else if(m.method==='thread/queue/add')result={queuedSubmission:{id:'queued-'+m.params.clientUserMessageId,clientUserMessageId:m.params.clientUserMessageId}};
+  result={thread:selected,...settings.expected};
+ }else if(m.method==='thread/queue/add'){
+  result={queuedSubmission:{id:'queued-'+m.params.clientUserMessageId,clientUserMessageId:m.params.clientUserMessageId}};
+  if(selected===workerThread){
+   const turn=randomUUID();fs.appendFileSync(workerRollout,[
+    {type:'event_msg',payload:{type:'task_started',turn_id:turn}},
+    {type:'response_item',payload:{type:'message',role:'user',content:[{type:'input_text',text:m.params.input[0].text}]}},
+    {type:'turn_context',payload:{...saved,turn_id:turn}},
+    {type:'response_item',payload:{type:'message',role:'assistant',phase:'final',content:[{type:'output_text',text:'The isolated review is ready.'}]}},
+    {type:'event_msg',payload:{type:'task_complete',turn_id:turn}}
+   ].map(JSON.stringify).join('\n')+'\n');
+  }
+ }
  else {ws.send(JSON.stringify({id:m.id,error:{code:-32000,message:'unsupported fixture RPC'}}));return;}
  ws.send(JSON.stringify({id:m.id,result}));
 }));
 await new Promise((resolve,reject)=>{native.once('error',reject);native.listen(socket,resolve);});fs.chmodSync(socket,0o600);
 new CodexBindings(path.join(data,'codex-bindings.json')).bind({session:target,threadId:tid,endpointId:endpointIdentity({socket,home}),cwd:work,expectedRevision:0});
+new CodexBindings(path.join(data,'codex-bindings.json')).bind({session:worker,threadId:worker.codexSessionId,endpointId:endpointIdentity({socket,home}),cwd:work,expectedRevision:0});
 const free=net.createServer().listen(0,'127.0.0.1');await once(free,'listening');const port=free.address().port;await new Promise(r=>free.close(r));
 const preload=path.join(root,'preload.mjs');
 fs.writeFileSync(preload,`import cp from 'node:child_process';import {syncBuiltinESMExports} from 'node:module';const orig=cp.execFile;cp.execFile=(...args)=>{if(args[1]?.includes('--version')){queueMicrotask(()=>args.at(-1)(new Error('fixture')));return;}return orig(...args);};syncBuiltinESMExports();`);
@@ -58,8 +73,37 @@ try {
  const retry=await request('/api/agents/target/prompt?from=source',delivery);assert.equal(retry.body.repeated,true);
  assert.equal(calls.filter(c=>c.method==='thread/resume'&&c.params.model).length,1);assert.equal(calls.filter(c=>c.method==='thread/queue/add').length,1);
  assert(!calls.some(c=>['thread/start','turn/start','turn/steer','turn/interrupt'].includes(c.method)));
- assert.equal(fingerprint(),originalHash);assert.equal(JSON.parse(fs.readFileSync(path.join(data,'sessions.json'))).length,2);
+ assert.equal(fingerprint(),originalHash);assert.equal(JSON.parse(fs.readFileSync(path.join(data,'sessions.json'))).length,3);
  console.log('PASS: agent HTTP restores exact thread/settings, queues once, passive retry, UI guard retained, history preserved.');
+ // The parent has ended its HTTP call and is unloaded. Completion is owned by
+ // AM, not the original /wait caller. No model or real session participates.
+ const task={requestId:randomUUID(),text:'Review the fixture.',completion:'notify'};
+ const dispatched=await request('/api/agents/worker/prompt?from=target',task);
+ assert.equal(dispatched.status,202,JSON.stringify(dispatched)+'\n'+log);
+ assert.equal((await request(`/api/delegations/${task.requestId}?from=source`)).status,404);
+ let followup;
+ for(let i=0;i<100;i++){
+  followup=await request(`/api/delegations/${task.requestId}?from=target`);
+  if(followup.body.state==='delivered')break;
+  await new Promise(r=>setTimeout(r,100));
+ }
+ assert.equal(followup.body.state,'delivered',JSON.stringify(followup));assert.equal(followup.body.outcome,'completed');
+ assert.equal(followup.body.result,'The isolated review is ready.');
+ const callbacks=calls.filter(c=>c.method==='thread/queue/add' && c.params.threadId===tid && c.params.input[0].text.includes('[AM delegation result'));
+ assert.equal(callbacks.length,1);assert.match(callbacks[0].params.input[0].text,/"amSessionId":"worker"/);
+ assert.equal(calls.filter(c=>c.method==='thread/resume'&&c.params.model).length,2,'unloaded parent recovered exactly once');
+ const repeated=await request('/api/agents/worker/prompt?from=target',task);assert.equal(repeated.body.delegation.state,'delivered');
+ assert.equal(calls.filter(c=>c.method==='thread/queue/add').length,3,'one ordinary delivery, one delegation, one follow-up');
+ assert.equal(fingerprint(),originalHash,'fixture parent recovery does not rewrite original history');
+ console.log('PASS: durable HTTP delegation completes exact exchange, recovers unloaded parent, one attributed callback, scoped reads and passive retry.');
+ const cron=await request('/api/crons?from=target',{name:'Shared cron limit fixture',agent:{name:target.name,cli:'codex'},prompt:'Never delivered',schedule:{cron:'0 0 * * *',tz:'UTC'},state:'stopped'});
+ assert.equal(cron.status,201,JSON.stringify(cron));
+ const run=await request(`/api/crons/${cron.body.id}/run?from=target`,{});assert.equal(run.status,202,JSON.stringify(run));
+ const jobs=await request('/api/crons');assert.equal(jobs.body.crons.find(j=>j.id===cron.body.id).last.code,'codex-shared-delivery-pending');
+ assert.equal(calls.filter(c=>c.method==='thread/queue/add').length,3,'unsupported native cron never borrows an agent identity');
+ console.log('PASS: native shared cron remains explicitly unsupported, no extra queue operation.');
+
+
 }finally{
  if(child&&child.exitCode===null&&child.signalCode===null){const done=once(child,'exit');child.kill('SIGTERM');await done;}
  for(const ws of wss.clients)ws.terminate();await new Promise(r=>wss.close(r));await new Promise(r=>native.close(r));fs.rmSync(root,{recursive:true,force:true});
