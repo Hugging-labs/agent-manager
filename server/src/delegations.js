@@ -109,7 +109,7 @@ export class Delegations {
   }
   view(j) {return {id:j.id,parentId:j.parentId,targetId:j.targetId,state:j.state,outcome:j.evidence?.outcome || null,reason:j.evidence?.reason || j.reason || null,result:j.evidence?.answer || null,createdAt:j.createdAt,updatedAt:j.updatedAt,expiresAt:j.expiresAt,notification:j.notification || null,audit:j.audit || []};}
   get(id,parentId) {const j=this.jobs.get(id);if(!j || j.parentId!==parentId)throw new ApiError(404,'not-found','Delegation not found.');return this.view(j);}
-  valid(j) {try{return this.identity(j.parentId)===j.parentIdentity && this.identity(j.targetId)===j.targetIdentity;}catch(e){if(['codex-sender-stale','codex-unmapped','codex-binding-stale'].includes(e?.code))return false;throw e;}}
+  valid(j) {try{return this.identity(j.parentId)===j.parentIdentity && this.identity(j.targetId)===j.targetIdentity;}catch(e){if(['codex-sender-stale','codex-sender-archived','codex-unmapped','codex-binding-stale'].includes(e?.code))return false;throw e;}}
   async create(parentId,targetId,{requestId,text}) {
     if(!uuid(requestId) || typeof text!=='string' || !text.trim() || text.length>40000)throw new ApiError(400,'invalid-input','A stable UUID and text of at most 40000 characters are required.');
     if(parentId===targetId)throw fail('delegation-self','Cannot delegate to yourself.');

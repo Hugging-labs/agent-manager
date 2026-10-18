@@ -226,7 +226,7 @@ test('invalid, cancelled or stale-source deliveries never inspect receipt paths 
   f.hub.readReceipt=()=>{throw Error('receipt accessed before validation');};
   const input={text:mode==='oversize'?'x'.repeat(50000):'hello',requestId:mode==='uuid'?'../../outside':randomUUID()};
   const options=mode==='cancelled'?{signal:AbortSignal.abort()}:mode==='source'?{cancelled:()=>{sender.archivedAt='now';}}:{};
-  await assert.rejects(f.hub.sendFromAgent('am',input,'sender',options),e=>['invalid-input','codex-send-cancelled','codex-sender-stale'].includes(e.code));
+  await assert.rejects(f.hub.sendFromAgent('am',input,'sender',options),e=>['invalid-input','codex-send-cancelled','codex-sender-stale','codex-sender-archived'].includes(e.code));
   assert.equal(f.calls.length,0);
  }
 });
@@ -235,7 +235,7 @@ test('sender is revalidated after writer inspection and before the actual recove
  const f=fixture(),source=withSender(f);f.thread.status={type:'notLoaded'};f.turn.status='completed';
  f.hub.recovery=async()=>({key:'a'.repeat(64),settings:{params:{},expected:{}}});
  f.hub.owner=async()=>{source.archivedAt='now';return {state:'free',activeGoal:false,queuedInput:false};};
- await assert.rejects(f.hub.sendFromAgent('am',{text:'hello',requestId:randomUUID()},'sender'),{code:'codex-sender-stale'});
+ await assert.rejects(f.hub.sendFromAgent('am',{text:'hello',requestId:randomUUID()},'sender'),{code:'codex-sender-archived'});
  assert.equal(f.calls.filter(c=>['thread/resume','thread/queue/add'].includes(c.method)).length,0);
 });
 
@@ -262,4 +262,22 @@ test('automatic recovery refuses a nonterminal last turn even on an unloaded tas
   await assert.rejects(f.hub.sendFromAgent('am',{text:'next task',requestId:randomUUID()},'sender'),{code:'codex-recovery-pending'});
   assert.equal(f.calls.some(c=>['thread/resume','thread/queue/add'].includes(c.method)),false);
  }
+});
+test('archived active native sender has distinct actionable refusal, deletion and stale binding stay refused',async()=>{
+ const f=fixture();f.deps.getSession=id=>id==='am'?f.session:null;const hub=new CodexInput(f.deps);
+ assert.equal(hub.agentSource('am').threadId,f.session.codexSessionId);
+ f.session.archivedAt='2026-10-18T10:36:08.732Z';f.thread.status={type:'active'};
+ assert.throws(()=>hub.agentSource('am'),e=>e.code==='codex-sender-archived'&&/Restore this same session/.test(e.message));
+ assert.throws(()=>hub.agentSource('deleted'),{code:'codex-sender-stale'});
+ delete f.session.archivedAt;f.session.sessionUuid=randomUUID();
+ assert.throws(()=>hub.agentSource('am'),{code:'codex-binding-stale'});
+ assert.equal(f.calls.length,0,'sender checks never resume, interrupt or send');
+});
+
+test('archived recipient is distinct from missing binding, remains observable, and restores on the same thread',async()=>{
+ const f=fixture();const original=f.hub.context('am');f.session.archivedAt='2026-10-18T10:36:08Z';
+ assert.throws(()=>f.hub.context('am'),e=>e.code==='codex-target-archived'&&/receiving.*archived/.test(e.message));
+ assert.equal(f.hub.context('am',{allowArchived:true}).threadId,original.threadId);
+ await assert.rejects(f.hub.send('am',{requestId:randomUUID(),text:'must not arrive'}),{code:'codex-target-archived'});
+ assert.equal(f.calls.length,0);delete f.session.archivedAt;assert.equal(f.hub.context('am').stamp,original.stamp);
 });

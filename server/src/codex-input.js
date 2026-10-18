@@ -26,7 +26,8 @@ export class CodexInput {
   context(id, { allowArchived = false } = {}) {
     if (!this.enabled()) throw fail('codex-pilot-disabled', 'Shared Reader input is disabled.');
     const s = this.getSession(id), binding = this.bindings.forSession(id), endpoint = this.endpoint();
-    if (!s || (!allowArchived && s.archivedAt) || !binding) throw fail('codex-unmapped', 'This session has no active shared Codex binding.');
+    if (!s || !binding) throw fail('codex-unmapped', 'This session has no shared Codex binding. Resolve or import the exact existing thread before sending.');
+    if (!allowArchived && s.archivedAt) throw fail('codex-target-archived', 'The receiving AM session is archived. Restore this same session from AM Archive before sending to it; its shared Codex binding and conversation are preserved.');
     const context = contextForThread(binding.threadId, { sessions: this.listSessions(), bindings: this.bindings, endpoint });
     if (context.amSessionId !== id) throw fail('codex-binding-stale', 'The shared binding changed.');
     return { ...context, endpoint, stamp: JSON.stringify([s.sessionUuid, binding.endpointId, binding.threadId, binding.revision, binding.cwd]) };
@@ -213,7 +214,8 @@ export class CodexInput {
   }
   agentSource(id) {
     const session = this.getSession(id);
-    if (!session || session.archivedAt) throw fail('codex-sender-stale', 'The sending session is missing or archived.');
+    if (!session) throw fail('codex-sender-stale', 'The sending AM session no longer exists. Resolve the exact native thread again; do not substitute another identity.');
+    if (session.archivedAt) throw fail('codex-sender-archived', 'The sending AM session is archived. Restore this same session from AM Archive before sending. Its native Codex thread may still be active; resolving a mapping does not authorize sending.');
     const shared = session.cli === 'codex' && (session.codexSharedOnly || this.bindings.forSession(id));
     const context = shared ? this.context(id) : null;
     return {id, sessionUuid:session.sessionUuid, name:session.name, cli:session.cli,

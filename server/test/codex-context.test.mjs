@@ -138,3 +138,18 @@ test('shared helper supports configured loopback interfaces without allowing rem
     assert.throws(() => localOrigin(origin));
   }
 });
+test('archived mapping remains readable but explicitly denies messaging; missing/stale mappings never resolve',async t=>{
+ const f=fixture(t);await bindExistingThread(f.request,f.deps);
+ const resolve=()=>contextForThread(threadId,{sessions:f.facts.sessions,bindings:f.bindings,endpoint});
+ assert.deepEqual(resolve().messaging,{allowed:true});
+ f.session.archivedAt='2026-10-18T10:36:08.732Z';
+ const archived=resolve();assert.equal(archived.amSessionId,f.session.id);assert.equal(archived.messaging.allowed,false);assert.equal(archived.messaging.code,'codex-sender-archived');assert.match(archived.messaging.action,/Restore/);
+ f.facts.sessions=[];assert.throws(resolve,{code:'codex-binding-stale'});
+ f.facts.sessions=[{...f.session,sessionUuid:'replacement'}];assert.throws(resolve,{code:'codex-binding-stale'});
+});
+test('id-only helper cannot silently present an archived mapping as a usable sender',async()=>{
+ const args=['--base-url','http://127.0.0.1:7860','resolve','--id-only'];let printed=false;
+ const fetchImpl=async()=>Response.json({amSessionId:'a',threadId,messaging:{allowed:false,code:'codex-sender-archived',action:'Restore the same session.'}});
+ await assert.rejects(run(args,{env:{CODEX_THREAD_ID:threadId},fetchImpl,print:()=>printed=true}),/codex-sender-archived.*Restore/);
+ assert.equal(printed,false);
+});

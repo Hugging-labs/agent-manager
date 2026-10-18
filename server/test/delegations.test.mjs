@@ -119,3 +119,18 @@ test('cancellation during target observation or scan stays terminal across resta
   f.append(answer());await f.create().tick();assert.equal(f.counts().notifications,0,boundary);
  }
 });
+test('reused Claude child correlates each request and treats a scope update as uncertain, never completed',async t=>{
+ const f=fixture(t);f.state.parent='waiting';
+ const first=await start(f);f.append(answer('first run'));await f.d.tick();assert.equal(f.d.get(first,'parent').state,'delivered');
+ const second=await start(f);await f.d.tick();assert.equal(f.d.get(second,'parent').outcome,null);
+ f.append(answer('tool gap','tool_use'));await f.d.tick();assert.equal(f.counts().notifications,1);
+ f.append(input('new scope from another input'));f.append(answer('answer to updated scope'));
+ await f.d.tick();assert.equal(f.d.get(second,'parent').outcome,'uncertain');assert.equal(f.d.get(second,'parent').reason,'another-user-input');
+ assert.equal(f.d.get(second,'parent').state,'delivered');assert.equal(f.counts().notifications,2);
+ await f.create().tick();assert.equal(f.counts().notifications,2);
+});
+test('archiving a parent during observation invalidates callback instead of retrying forever',async t=>{
+ const f=fixture(t);const id=await start(f);f.append(answer());f.state.parent='waiting';
+ f.options.identity=()=>{throw Object.assign(Error('archived'),{code:'codex-sender-archived'});};
+ const restored=f.create();await restored.tick();assert.equal(restored.get(id,'parent').state,'stale');assert.equal(f.counts().notifications,0);
+});
