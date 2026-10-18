@@ -68,14 +68,14 @@ test('partial records survive restart; rotated traces fail closed',async t=>{
  assert.equal(f.d.get(id,'parent').outcome,null);fs.appendFileSync(f.file,line.slice(10)+'\n');const resumed=f.create();await resumed.tick();assert.equal(resumed.get(id,'parent').outcome,'completed');
  const f2=fixture(t),id2=await start(f2);fs.renameSync(f2.file,f2.file+'.old');fs.writeFileSync(f2.file,'');await f2.d.tick();assert.equal(f2.d.get(id2,'parent').outcome,'uncertain');
 });
-test('Codex needs matched source input plus same native turn completion and final answer',()=>{
+for (const phase of ['final','final_answer']) test('Codex '+phase+' needs matched input and same native completion',()=>{
  const e={},expected=hash('exact');const feed=r=>consumeEvidence(e,r,expected,'codex');
  feed({type:'event_msg',payload:{type:'task_started',turn_id:'turn'}});
  feed({type:'response_item',payload:{type:'message',role:'user',content:[{type:'input_text',text:'exact'}]}});
  feed({type:'turn_context',payload:{turn_id:'turn'}});
  feed({type:'response_item',payload:{type:'message',role:'assistant',phase:'commentary',content:[{type:'output_text',text:'intermediate'}]}});
  assert.equal(e.outcome,undefined);
- feed({type:'response_item',payload:{type:'message',role:'assistant',phase:'final',content:[{type:'output_text',text:'done'}]}});
+ feed({type:'response_item',payload:{type:'message',role:'assistant',phase,content:[{type:'output_text',text:'done'}]}});
  feed({type:'event_msg',payload:{type:'task_complete',turn_id:'wrong'}});assert.equal(e.outcome,undefined);
  feed({type:'event_msg',payload:{type:'task_complete',turn_id:'turn'}});assert.equal(e.outcome,'completed');
 });

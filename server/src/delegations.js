@@ -54,7 +54,7 @@ export function consumeEvidence(e, record, expectedHash, cli) {
       if (e.turnId && e.turnId !== p.turn_id) {e.outcome='uncertain';e.reason='turn-changed';}
       else e.turnId=p.turn_id;
     }
-    if (record.type==='response_item' && p.role==='assistant' && p.type==='message' && p.phase==='final') e.answer=textOf(p.content).slice(-16000);
+    if (record.type==='response_item' && p.role==='assistant' && p.type==='message' && ['final','final_answer'].includes(p.phase)) e.answer=textOf(p.content).slice(-16000);
     if (record.type==='event_msg' && p.turn_id === e.turnId && e.turnId) {
       if (p.type==='task_complete') {e.outcome=e.answer ? 'completed':'uncertain';e.reason=e.answer?'harness-task-complete':'no-final-result';}
       if (p.type==='turn_aborted') {e.outcome='failed';e.reason='harness-aborted';}
