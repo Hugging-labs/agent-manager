@@ -57,7 +57,7 @@ const free=net.createServer().listen(0,'127.0.0.1');await once(free,'listening')
 const preload=path.join(root,'preload.mjs');
 fs.writeFileSync(preload,`import cp from 'node:child_process';import {syncBuiltinESMExports} from 'node:module';const orig=cp.execFile;cp.execFile=(...args)=>{if(args[1]?.includes('--version')){queueMicrotask(()=>args.at(-1)(new Error('fixture')));return;}return orig(...args);};syncBuiltinESMExports();`);
 let child,log='';const base=`http://127.0.0.1:${port}`;
-const request=async(route,body)=>{const response=await fetch(base+route,{method:body===undefined?'GET':'POST',headers:{'content-type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:AbortSignal.timeout(15000)});return {status:response.status,body:await response.json()};};
+const request=async(route,body)=>{const response=await fetch(base+route,{method:body===undefined?'GET':'POST',headers:{'content-type':'application/json','X-AM-Request':'1'},body:body===undefined?undefined:JSON.stringify(body),signal:AbortSignal.timeout(15000)});return {status:response.status,body:await response.json()};};
 try {
  child=spawn(process.execPath,['--import',preload,'src/index.js'],{cwd:fileURLToPath(new URL('../',import.meta.url)),env:{PATH:process.env.PATH,TMPDIR:root,HOME:home,DATA_DIR:data,PORT:String(port),AM_BIND_HOST:'127.0.0.1',PUBLIC_DIR:path.join(root,'public'),CODEX_HOME:home,CLAUDE_CONFIG_DIR:path.join(home,'claude'),XDG_CONFIG_HOME:path.join(home,'config'),XDG_DATA_HOME:path.join(home,'share'),AM_REPIN_DIR:path.join(root,'repin'),AM_INPUT_REQUIRED_DIR:path.join(root,'input'),AM_BASHRC:'/nonexistent',AM_CODEX_SHARED_SOCKET:socket,AM_CODEX_SHARED_HOME:home,AM_CODEX_BINDINGS_PILOT:'1'},stdio:['ignore','pipe','pipe']});
  child.stdout.on('data',chunk=>log+=chunk);child.stderr.on('data',chunk=>log+=chunk);let ready=false;
@@ -102,6 +102,24 @@ try {
  const jobs=await request('/api/crons');assert.equal(jobs.body.crons.find(j=>j.id===cron.body.id).last.code,'codex-shared-delivery-pending');
  assert.equal(calls.filter(c=>c.method==='thread/queue/add').length,3,'unsupported native cron never borrows an agent identity');
  console.log('PASS: native shared cron remains explicitly unsupported, no extra queue operation.');
+ const mapping=await request('/api/codex/context?threadId='+tid);assert.equal(mapping.body.messaging.allowed,true);
+ const observed=await request('/api/agents/worker/wait?timeout=1&settle=0');
+ assert.equal(observed.body.completionSubscribed,false);assert.equal(observed.body.taskCorrelated,false);assert.match(observed.body.observationId,/^[a-f0-9-]{36}$/);assert(Number.isFinite(Date.parse(observed.body.observedAt)));
+ assert.equal(result.body.completionSubscribed,false);assert.equal(dispatched.body.completionSubscribed,true);
+ const archiveResult=await request('/api/sessions/target/archive?from=source',{});assert.equal(archiveResult.status,200,JSON.stringify(archiveResult));
+ const archivedContext=await request('/api/codex/context?threadId='+tid);
+ assert.equal(archivedContext.status,200);assert.equal(archivedContext.body.messaging.allowed,false);assert.equal(archivedContext.body.messaging.code,'codex-sender-archived');
+ const beforeRefusal=calls.filter(c=>c.method==='thread/queue/add').length;
+ for(const destination of ['worker','source'])for(const completion of [undefined,'notify']){
+  const rejected=await request('/api/agents/'+destination+'/prompt?from=target',{requestId:randomUUID(),text:'must not arrive',...(completion?{completion}:{})});
+  assert.equal(rejected.status,409);assert.equal(rejected.body.code,'codex-sender-archived');assert.match(rejected.body.error,/Restore this same session/);
+ }
+ assert.equal(calls.filter(c=>c.method==='thread/queue/add').length,beforeRefusal);
+ assert.equal((await request('/api/sessions/target/unarchive?from=source',{})).status,200);
+ assert.equal((await request('/api/codex/context?threadId='+tid)).body.messaging.allowed,true);
+ console.log('PASS: resolved sender lifecycle explicit; ordinary/subscribed sends reject archived parents before native/legacy effects.');
+
+
 
 
 }finally{

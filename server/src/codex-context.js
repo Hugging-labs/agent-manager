@@ -25,7 +25,10 @@ export function contextForThread(threadId, { sessions, bindings = codexBindings,
   const cwd = fs.realpathSync(path.join(WORKSPACES_DIR, session.path ?? session.id));
   if (cwd !== binding.cwd) throw new ApiError(409, 'codex-workspace-changed', 'The workspace no longer matches this binding.');
   return { amSessionId: session.id, name: session.name, threadId, endpointId: binding.endpointId,
-    revision: binding.revision, workdir: cwd };
+    revision: binding.revision, workdir: cwd, archivedAt: session.archivedAt || null,
+    messaging: session.archivedAt
+      ? {allowed:false, code:'codex-sender-archived', action:'Restore this AM session from Archive before sending messages. The native thread and its history are unchanged.'}
+      : {allowed:true} };
 }
 
 // This first slice completes attribution AFTER a manual handoff. It never

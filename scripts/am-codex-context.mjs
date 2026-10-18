@@ -57,6 +57,7 @@ export async function run(args, { env = process.env, fetchImpl = fetch, print = 
   const data = command === 'import' ? result.context : result;
   if (command !== 'tui') {
     if (data?.threadId !== env.CODEX_THREAD_ID || !/^[a-zA-Z0-9_-]{1,128}$/.test(data.amSessionId || '')) throw new Error('Invalid AM context response.');
+    if (rest.includes('--id-only') && data.messaging?.allowed === false) throw new Error(`${data.messaging.code}: ${data.messaging.action}`);
     print(rest.includes('--id-only') ? data.amSessionId : JSON.stringify(data, null, 2));
     return 0;
   }

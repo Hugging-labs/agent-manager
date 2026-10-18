@@ -213,7 +213,8 @@ export class CodexInput {
   }
   agentSource(id) {
     const session = this.getSession(id);
-    if (!session || session.archivedAt) throw fail('codex-sender-stale', 'The sending session is missing or archived.');
+    if (!session) throw fail('codex-sender-stale', 'The sending AM session no longer exists. Resolve the exact native thread again; do not substitute another identity.');
+    if (session.archivedAt) throw fail('codex-sender-archived', 'The sending AM session is archived. Restore this same session from AM Archive before sending. Its native Codex thread may still be active; resolving a mapping does not authorize sending.');
     const shared = session.cli === 'codex' && (session.codexSharedOnly || this.bindings.forSession(id));
     const context = shared ? this.context(id) : null;
     return {id, sessionUuid:session.sessionUuid, name:session.name, cli:session.cli,
