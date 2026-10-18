@@ -273,3 +273,11 @@ test('archived active native sender has distinct actionable refusal, deletion an
  assert.throws(()=>hub.agentSource('am'),{code:'codex-binding-stale'});
  assert.equal(f.calls.length,0,'sender checks never resume, interrupt or send');
 });
+
+test('archived recipient is distinct from missing binding, remains observable, and restores on the same thread',async()=>{
+ const f=fixture();const original=f.hub.context('am');f.session.archivedAt='2026-10-18T10:36:08Z';
+ assert.throws(()=>f.hub.context('am'),e=>e.code==='codex-target-archived'&&/receiving.*archived/.test(e.message));
+ assert.equal(f.hub.context('am',{allowArchived:true}).threadId,original.threadId);
+ await assert.rejects(f.hub.send('am',{requestId:randomUUID(),text:'must not arrive'}),{code:'codex-target-archived'});
+ assert.equal(f.calls.length,0);delete f.session.archivedAt;assert.equal(f.hub.context('am').stamp,original.stamp);
+});

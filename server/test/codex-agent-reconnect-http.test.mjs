@@ -107,6 +107,8 @@ try {
  assert.equal(observed.body.completionSubscribed,false);assert.equal(observed.body.taskCorrelated,false);assert.match(observed.body.observationId,/^[a-f0-9-]{36}$/);assert(Number.isFinite(Date.parse(observed.body.observedAt)));
  assert.equal(result.body.completionSubscribed,false);assert.equal(dispatched.body.completionSubscribed,true);
  const archiveResult=await request('/api/sessions/target/archive?from=source',{});assert.equal(archiveResult.status,200,JSON.stringify(archiveResult));
+ const archivedRecipient=await request('/api/agents/target/prompt?from=source',{requestId:randomUUID(),text:'must not arrive at archived recipient'});
+ assert.equal(archivedRecipient.status,409);assert.equal(archivedRecipient.body.code,'codex-target-archived');
  const archivedContext=await request('/api/codex/context?threadId='+tid);
  assert.equal(archivedContext.status,200);assert.equal(archivedContext.body.messaging.allowed,false);assert.equal(archivedContext.body.messaging.code,'codex-sender-archived');
  const beforeRefusal=calls.filter(c=>c.method==='thread/queue/add').length;
