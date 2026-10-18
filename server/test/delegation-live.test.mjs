@@ -31,6 +31,23 @@ try{
  evidence.parentReady=await waitAnswer(evidence.parent.id,'PARENT_READY');console.log('Parent initial turn ended',evidence.parent.threadId);save();
  evidence.child=await req('/api/agents?cli=claude&name=Delegation%20E2E%20Claude&from='+evidence.parent.id,{prompt:'Isolated integration test. No tools, no research, no file edits, no external messages. Reply exactly CHILD_READY.'});save();
  evidence.childReady=await waitAnswer(evidence.child.id,'CHILD_READY');console.log('Real Claude ready');save();
+ // Exercise the operator recovery workflow on this test session only.
+ const originalTrace=fs.readFileSync(evidence.parentReady.trace.path);
+ await req('/api/sessions/'+evidence.parent.id+'/archive?from=bootstrap',{});
+ evidence.archivedMapping=await req('/api/codex/context?threadId='+evidence.parent.threadId);
+ assert.equal(evidence.archivedMapping.messaging.allowed,false);
+ evidence.archivedRefusals=[];
+ for(const completion of [undefined,'notify']){
+  const response=await fetch(base+'/api/agents/'+evidence.child.id+'/prompt?from='+evidence.parent.id,{method:'POST',headers:{'content-type':'application/json','X-AM-Request':'1'},body:JSON.stringify({requestId:randomUUID(),text:'MUST_NOT_BE_DELIVERED',...(completion?{completion}:{})}),signal:AbortSignal.timeout(15000)});
+  const refusal=await response.json();assert.equal(response.status,409);assert.equal(refusal.code,'codex-sender-archived');evidence.archivedRefusals.push(refusal);
+ }
+ await req('/api/sessions/'+evidence.parent.id+'/unarchive?from=bootstrap',{});
+ evidence.restoredMapping=await req('/api/codex/context?threadId='+evidence.parent.threadId);
+ assert.equal(evidence.restoredMapping.amSessionId,evidence.parent.id);assert.equal(evidence.restoredMapping.threadId,evidence.parent.threadId);assert.equal(evidence.restoredMapping.messaging.allowed,true);
+ assert(fs.readFileSync(evidence.parentReady.trace.path).subarray(0,originalTrace.length).equals(originalTrace),'Original conversation bytes preserved');
+ evidence.ordinarySend=await req('/api/agents/'+evidence.child.id+'/prompt?from='+evidence.parent.id,{requestId:randomUUID(),text:'Isolated integration test. No tools or messages. Reply exactly ORDINARY_RECEIVED.'});
+ assert.equal(evidence.ordinarySend.completionSubscribed,false);
+ evidence.ordinaryAnswer=await waitAnswer(evidence.child.id,'ORDINARY_RECEIVED');save();console.log('Archive refusal, same-thread restore and ordinary delivery verified');
  const body={requestId:randomUUID(),text:'Isolated integration test. No tools, no research, no file edits, no external messages. Reply exactly CHILD_TASK_COMPLETE.',completion:'notify'};
  evidence.dispatch=await req('/api/agents/'+evidence.child.id+'/prompt?from='+evidence.parent.id,body);save();
  const id=evidence.dispatch.delegation.id;
