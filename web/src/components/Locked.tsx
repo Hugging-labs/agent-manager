@@ -1,8 +1,34 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import type { SessionState } from '../types';
 import { describeVerification, type LockStatus } from '../lib/lockStatus';
 import { SlidersGlyph, SunGlyph, GridGlyph, PlusGlyph, AmMark } from './icons';
 import StateLogo from './StateLogo';
+
+export const REPO_URL = 'https://github.com/huggingface/agent-manager';
+// The launch film, from a public dataset. A new cut changes only this.
+// (The app's CSP is frame-ancestors alone, so nothing restricts where media loads from.)
+const FILM_BASE = 'https://huggingface.co/datasets/lvwerra/agent-manager-video/resolve/main';
+export const LAUNCH_FILM = {
+  src: `${FILM_BASE}/agent-manager-720.mp4`,
+  hd: `${FILM_BASE}/agent-manager-1080.mp4`,
+  poster: `${FILM_BASE}/poster.jpg`,
+} as const;
+
+// The standard GitHub mark.
+function GitHubLink() {
+  return (
+    <a className="install-github" href={REPO_URL} target="_blank" rel="noreferrer" aria-label="Agent Manager on GitHub" title="Agent Manager on GitHub">
+      <svg viewBox="0 0 16 16" aria-hidden="true">
+        <path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z" />
+      </svg>
+    </a>
+  );
+}
+
+// Every locked page's heading, with the GitHub link beside it.
+const Title = ({ children }: { children: ReactNode }) => (
+  <div className="install-title"><h1>{children}</h1><GitHubLink /></div>
+);
 
 // A frozen, slightly dimmed replica of the real sidebar so the install page
 // looks like the product it unlocks. Pure decoration: no handlers, no state.
@@ -137,7 +163,7 @@ api.duplicate_repo(
         <MockSidebar />
         <div className="main locked-main">
           <div className="install" data-lock-reason={reason}>
-            <h1>{checking ? 'Checking that this Space is private…' : 'Couldn’t re-verify that this Space is private'}</h1>
+            <Title>{checking ? 'Checking that this Space is private…' : 'Couldn’t re-verify that this Space is private'}</Title>
             <p className="locked-lead">
               {checking ? (
                 <>Agent Manager only serves terminals once it has confirmed that this Space and the
@@ -169,7 +195,7 @@ api.duplicate_repo(
         <MockSidebar />
         <div className="main locked-main">
           <div className="install">
-            <h1>Your storage bucket is public</h1>
+            <Title>Your storage bucket is public</Title>
             <p className="locked-lead">
               The bucket mounted at <span className="mono">/data</span>
               {bucket ? <> (<span className="mono">{bucket}</span>)</> : null} is <b>public</b> —
@@ -196,7 +222,7 @@ api.duplicate_repo(
       <div className="main locked-main">
         <div className="install">
           <div>
-            <h1>Set up the Agent Manager in two steps</h1>
+            <Title>Set up the Agent Manager in two steps</Title>
             <p className="locked-lead">
               A private cloud workspace for Claude Code, Codex, Gemini CLI and friends —
               dispatch agents from anywhere, they keep working when you close the tab.
@@ -210,6 +236,13 @@ api.duplicate_repo(
             <b>Is this your Space?</b> Set it back to <b>Private</b> in Settings → Change visibility —
             it unlocks automatically within a minute.
           </p>
+
+          <figure className="install-film">
+            {/* No autoplay: nothing downloads until the visitor presses play. */}
+            <video controls preload="none" playsInline poster={LAUNCH_FILM.poster} src={LAUNCH_FILM.src}
+              aria-label="Agent Manager launch film" />
+            <figcaption><a href={LAUNCH_FILM.hd} target="_blank" rel="noreferrer">Watch in 1080p ↗</a></figcaption>
+          </figure>
 
           <div className="step">
             <div className="step-head"><span className="step-n mono">1</span><h3>Duplicate this Space</h3></div>
