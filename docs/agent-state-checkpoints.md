@@ -74,13 +74,16 @@ seven adapters (5,780 files, 3.7 GB) took 4m50s, against 10m23s for Claude
 alone through the mount.
 
 The bucket is discovered from `GET /api/spaces/$SPACE_ID` (the volume mounted
-at `$DATA_DIR`) using `HF_TOKEN`; `AGENT_STATE_BUCKET` overrides it. There is
-**no fallback to reading the mount**: parallel cold reads through it are the
-failure (a fresh container's 8 parallel rsyncs stopped at 1,538 of 4,689
-files, every time). A failed transfer is retried once; after that the adapter's
-restore fails and the server refuses to start, as for any incomplete restore.
-Without a bucket at `$DATA_DIR` (a local run, or a Space with none attached)
-the restore copies straight from `$DATA_DIR`, which is then local disk.
+at `$DATA_DIR`) using `HF_TOKEN`; `AGENT_STATE_BUCKET` overrides it. The token is optional for this
+app, so when the API can't be used — no `HF_TOKEN`, the bucket can't be
+discovered, or a transfer still fails after one retry — that adapter restores
+straight from `$DATA_DIR`, **with one rsync at a time**, and the log says why.
+That is the one mount read pattern that has held up: parallel cold reads are the
+failure (a fresh container's 8 parallel rsyncs stopped at 1,538 of 4,689 files,
+every time, while a single rsync copied everything, in ~9 minutes). Parallel
+slices are used only when copying from the local mirror. Without a bucket at
+`$DATA_DIR` (a local run, or a Space with none attached) the same direct copy
+reads ordinary local disk.
 `HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS` defaults to 64 (measured on
 cpu-upgrade: 4 → 128 s, default → ~63 s, 16 → 38 s, 64 → ~29 s for 2.8 GB);
 `AGENT_STATE_HTTP_TIMEOUT` (default 1200 s) bounds each transfer. A dry run

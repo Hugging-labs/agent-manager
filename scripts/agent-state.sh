@@ -230,7 +230,10 @@ list_slices() {
 # slice fails the tree (xargs exits non-zero when any command did).
 parallel_restore() {
   _key="$1" _durable="$2" _live="$3" _split="$4"
-  if [ "$JOBS" -le 1 ]; then
+  # A tree read from $DATA_DIR itself (no API mirror) gets ONE rsync: on the
+  # bucket mount, parallel cold reads are what fails (see restore_source).
+  case "$_durable" in "${DATA_DIR%/}"/*) _serial=1 ;; *) _serial=0 ;; esac
+  if [ "$JOBS" -le 1 ] || [ "$_serial" = 1 ]; then
     restore_slice "$_key" "$_durable" "$_live" all
     return
   fi
@@ -448,11 +451,14 @@ checkpoint_sqlite_tree() {
 # behaves exactly as before; it just reads fast local disk. The mirror is
 # deleted once the restore is done.
 #
-# There is NO fallback to reading the mount: parallel cold reads through it
-# are exactly what fails (measured: 8 rsyncs on a fresh container stopped at
-# 1,538 of 4,689 files, every time). A transfer that fails is retried once;
-# after that the adapter's restore fails, and the entrypoint's existing rule —
-# refuse to start agents on partial state — applies.
+# When the API can't be used — no HF_TOKEN (it is optional for this app), the
+# bucket can't be discovered, or a transfer still fails after one retry — the
+# adapter restores straight from $DATA_DIR instead, with ONE rsync at a time.
+# That is the only mount read pattern that has held up: parallel cold reads are
+# what fails (on a fresh container, 8 parallel rsyncs stopped at 1,538 of 4,689
+# files every time, while a single rsync copied all of them, slowly). Parallel
+# slices are therefore used only when copying from the local mirror; see
+# parallel_restore. Each fallback is logged with its reason.
 #
 # Without a bucket there is nothing to fetch: a Space whose /data has no bucket
 # attached (the entrypoint's ephemeral mode) or a local run restores straight
@@ -547,32 +553,35 @@ PY
   echo "$_mirror"
 }
 
-# The tree an adapter restores FROM: its API mirror when $DATA_DIR is a bucket,
-# $DATA_DIR itself when it is local disk. Fails — never falls back to reading
-# the mount — when the bucket can't be found or fetched. A dry run lists what
-# the restore would copy from $DATA_DIR and fetches nothing.
+# The tree an adapter restores FROM: its API mirror when $DATA_DIR is a bucket
+# we can fetch, $DATA_DIR itself otherwise — local disk, or the mount read by a
+# single rsync (parallel_restore never splits a tree under $DATA_DIR). A dry run
+# lists what the restore would copy from $DATA_DIR and fetches nothing.
 restore_source() {
   _key="$1" _durable="$2"
   [ -n "$DRY_RUN" ] && { echo "$_durable"; return 0; }
-  if ! _bucket=$(bucket_id); then
-    log "$_key: cannot tell which bucket is mounted at $DATA_DIR — not restoring" >&2
-    return 1
+  if ! _bucket=$(bucket_id 2>"$MIRROR_ROOT.$_key.why"); then
+    log "$_key: bucket API not usable ($(tail -n 1 "$MIRROR_ROOT.$_key.why")) — reading $DATA_DIR directly, one rsync at a time (slow)" >&2
+    rm -f "$MIRROR_ROOT.$_key.why"
+    echo "$_durable"; return 0
   fi
+  rm -f "$MIRROR_ROOT.$_key.why"
   [ -z "$_bucket" ] && { echo "$_durable"; return 0; } # local disk
-  if _m=$(mirror_tree "$_key" "$_durable" "$_bucket"); then
+  if _m=$(mirror_tree "$_key" "$_durable" "$_bucket" 2>"$MIRROR_ROOT.$_key.why"); then
     : > "$WORK/fetched.$_key"
     log "$_key: fetched over the bucket API ($(count_files "$_m") files, $(tree_size "$_m"))" >&2
+    rm -f "$MIRROR_ROOT.$_key.why"
     echo "$_m"
   else
-    log "$_key: could not fetch from bucket $_bucket — not restoring" >&2
-    return 1
+    log "$_key: could not fetch from bucket $_bucket ($(tail -n 1 "$MIRROR_ROOT.$_key.why")) — reading $DATA_DIR directly, one rsync at a time (slow)" >&2
+    rm -rf "$MIRROR_ROOT/$_key" "$MIRROR_ROOT.$_key.why"
+    echo "$_durable"
   fi
 }
 
 # ---------- restore: every adapter at once, with progress ----------
 
-# Each restores from restore_source (the API mirror, or local disk), and fails
-# if that does.
+# Each restores from restore_source: the API mirror, or $DATA_DIR directly.
 restore_codex() { _src=$(restore_source codex "$CODEX_DURABLE") && restore_tree codex "$_src" "$CODEX_HOME"; }
 # projects/ is most of Claude's bytes in one directory: one slice per project.
 restore_claude() {
