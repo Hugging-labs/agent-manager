@@ -73,7 +73,9 @@ try {
   };
 
   // Sending a prompt is the common dispatch: the rule lives here in full.
-  const send = section('### Send an agent a prompt');
+  // (#191 split "Send an agent a prompt" into a durable delegation section and
+  // this one; the rule still has to be where the plain send is described.)
+  const send = section('### Send an ordinary message');
   assert.match(send, /A task you hand over is still yours/);
   assert.match(send, /start the background `wait` loop/);
   assert.match(send, /`tail` it and act on what it actually produced/);
@@ -84,7 +86,7 @@ try {
   // has to arm the watch where it happens, not leave it to a section the reader
   // may never reach.
   const launch = section('### Launch a new agent');
-  assert.match(launch, /it is a\s+dispatch and the rule under \*\*Send an agent a prompt\*\* applies/);
+  assert.match(launch, /it is a\s+dispatch and the rule under \*\*Send an ordinary message\*\* applies/);
   assert.match(launch, /start the background `wait` loop right\s+then/);
   assert.match(launch, /read its screen before you\s+call the job done/);
   assert.match(launch, /arming each\s+one's watch as you go/, 'spawning into a group arms a watch per agent');
@@ -97,10 +99,19 @@ try {
   // `wait` answering is not the work succeeding. A CLI that rejects its own
   // flags returns to its input box and reports `waiting`, which is why the
   // state alone must never be read as a result.
-  const watch = section('### Watch instead of asking');
+  const watch = section('### Observe a peer without requesting a callback');
   assert.match(watch, /`matched` means the agent STOPPED, not that it succeeded/);
   assert.match(watch, /Read `tail` afterwards and judge the\s+work, not the state/);
   assert.doesNotMatch(watch, /`matched: true`\s+is finished/);
+  assert.match(watch, /start the\s+background `wait` loop below/);
+  // Every API call in the generated text goes to the address the manager is
+  // bound to — a hardcoded localhost answers nothing on a local install bound
+  // elsewhere (#191 had one in the delegation snippet).
+  assert.doesNotMatch(text, /localhost:/, 'no generated snippet hardcodes localhost');
+  // …and the delegation command keeps its line continuations (a lone `\` in
+  // the template literal is eaten, joining the command into one line).
+  assert.match(section('### Delegate with a durable completion reply'),
+    /curl -sS --fail-with-body -H 'X-AM-Request: 1' -X POST \\\n  "http:\/\/\$\{AM_HOST:-[^}]+\}:\$\{AM_PORT:-\d+\}\/api\/agents\/\$ID\/prompt\?from=\$AM_ID" \\\n/);
 
   // Artifact links go through the Hub page, whatever the visibility: a direct
   // *.static.hf.space link to a private Space only works right after visiting
