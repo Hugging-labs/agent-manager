@@ -756,20 +756,52 @@ try {
     fs.rmSync(g.r, { recursive: true, force: true });
 
     // A step with no timeout of its own (here a SQLite check that never
-    // returns) is stopped by the watchdog shortly after the budget.
-    const h = apiFixture('budget-watchdog');
-    fs.writeFileSync(path.join(h.bin, 'sqlite3'), `#!/bin/sh\nsleep 1000; :\n`);
-    fs.chmodSync(path.join(h.bin, 'sqlite3'), 0o755);
-    const hOut = path.join(h.r, 'out.txt');
+    // returns) is stopped by the watchdog shortly after the budget. Kept
+    // deterministic: no API, and opencode is the only adapter with state, so
+    // what runs before that check is a handful of near-empty rsyncs, far
+    // inside the budget even on a busy box — and the fake sqlite3 leaves a
+    // marker proving the restore was in that very step when time ran out.
+    const { r: hr, e: he } = fresh('budget-watchdog');
+    const hbin = path.join(hr, 'bin');
+    fs.mkdirSync(path.join(he.OPENCODE_DURABLE, 'checkpoints'), { recursive: true });
+    sql(path.join(he.OPENCODE_DURABLE, 'checkpoints/opencode.db'), 'create table t(x);');
+    const reached = path.join(hr, 'sqlite-reached');
+    fs.mkdirSync(hbin, { recursive: true });
+    fs.writeFileSync(path.join(hbin, 'sqlite3'), `#!/bin/sh\n: > '${reached}'\nsleep 1000; :\n`);
+    fs.chmodSync(path.join(hbin, 'sqlite3'), 0o755);
+    const hOut = path.join(hr, 'out.txt');
     const ht = Date.now();
-    const w = await runTo(h.e, 'restore', hOut, { ...h.api, AGENT_STATE_BUDGET: '3' }).done;
+    const w = await runTo(he, 'restore', hOut, { PATH: `${hbin}:${he.PATH}`, AGENT_STATE_BUDGET: '8' }).done;
     const wText = fs.readFileSync(hOut, 'utf8');
     check('budget: a step without its own timeout is stopped by the watchdog, naming the step',
-      w.code === 1 && /opencode FAILED: out of time — the restore budget \(AGENT_STATE_BUDGET=3s\) ran out during: checking the restored SQLite database/.test(wText)
-        && /refusing to start/.test(wText), wText.slice(-800));
-    check('…promptly, with no process of it left', (Date.now() - ht) / 1000 < 35 && processesNaming(h.r).length === 0,
-      processesNaming(h.r).join(' | '));
-    fs.rmSync(h.r, { recursive: true, force: true });
+      w.code === 1 && fs.existsSync(reached)
+        && /opencode FAILED: out of time — the restore budget \(AGENT_STATE_BUDGET=8s\) ran out during: checking the restored SQLite database/.test(wText)
+        && /refusing to start/.test(wText) && !/restore finished/.test(wText), wText.slice(-800));
+    check('…promptly, with no process of it left', (Date.now() - ht) / 1000 < 40 && processesNaming(hr).length === 0,
+      processesNaming(hr).join(' | '));
+    fs.rmSync(hr, { recursive: true, force: true });
+
+    // The mount-side backup listing: Claude on the mount (its API listing
+    // failed), and `ls` of the backups hung until the budget stopped it. A
+    // stopped listing is not an empty one — Claude fails, and so does the
+    // restore, instead of finishing without the backups.
+    const k = apiFixture('mount-ls-hang');
+    const realLs = execFileSync('sh', ['-c', 'command -v ls'], { encoding: 'utf8' }).trim();
+    fs.writeFileSync(path.join(k.bin, 'ls'), [
+      '#!/bin/sh',
+      'for a in "$@"; do case "$a" in */state/claude/backups) sleep 1000; : ;; esac; done',
+      `exec ${realLs} "$@"`,
+    ].join('\n'));
+    fs.chmodSync(path.join(k.bin, 'ls'), 0o755);
+    const kr = await k.restore({ FAKE_HF_LIST: 'fail', AGENT_STATE_BUDGET: '6' });
+    const kBackups = path.join(k.e.CLAUDE_CONFIG_DIR, 'backups');
+    check('budget: a hung mount-side backup listing fails Claude and the restore, never "no backups"',
+      kr.code === 1 && /claude: could not fetch from bucket/.test(kr.out)
+        && /claude FAILED after \d+s: out of time — the restore budget \(AGENT_STATE_BUDGET=6s\) ran out during: listing \S+\/state\/claude\/backups/.test(kr.out)
+        && !/restore finished/.test(kr.out) && !/claude done/.test(kr.out), kr.out.slice(-800));
+    check('…promptly, with no process of it left', kr.secs < 25 && processesNaming(k.r).length === 0
+      && !(fs.existsSync(kBackups) && fs.readdirSync(kBackups).length), processesNaming(k.r).join(' | '));
+    fs.rmSync(k.r, { recursive: true, force: true });
   }
 
 } catch (error) {

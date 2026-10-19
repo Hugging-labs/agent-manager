@@ -362,15 +362,23 @@ checkpoint_tree() {
 
 # The newest few Claude config backups, by the millisecond stamp in their
 # names — read from the directory listing alone, without a stat per file.
+# A listing that failed or was stopped is not an empty one: it fails, rather
+# than handing back no backups at all.
 newest_claude_backups() {
-  bounded "listing ${SRC_DESC:-$1}/backups" "" ls -A "$1" 2>/dev/null | grep -E '^\.claude\.json\.backup\.[0-9]+$' | sort -t . -k 5,5n | tail -n "$2"
+  _nl="$AM_LOCAL/agent-state-claude-ls.$$"
+  if ! bounded "listing $1" "" ls -A "$1" > "$_nl" 2>/dev/null; then rm -f "$_nl"; return 1; fi
+  grep -E '^\.claude\.json\.backup\.[0-9]+$' "$_nl" | sort -t . -k 5,5n | tail -n "$2"
+  rm -f "$_nl"
 }
 
 restore_claude_backups() {
   _src="${1:-$CLAUDE_DURABLE}/backups" _dst="$CLAUDE_CONFIG_DIR/backups"
   [ -d "$_src" ] && [ ! -L "$_src" ] || return 0
   _list="$AM_LOCAL/agent-state-claude-backups.$$"
-  newest_claude_backups "$_src" "$KEEP_CLAUDE_BACKUPS" > "$_list"
+  if ! newest_claude_backups "$_src" "$KEEP_CLAUDE_BACKUPS" > "$_list"; then
+    echo "agent-state: could not list the Claude backups in $_src" >&2
+    rm -f "$_list"; return 1
+  fi
   if [ -s "$_list" ] && [ -z "$DRY_RUN" ]; then
     mkdir -p "$_dst"
     if ! bounded "rsync from ${SRC_DESC:-$_src}" "" rsync -a --update --files-from="$_list" "$_src/" "$_dst/"; then
@@ -1012,10 +1020,13 @@ if [ "$MODE" = restore ]; then
     wait "$p" || failures=$((failures + 1))
   done
   kill "$hb" "$wd" 2>/dev/null
-  [ "$failures" -eq 0 ] && log "restore finished in $(elapsed "$t0")"
+  # The last guard: a step that ran out of budget fails the restore, whatever
+  # the adapter that ran it went on to report.
   if ls "$WORK"/exhausted.* >/dev/null 2>&1; then
     echo "agent-state: restore ran out of its ${BUDGET}s budget (AGENT_STATE_BUDGET); refusing to start rather than wait any longer" >&2
+    [ "$failures" -eq 0 ] && failures=1
   fi
+  [ "$failures" -eq 0 ] && log "restore finished in $(elapsed "$t0")"
   rm -rf "${MIRROR_ROOT:?}"
 else
   checkpoint_tree codex "$CODEX_HOME" "$CODEX_DURABLE" || failures=$((failures + 1))
