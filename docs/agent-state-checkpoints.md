@@ -57,6 +57,29 @@ raw DB/WAL layout is accepted only as a one-release migration fallback. The
 server refuses to start if restore is incomplete, avoiding a new lineage from
 being written over partially restored state.
 
+Restore READS go over the bucket API, not the mount. Each durable tree is
+first pulled with `hf buckets sync` (plan, then apply) into a local mirror
+under `$AM_LOCAL/agent-state-mirror/`, with the bucket's mtimes reapplied from
+the plan; the rsync restore described above then runs from that mirror instead
+of from `/data`, so its filters, newest-N Claude backups, SQLite validation and
+`--update` semantics are unchanged. Bulk junk (Codex `tmp/`, caches, all but
+the newest Claude backups) is filtered out of the download itself. The mirror
+is deleted when the restore ends.
+
+Why: on 2026-10-19 hf-mount stopped serving reads ~90 s into two consecutive
+boots — every read hung ~90 s then failed with EIO, rsync exited 23 and the
+Space never started — while the same files came over the API in under a second
+each. Measured from outside HF against that bucket, the API restore of all
+seven adapters (5,780 files, 3.7 GB) took 4m50s, against 10m23s for Claude
+alone through the mount.
+
+The bucket is discovered from `GET /api/spaces/$SPACE_ID` (the volume mounted
+at `$DATA_DIR`) using `HF_TOKEN`; `AGENT_STATE_BUCKET` overrides it. If `hf`,
+the token, discovery or the transfer fails, that adapter restores from the mount
+exactly as before and the log says why. `AGENT_STATE_HTTP=0` turns the API path
+off; `AGENT_STATE_HTTP_TIMEOUT` (default 1200 s) bounds each transfer.
+Checkpoints are unchanged: they still write closed files through the mount.
+
 While the server is running, one supervisor loop calls
 `scripts/agent-state.sh checkpoint` every
 `$AGENT_STATE_CHECKPOINT_SECONDS` (default 15). A local `flock` prevents a

@@ -304,7 +304,7 @@ newest_claude_backups() {
 }
 
 restore_claude_backups() {
-  _src="$CLAUDE_DURABLE/backups" _dst="$CLAUDE_CONFIG_DIR/backups"
+  _src="${1:-$CLAUDE_DURABLE}/backups" _dst="$CLAUDE_CONFIG_DIR/backups"
   [ -d "$_src" ] && [ ! -L "$_src" ] || return 0
   _list="$AM_LOCAL/agent-state-claude-backups.$$"
   newest_claude_backups "$_src" "$KEEP_CLAUDE_BACKUPS" > "$_list"
@@ -432,18 +432,134 @@ checkpoint_sqlite_tree() {
   mv "$sqlite_next" "$sqlite_stamp"
 }
 
+# ---------- restore source: the bucket API, not the mount ----------
+#
+# Every restore read used to go through hf-mount. On 2026-10-19 that mount
+# stopped serving reads ~90s into two consecutive boots — each read hung ~90s
+# and failed with EIO, rsync exited 23, and the Space never started — while the
+# same files downloaded over the bucket API in under a second each. Listing is
+# cheap there too: 7,102 Claude files in 2s.
+#
+# So the restore first pulls each durable tree over the API (`hf buckets sync`)
+# into a local MIRROR, with the bucket's mtimes reapplied, and then runs the
+# unchanged rsync restore from that mirror instead of from /data. Every rule
+# below — adapter filters, newest-N Claude backups, SQLite checkpoint
+# validation, the legacy DB fallback, --update for hot restarts — therefore
+# behaves exactly as before; it just reads fast local disk. The mirror is
+# deleted once the restore is done.
+#
+# Any failure of this step (no `hf`, no token, bucket not discoverable, API
+# error, timeout) falls back to restoring THAT adapter from the mount, as
+# before. AGENT_STATE_HTTP=0 disables it outright; AGENT_STATE_BUCKET names the
+# bucket for runs where the Space API can't say (local runs, tests).
+HTTP_RESTORE="${AGENT_STATE_HTTP:-1}"
+HTTP_TIMEOUT="${AGENT_STATE_HTTP_TIMEOUT:-1200}"
+MIRROR_ROOT="$AM_LOCAL/agent-state-mirror"
+
+# The bucket mounted at $DATA_DIR, from GET /api/spaces/$SPACE_ID — the same
+# source backup.js/visibility.js use. Cached for the rest of this restore.
+bucket_id() {
+  [ -n "${AGENT_STATE_BUCKET:-}" ] && { echo "$AGENT_STATE_BUCKET"; return 0; }
+  _cache="$AM_LOCAL/agent-state-bucket"
+  [ -s "$_cache" ] && { cat "$_cache"; return 0; }
+  [ -n "${SPACE_ID:-}" ] && [ -n "${HF_TOKEN:-}" ] || return 1
+  _b=$(curl -fsS -m 20 -H "Authorization: Bearer $HF_TOKEN" "https://huggingface.co/api/spaces/$SPACE_ID" 2>/dev/null \
+    | jq -r --arg m "${DATA_DIR%/}" '.runtime.volumes[]? | select(.type == "bucket" and (.mountPath | rtrimstr("/")) == $m) | .source' 2>/dev/null \
+    | head -n 1)
+  [ -n "$_b" ] || return 1
+  echo "$_b" > "$_cache"
+  echo "$_b"
+}
+
+# Coarse filters for the mirror, in `hf buckets sync` syntax (fnmatch on the
+# path relative to the tree root; `*` crosses `/`). They only keep bulk junk
+# from being DOWNLOADED; the adapter's rsync filters still apply when the
+# mirror is restored, so anything let through here is filtered there as before.
+mirror_filters() {
+  case "$1" in
+    codex)
+      printf '%s\n' '- tmp/*' '- .tmp/*' '- */.tmp/*' '- cache/*' '- */cache/*' \
+        '- db-backups/*' '- */db-backups/*' '- plugins/.remote-plugin-install-staging/*' \
+        '- *.sqlite*' '- *-wal' '- *-shm' ;;
+    claude)
+      # Only the newest few config backups are restored (restore_claude_backups);
+      # fetch just those rather than all ~2,400.
+      bucket_names "$2/backups" | grep -E '^\.claude\.json\.backup\.[0-9]+$' \
+        | sort -t . -k 5,5n | tail -n "$KEEP_CLAUDE_BACKUPS" | sed 's|^|+ backups/|'
+      echo '- backups/*' ;;
+  esac
+}
+
+# File names directly under a bucket prefix (one API listing, no stat per file).
+bucket_names() {
+  hf buckets list "hf://buckets/$1" --format json 2>/dev/null \
+    | jq -r '.[]? | select(.type == "file") | .path | split("/") | last' 2>/dev/null
+}
+
+# Pull one durable tree into its mirror; prints the mirror path on success.
+mirror_tree() {
+  _key="$1" _durable="$2"
+  [ "$HTTP_RESTORE" = 1 ] && [ -z "$DRY_RUN" ] || return 1
+  command -v hf >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 1
+  case "$_durable" in "${DATA_DIR%/}"/*) ;; *) return 1 ;; esac
+  _bucket=$(bucket_id) || return 1
+  _prefix="$_bucket/${_durable#"${DATA_DIR%/}/"}"
+  _mirror="$MIRROR_ROOT/$_key"
+  _rules="$MIRROR_ROOT/$_key.filters" _plan="$MIRROR_ROOT/$_key.plan.jsonl"
+  mkdir -p "$_mirror"
+  mirror_filters "$_key" "$_prefix" > "$_rules" || return 1
+  # Plan, then apply the plan: the plan carries each file's bucket mtime, which
+  # the download itself does not set.
+  timeout "$HTTP_TIMEOUT" hf buckets sync "hf://buckets/$_prefix" "$_mirror" \
+    --filter-from "$_rules" --plan "$_plan" --quiet >/dev/null 2>"$_plan.err" || return 1
+  timeout "$HTTP_TIMEOUT" hf buckets sync --apply "$_plan" --quiet >/dev/null 2>>"$_plan.err" || return 1
+  # Bucket mtimes back onto the mirror, so the rsync from it preserves them into
+  # the live tree exactly as `rsync -a` from the mount did: --update decisions on
+  # a later hot restart and the checkpoint floor both depend on them.
+  python3 - "$_plan" "$_mirror" <<'PY' || return 1
+import json, os, sys
+from datetime import datetime
+plan, root = sys.argv[1], sys.argv[2]
+for line in open(plan):
+    op = json.loads(line)
+    if op.get("type") != "operation" or op.get("action") != "download" or not op.get("remote_mtime"):
+        continue
+    t = datetime.fromisoformat(op["remote_mtime"].replace("Z", "+00:00")).timestamp()
+    os.utime(os.path.join(root, op["path"]), (t, t))
+PY
+  echo "$_mirror"
+}
+
+# The durable tree an adapter restores FROM: its API mirror when that worked,
+# the mount otherwise. Logs which, so a boot says how it was restored.
+restore_source() {
+  _key="$1" _durable="$2"
+  if _m=$(mirror_tree "$_key" "$_durable"); then
+    : > "$WORK/fetched.$_key"
+    log "$_key: fetched over the bucket API ($(count_files "$_m") files, $(tree_size "$_m"))" >&2
+    echo "$_m"
+  else
+    [ "$HTTP_RESTORE" = 1 ] && [ -z "$DRY_RUN" ] && \
+      log "$_key: bucket API unavailable — restoring from the mount ($(tail -n 1 "$MIRROR_ROOT/$_key.plan.jsonl.err" 2>/dev/null))" >&2
+    rm -rf "$MIRROR_ROOT/$_key"
+    echo "$_durable"
+  fi
+}
+
 # ---------- restore: every adapter at once, with progress ----------
 
-restore_codex() { restore_tree codex "$CODEX_DURABLE" "$CODEX_HOME"; }
+# Each reads from restore_source: the API mirror, or the mount as a fallback.
+restore_codex() { restore_tree codex "$(restore_source codex "$CODEX_DURABLE")" "$CODEX_HOME"; }
 # projects/ is most of Claude's bytes in one directory: one slice per project.
 restore_claude() {
-  restore_tree claude "$CLAUDE_DURABLE" "$CLAUDE_CONFIG_DIR" "projects file-history" && restore_claude_backups
+  _src=$(restore_source claude "$CLAUDE_DURABLE")
+  restore_tree claude "$_src" "$CLAUDE_CONFIG_DIR" "projects file-history" && restore_claude_backups "$_src"
 }
-restore_gemini() { restore_tree gemini "$GEMINI_DURABLE" "$GEMINI_LIVE"; }
-restore_openclaw() { restore_tree openclaw "$OPENCLAW_DURABLE" "$OPENCLAW_STATE_DIR"; }
-restore_opencode() { restore_sqlite_tree "$OPENCODE_DURABLE" "$OPENCODE_LIVE" opencode.db opencode.db; }
-restore_hermes() { restore_sqlite_tree "$HERMES_DURABLE" "$HERMES_LIVE" state.db state.db; }
-restore_fx() { restore_tree fx "$FX_DURABLE" "$FX_LIVE"; }
+restore_gemini() { restore_tree gemini "$(restore_source gemini "$GEMINI_DURABLE")" "$GEMINI_LIVE"; }
+restore_openclaw() { restore_tree openclaw "$(restore_source openclaw "$OPENCLAW_DURABLE")" "$OPENCLAW_STATE_DIR"; }
+restore_opencode() { restore_sqlite_tree "$(restore_source opencode "$OPENCODE_DURABLE")" "$OPENCODE_LIVE" opencode.db opencode.db; }
+restore_hermes() { restore_sqlite_tree "$(restore_source hermes "$HERMES_DURABLE")" "$HERMES_LIVE" state.db state.db; }
+restore_fx() { restore_tree fx "$(restore_source fx "$FX_DURABLE")" "$FX_LIVE"; }
 
 ADAPTERS="codex claude gemini openclaw opencode hermes fx"
 live_of() {
@@ -490,7 +606,13 @@ heartbeat() {
     _line=""
     for _a in $ADAPTERS; do
       [ -e "$WORK/done.$_a" ] || [ -e "$WORK/failed.$_a" ] && continue
-      _line="$_line, $_a $(count_files "$(live_of "$_a")") files"
+      # While an adapter is still downloading, its files are in the API mirror,
+      # not yet on the live side — count those, or the log reads "0 files".
+      if [ -d "$MIRROR_ROOT/$_a" ] && [ ! -e "$WORK/fetched.$_a" ]; then
+        _line="$_line, $_a $(count_files "$MIRROR_ROOT/$_a") files fetched"
+      else
+        _line="$_line, $_a $(count_files "$(live_of "$_a")") files"
+      fi
     done
     [ -n "$_line" ] && log "still restoring after $(elapsed "$_t0"): ${_line#, } on local disk so far"
   done
@@ -647,7 +769,7 @@ if [ "$MODE" = restore ]; then
     wait
   }
   # The heartbeat must not outlive the restore, however it ends.
-  trap 'kill $hb 2>/dev/null; rm -rf "$WORK"' EXIT
+  trap 'kill $hb 2>/dev/null; rm -rf "$WORK" "$MIRROR_ROOT"' EXIT
   trap 'stop_workers; exit 130' INT
   trap 'stop_workers; exit 143' TERM
   trap 'stop_workers; exit 129' HUP
@@ -663,6 +785,7 @@ if [ "$MODE" = restore ]; then
   done
   kill "$hb" 2>/dev/null
   [ "$failures" -eq 0 ] && log "restore finished in $(elapsed "$t0")"
+  rm -rf "$MIRROR_ROOT"
 else
   checkpoint_tree codex "$CODEX_HOME" "$CODEX_DURABLE" || failures=$((failures + 1))
   checkpoint_tree claude "$CLAUDE_CONFIG_DIR" "$CLAUDE_DURABLE" || failures=$((failures + 1))
