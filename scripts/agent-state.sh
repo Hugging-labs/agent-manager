@@ -448,26 +448,38 @@ checkpoint_sqlite_tree() {
 # behaves exactly as before; it just reads fast local disk. The mirror is
 # deleted once the restore is done.
 #
-# Any failure of this step (no `hf`, no token, bucket not discoverable, API
-# error, timeout) falls back to restoring THAT adapter from the mount, as
-# before. AGENT_STATE_HTTP=0 disables it outright; AGENT_STATE_BUCKET names the
-# bucket for runs where the Space API can't say (local runs, tests).
-HTTP_RESTORE="${AGENT_STATE_HTTP:-1}"
+# There is NO fallback to reading the mount: parallel cold reads through it
+# are exactly what fails (measured: 8 rsyncs on a fresh container stopped at
+# 1,538 of 4,689 files, every time). A transfer that fails is retried once;
+# after that the adapter's restore fails, and the entrypoint's existing rule —
+# refuse to start agents on partial state — applies.
+#
+# Without a bucket there is nothing to fetch: a Space whose /data has no bucket
+# attached (the entrypoint's ephemeral mode) or a local run restores straight
+# from $DATA_DIR, which is then ordinary local disk. AGENT_STATE_BUCKET names
+# the bucket where the Space API can't (local runs against a bucket, tests).
 HTTP_TIMEOUT="${AGENT_STATE_HTTP_TIMEOUT:-1200}"
+# Files in flight per transfer. Measured on cpu-upgrade against a 4,686-file,
+# 2.8 GB tree: 4 → 128s, default → ~63s, 16 → 38s, 64 → 28-30s.
+export HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS="${HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS:-64}"
 MIRROR_ROOT="$AM_LOCAL/agent-state-mirror"
 
 # The bucket mounted at $DATA_DIR, from GET /api/spaces/$SPACE_ID — the same
-# source backup.js/visibility.js use. Cached for the rest of this restore.
+# source backup.js/visibility.js use. Prints the bucket id, or nothing when
+# there is no bucket at $DATA_DIR (local disk). Returns non-zero only when it
+# CANNOT TELL, which on a Space is an error, never a reason to read the mount.
 bucket_id() {
   [ -n "${AGENT_STATE_BUCKET:-}" ] && { echo "$AGENT_STATE_BUCKET"; return 0; }
+  [ -n "${SPACE_ID:-}" ] || return 0 # not a Space: local disk
   _cache="$AM_LOCAL/agent-state-bucket"
-  [ -s "$_cache" ] && { cat "$_cache"; return 0; }
-  [ -n "${SPACE_ID:-}" ] && [ -n "${HF_TOKEN:-}" ] || return 1
-  _b=$(curl -fsS -m 20 -H "Authorization: Bearer $HF_TOKEN" "https://huggingface.co/api/spaces/$SPACE_ID" 2>/dev/null \
-    | jq -r --arg m "${DATA_DIR%/}" '.runtime.volumes[]? | select(.type == "bucket" and (.mountPath | rtrimstr("/")) == $m) | .source' 2>/dev/null \
-    | head -n 1)
-  [ -n "$_b" ] || return 1
-  echo "$_b" > "$_cache"
+  [ -e "$_cache" ] && { cat "$_cache"; return 0; }
+  [ -n "${HF_TOKEN:-}" ] || { echo "HF_TOKEN is not set; it is needed to find and read the bucket" >&2; return 1; }
+  command -v jq >/dev/null 2>&1 || { echo "jq is missing" >&2; return 1; }
+  _info=$(curl -fsS -m 20 --retry 2 -H "Authorization: Bearer $HF_TOKEN" "https://huggingface.co/api/spaces/$SPACE_ID") \
+    || { echo "could not read the Space's volumes from the Hub API" >&2; return 1; }
+  _b=$(printf '%s' "$_info" | jq -r --arg m "${DATA_DIR%/}" \
+    '.runtime.volumes[]? | select(.type == "bucket" and (.mountPath | rtrimstr("/")) == $m) | .source' | head -n 1)
+  printf '%s' "$_b" > "$_cache"
   echo "$_b"
 }
 
@@ -496,13 +508,11 @@ bucket_names() {
     | jq -r '.[]? | select(.type == "file") | .path | split("/") | last' 2>/dev/null
 }
 
-# Pull one durable tree into its mirror; prints the mirror path on success.
+# Pull one durable tree from bucket $3 into its mirror; prints the mirror path.
 mirror_tree() {
-  _key="$1" _durable="$2"
-  [ "$HTTP_RESTORE" = 1 ] && [ -z "$DRY_RUN" ] || return 1
-  command -v hf >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 1
-  case "$_durable" in "${DATA_DIR%/}"/*) ;; *) return 1 ;; esac
-  _bucket=$(bucket_id) || return 1
+  _key="$1" _durable="$2" _bucket="$3"
+  command -v hf >/dev/null 2>&1 || { echo "the hf CLI is missing" >&2; return 1; }
+  case "$_durable" in "${DATA_DIR%/}"/*) ;; *) echo "$_durable is not under $DATA_DIR" >&2; return 1 ;; esac
   _prefix="$_bucket/${_durable#"${DATA_DIR%/}/"}"
   _mirror="$MIRROR_ROOT/$_key"
   _rules="$MIRROR_ROOT/$_key.filters" _plan="$MIRROR_ROOT/$_key.plan.jsonl"
@@ -510,9 +520,16 @@ mirror_tree() {
   mirror_filters "$_key" "$_prefix" > "$_rules" || return 1
   # Plan, then apply the plan: the plan carries each file's bucket mtime, which
   # the download itself does not set.
-  timeout "$HTTP_TIMEOUT" hf buckets sync "hf://buckets/$_prefix" "$_mirror" \
-    --filter-from "$_rules" --plan "$_plan" --quiet >/dev/null 2>"$_plan.err" || return 1
-  timeout "$HTTP_TIMEOUT" hf buckets sync --apply "$_plan" --quiet >/dev/null 2>>"$_plan.err" || return 1
+  # Once more on failure: a re-plan against the partly filled mirror only
+  # fetches what is still missing.
+  _try=1
+  until timeout "$HTTP_TIMEOUT" hf buckets sync "hf://buckets/$_prefix" "$_mirror" \
+          --filter-from "$_rules" --plan "$_plan" --quiet >/dev/null 2>"$_plan.err" \
+        && timeout "$HTTP_TIMEOUT" hf buckets sync --apply "$_plan" --quiet >/dev/null 2>>"$_plan.err"; do
+    [ "$_try" -ge 2 ] && { tail -n 3 "$_plan.err" >&2; return 1; }
+    log "$_key: bucket transfer failed, retrying ($(tail -n 1 "$_plan.err"))" >&2
+    _try=$((_try + 1))
+  done
   # Bucket mtimes back onto the mirror, so the rsync from it preserves them into
   # the live tree exactly as `rsync -a` from the mount did: --update decisions on
   # a later hot restart and the checkpoint floor both depend on them.
@@ -530,36 +547,43 @@ PY
   echo "$_mirror"
 }
 
-# The durable tree an adapter restores FROM: its API mirror when that worked,
-# the mount otherwise. Logs which, so a boot says how it was restored.
+# The tree an adapter restores FROM: its API mirror when $DATA_DIR is a bucket,
+# $DATA_DIR itself when it is local disk. Fails — never falls back to reading
+# the mount — when the bucket can't be found or fetched. A dry run lists what
+# the restore would copy from $DATA_DIR and fetches nothing.
 restore_source() {
   _key="$1" _durable="$2"
-  if _m=$(mirror_tree "$_key" "$_durable"); then
+  [ -n "$DRY_RUN" ] && { echo "$_durable"; return 0; }
+  if ! _bucket=$(bucket_id); then
+    log "$_key: cannot tell which bucket is mounted at $DATA_DIR — not restoring" >&2
+    return 1
+  fi
+  [ -z "$_bucket" ] && { echo "$_durable"; return 0; } # local disk
+  if _m=$(mirror_tree "$_key" "$_durable" "$_bucket"); then
     : > "$WORK/fetched.$_key"
     log "$_key: fetched over the bucket API ($(count_files "$_m") files, $(tree_size "$_m"))" >&2
     echo "$_m"
   else
-    [ "$HTTP_RESTORE" = 1 ] && [ -z "$DRY_RUN" ] && \
-      log "$_key: bucket API unavailable — restoring from the mount ($(tail -n 1 "$MIRROR_ROOT/$_key.plan.jsonl.err" 2>/dev/null))" >&2
-    rm -rf "$MIRROR_ROOT/$_key"
-    echo "$_durable"
+    log "$_key: could not fetch from bucket $_bucket — not restoring" >&2
+    return 1
   fi
 }
 
 # ---------- restore: every adapter at once, with progress ----------
 
-# Each reads from restore_source: the API mirror, or the mount as a fallback.
-restore_codex() { restore_tree codex "$(restore_source codex "$CODEX_DURABLE")" "$CODEX_HOME"; }
+# Each restores from restore_source (the API mirror, or local disk), and fails
+# if that does.
+restore_codex() { _src=$(restore_source codex "$CODEX_DURABLE") && restore_tree codex "$_src" "$CODEX_HOME"; }
 # projects/ is most of Claude's bytes in one directory: one slice per project.
 restore_claude() {
-  _src=$(restore_source claude "$CLAUDE_DURABLE")
-  restore_tree claude "$_src" "$CLAUDE_CONFIG_DIR" "projects file-history" && restore_claude_backups "$_src"
+  _src=$(restore_source claude "$CLAUDE_DURABLE") \
+    && restore_tree claude "$_src" "$CLAUDE_CONFIG_DIR" "projects file-history" && restore_claude_backups "$_src"
 }
-restore_gemini() { restore_tree gemini "$(restore_source gemini "$GEMINI_DURABLE")" "$GEMINI_LIVE"; }
-restore_openclaw() { restore_tree openclaw "$(restore_source openclaw "$OPENCLAW_DURABLE")" "$OPENCLAW_STATE_DIR"; }
-restore_opencode() { restore_sqlite_tree "$(restore_source opencode "$OPENCODE_DURABLE")" "$OPENCODE_LIVE" opencode.db opencode.db; }
-restore_hermes() { restore_sqlite_tree "$(restore_source hermes "$HERMES_DURABLE")" "$HERMES_LIVE" state.db state.db; }
-restore_fx() { restore_tree fx "$(restore_source fx "$FX_DURABLE")" "$FX_LIVE"; }
+restore_gemini() { _src=$(restore_source gemini "$GEMINI_DURABLE") && restore_tree gemini "$_src" "$GEMINI_LIVE"; }
+restore_openclaw() { _src=$(restore_source openclaw "$OPENCLAW_DURABLE") && restore_tree openclaw "$_src" "$OPENCLAW_STATE_DIR"; }
+restore_opencode() { _src=$(restore_source opencode "$OPENCODE_DURABLE") && restore_sqlite_tree "$_src" "$OPENCODE_LIVE" opencode.db opencode.db; }
+restore_hermes() { _src=$(restore_source hermes "$HERMES_DURABLE") && restore_sqlite_tree "$_src" "$HERMES_LIVE" state.db state.db; }
+restore_fx() { _src=$(restore_source fx "$FX_DURABLE") && restore_tree fx "$_src" "$FX_LIVE"; }
 
 ADAPTERS="codex claude gemini openclaw opencode hermes fx"
 live_of() {
