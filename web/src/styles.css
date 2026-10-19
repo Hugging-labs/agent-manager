@@ -756,6 +756,15 @@ body {
 .install-lock { flex: none; width: 40px; height: 40px; display: inline-flex; align-items: center; justify-content: center; background: color-mix(in srgb, var(--accent) 10%, transparent); border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border)); border-radius: var(--r-lg); margin-top: 2px; }
 .install-lock svg { width: 20px; height: 20px; color: var(--accent); }
 .install h1 { margin: 0 0 6px; font-size: 19px; letter-spacing: -0.01em; text-wrap: balance; }
+.install-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.install-github { flex: none; display: inline-flex; width: 28px; height: 28px; align-items: center; justify-content: center; color: var(--muted); border-radius: var(--r-sm); margin-top: -2px; }
+.install-github:hover { color: var(--text); background: color-mix(in srgb, var(--text) 8%, transparent); }
+.install-github svg { width: 18px; height: 18px; }
+.install-film { margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.install-film video { width: 100%; aspect-ratio: 16 / 9; display: block; background: #000; border: 1px solid var(--border); border-radius: var(--r-lg); }
+.install-film figcaption { font-size: 12px; text-align: right; }
+.install-film figcaption a { color: var(--muted); }
+.install-film figcaption a:hover { color: var(--text); }
 .locked-lead { color: var(--text); font-size: 13.5px; line-height: 1.55; margin: 0; }
 .locked-sub { color: var(--muted); font-size: 13px; line-height: 1.55; margin: 0; }
 .locked-sub b { color: var(--text); }

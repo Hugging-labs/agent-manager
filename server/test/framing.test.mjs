@@ -104,6 +104,7 @@ test('every response carries frame-ancestors, off a Space', async () => {
   const srv = await startServer('local', {});
   try {
     await everyResponseCarries(srv, ["'self'"]);
+    assert.equal(csp(await fetch(srv.base + '/')), "frame-ancestors 'self'", 'no fetch directive on the page');
     const info = await (await fetch(srv.base + '/api/info')).json();
     assert.deepEqual(info.frameAncestors, []);
   } finally { await srv.stop(); }
@@ -113,6 +114,10 @@ test('every response carries frame-ancestors, in a Space (Hub allowed)', async (
   const srv = await startServer('space', { SPACE_ID: 'fixture/test', SPACE_HOST: 'fixture-test.hf.space' });
   try {
     await everyResponseCarries(srv, ["'self'", 'https://huggingface.co']);
+    // The page's policy is frame-ancestors and nothing else: no fetch directive
+    // (default-src, media-src, img-src) limits where the install page's film and
+    // poster load from (huggingface.co, redirecting to its CDN).
+    assert.equal(csp(await fetch(srv.base + '/')), "frame-ancestors 'self' https://huggingface.co");
     const info = await (await fetch(srv.base + '/api/info')).json();
     assert.deepEqual(info.frameAncestors, ['https://huggingface.co']);
   } finally { await srv.stop(); }
