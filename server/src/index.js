@@ -2303,9 +2303,9 @@ for the task and save the exact request before dispatch. Use JSON **text**, not
 message or prompt, at this endpoint:
 
 \`\`\`sh
-curl -sS --fail-with-body -X POST \
-  "http://localhost:\${AM_PORT:-7860}/api/agents/$ID/prompt?from=$AM_ID" \
-  -H 'X-AM-Request: 1' -H 'Content-Type: application/json' \
+curl -sS --fail-with-body -H 'X-AM-Request: 1' -X POST \\
+  "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/agents/$ID/prompt?from=$AM_ID" \\
+  -H 'Content-Type: application/json' \\
   --data-binary @delegation-request.json
 \`\`\`
 
@@ -2349,6 +2349,32 @@ still working, use \`/wait\` rather than a polling/sleep loop and inspect the na
 final result before declaring completion. If an old task has no subscription,
 report that gap instead of replaying it.
 
+\`\`\`sh
+curl -s -H 'X-AM-Request: 1' "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/agents/$ID/tail?lines=120" | jq -r .text
+\`\`\`
+\`tail\` returns that agent's screen and scrollback — exactly what a human would
+see in its pane.
+
+A harness that wakes you when a background command exits (Claude Code:
+\`run_in_background\`) can keep that watch without blocking you: start the
+background \`wait\` loop below. It reissues the blocking \`wait\`, not a
+sleep-poll, and it wakes YOUR harness — not an idle shared Codex conversation,
+which needs the subscription above.
+
+\`\`\`sh
+( until curl -s -H 'X-AM-Request: 1' "http://\${AM_HOST:-${INTERNAL_HOST}}:\${AM_PORT:-${PORT}}/api/agents/$ID/wait?timeout=300&settle=15&from=$AM_ID" \\
+        > /tmp/wait-$ID.json \\
+     && jq -e '.matched or .state == "gone" or has("error")' /tmp/wait-$ID.json >/dev/null
+  do sleep 2; done ) >/dev/null 2>&1 &
+\`\`\`
+When that exits, \`/tmp/wait-$ID.json\` holds the last answer: \`"state":"gone"\`
+means the session was deleted, \`error\` means the id is wrong.
+
+\`matched\` means the agent STOPPED, not that it succeeded — a CLI that rejects
+its own flags fails in a second and lands back at its input box, which from the
+outside is indistinguishable from finished. Read \`tail\` afterwards and judge the
+work, not the state.
+
 ### Send an ordinary message
 
 Use the same endpoint with \`{"requestId":"a saved UUID","text":"message"}\`.
@@ -2356,6 +2382,13 @@ This sends a message without a completion subscription. Shared Codex receivers
 require a request ID; keep it stable on retries. A successful response with
 \`completionSubscribed:false\` is explicit about this distinction. Do not infer
 subscription from \`from\`, successful resolve, or a successful prompt response.
+
+**A task you hand over is still yours.** Use the completion subscription above
+where it is supported. Otherwise keep the current turn alive:
+start the background \`wait\` loop from **Observe a peer without requesting a callback**
+with the id you just prompted, then \`tail\` it and act on what it actually produced.
+Your turn is not finished when the prompt is sent — it is finished when you have
+the result. Never report work as done that you only delegated.
 
 
 Mapping resolution intentionally remains available for read-only inspection of archived threads. \`messaging.allowed:false\` and \`archivedAt\` expose that state; \`am-context resolve --id-only\` refuses to hide it. A missing or replaced session still fails resolution. Sender checks are repeated across asynchronous native recovery and submission. No automatic unarchive is performed.
@@ -2387,7 +2420,10 @@ to leave it ungrouped. The prompt is required — it starts working on it
 immediately. Spawn one agent for one clearly separable job; several agents in
 one folder is fine, but this Space is a small CPU box, so don't build a fleet.
 
-The response carries the new agent's \`id\`. Creation starts the initial task but does not subscribe to a completion callback. Observe that initial task while your turn remains active. For later work on the now-existing peer, use the durable delegation endpoint above when supported. Never resend the initial task merely to add a callback.
+The response carries the new agent's \`id\`. Creation starts the initial task but does not subscribe to a completion callback. Observe that initial task while your turn remains active: it is a
+dispatch and the rule under **Send an ordinary message** applies —
+start the background \`wait\` loop right then, and read its screen before you
+call the job done. For later work on the now-existing peer, use the durable delegation endpoint above when supported. Never resend the initial task merely to add a callback.
 
 **Into a NEW group** — e.g. "start four agents in a group called taskforce".
 \`group=\` only ever selects a group that already exists; an unknown name is
